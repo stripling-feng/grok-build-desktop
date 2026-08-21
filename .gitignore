@@ -12,3 +12,5 @@ Thumbs.db
 *.exe
 *.exe.blockmap
 1.txt
+.idea
+.zcode
