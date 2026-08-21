@@ -6,18 +6,24 @@ import { GrokAcpClient } from "./acp";
 import {
   addProject,
   bindSessionToProject,
+  isScratchPath,
   listProjects,
   projectName,
   removeProject,
+  renameProject,
+  scratchCwd,
   threadBelongsToProject,
+  unbindSession,
 } from "./projects";
-import { listThreads, loadTranscript } from "./sessions";
+import { copySession, listThreads, loadTranscript, removeThread, renameThread } from "./sessions";
 import {
   applyWorktree,
   createWorktree,
   findGitRoot,
+  gitCommit,
   gitDiscard,
   gitFileDiff,
+  gitPush,
   gitStage,
   gitStatus,
   gitUnstage,
@@ -26,14 +32,59 @@ import {
   loadSettings,
   sessionMeta,
   setDefaultModel,
+  setDefaultReasoningEffort,
   setPermissionMode,
   setSkillDisabled,
+  setBrowserControl,
+  setComputerControl,
+  setSubagentsEnabled,
+  setSubagentTypeEnabled,
+  setSubagentTypeModel,
+  isBrowserControlServer,
+  isComputerControlServer,
 } from "./config";
+import {
+  GrokCliError,
+  ensureUserAgentsDir,
+  ensureUserHooksDir,
+  ensureUserSkillsDir,
+  listAvailablePlugins,
+  marketplaceAdd,
+  marketplaceRemove,
+  mcpAdd,
+  mcpDisable,
+  mcpDoctor,
+  mcpEnable,
+  mcpRemove,
+  pluginDisable,
+  pluginEnable,
+  pluginInstall,
+  pluginUninstall,
+  trustProject,
+  writeUserHook,
+  type McpAddInput,
+} from "./grok-cli";
 import { ProjectTerminal } from "./terminal";
-import type { PermissionMode } from "./shared";
+import type { PermissionMode, ReasoningEffort } from "./shared";
 import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
 import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
+import { loadAccount, loadAccountUsage } from "./account";
+import { checkAppUpdate, openUpdateUrl } from "./update";
+import { generateMedia } from "./media";
+import {
+  createAutomation,
+  deleteAutomation,
+  dueAutomations,
+  getAutomation,
+  listAutomations,
+  markFinished,
+  markRunning,
+  recoverStuckAutomations,
+  startAutomationLoop,
+  updateAutomation,
+  type AutomationInput,
+} from "./automations";
 
 app.setName("Grok Build");
 
@@ -46,6 +97,10 @@ function send(channel: string, payload: unknown) {
   mainWindow?.webContents.send(channel, payload);
 }
 
+function appIconPath() {
+  return path.join(__dirname, "..", "build", "icon.ico");
+}
+
 function createWindow() {
   const preload = path.join(__dirname, "preload.js");
   mainWindow = new BrowserWindow({
@@ -55,6 +110,7 @@ function createWindow() {
     minHeight: 640,
     title: "Grok Build 桌面端",
     backgroundColor: "#ffffff",
+    icon: appIconPath(),
     frame: false,
     titleBarStyle: "hidden",
     show: false,
@@ -67,6 +123,12 @@ function createWindow() {
   });
 
   mainWindow.once("ready-to-show", () => mainWindow?.show());
+  mainWindow.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+    log("renderer", level, message, sourceId, line);
+  });
+  mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    log("did-fail-load", code, desc, url);
+  });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) {
@@ -108,9 +170,15 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    app.setAppUserModelId("ai.x.grok.build.desktop");
     initLog();
     pruneLogs();
     createWindow();
+    void acp.ensureStarted().catch((err) => log("agent warmup failed", err));
+    recoverStuckAutomations(Date.now(), { force: true, skipIds: runningAutomations });
+    startAutomationLoop(() => {
+      void tickAutomations();
+    });
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -143,9 +211,15 @@ let workspaceCache: { at: number; data: ReturnType<typeof buildWorkspace> } | nu
 function buildWorkspace() {
   const raw = listThreads();
   const projects = listProjects(raw);
-  const threads = raw.map((t) => {
-    const match = projects.find((p) => threadBelongsToProject(t, p));
-    return match ? { ...t, projectCwd: match.cwd } : t;
+  const threads = raw.flatMap((t) => {
+    const match = projects.find((p) => threadBelongsToProject({ ...t, unattached: false }, p));
+    if (match) {
+      return [{ ...t, projectCwd: match.cwd, unattached: false }];
+    }
+    if (isScratchPath(t.cwd) || isScratchPath(t.projectCwd) || isScratchPath(t.gitRoot)) {
+      return [{ ...t, projectCwd: "", unattached: true }];
+    }
+    return [];
   });
   return { projects, threads };
 }
@@ -161,7 +235,117 @@ function invalidateWorkspace() {
   workspaceCache = null;
 }
 
+const runningAutomations = new Set<string>();
+const queuedAutomations = new Set<string>();
+let automationChain: Promise<void> = Promise.resolve();
+
+function publishAutomations() {
+  send("grok:automations", listAutomations());
+}
+
+function sameCwd(a?: string | null, b?: string | null) {
+  return (a || "").replace(/[\\/]+$/, "").toLowerCase() === (b || "").replace(/[\\/]+$/, "").toLowerCase();
+}
+
+async function runAutomation(id: string, manual = false) {
+  if (runningAutomations.has(id)) return;
+  const job = getAutomation(id);
+  if (!job) return;
+  if (!job.prompt.trim()) {
+    markFinished(id, false, "没有任务内容");
+    publishAutomations();
+    return;
+  }
+  runningAutomations.add(id);
+  if (job.lastStatus !== "running") {
+    markRunning(id, { trigger: manual ? "manual" : "schedule" });
+    publishAutomations();
+  }
+  const started = Date.now();
+  let sessionId = "";
+  let threadCwd = "";
+  try {
+    const unattached = !job.cwd;
+    const projectCwd = unattached ? scratchCwd() : job.cwd;
+    const boundCwd = job.sessionCwd || "";
+    threadCwd = boundCwd && (unattached || sameCwd(boundCwd, projectCwd) || sameCwd(boundCwd, job.cwd))
+      ? boundCwd
+      : projectCwd;
+    acp.allowRoot(projectCwd);
+    acp.allowRoot(threadCwd);
+    const extra = sessionMeta() as { _meta?: Record<string, unknown> };
+    extra._meta = { ...(extra._meta ?? {}), autoMode: true };
+    const reused = job.lastSessionId?.trim() || "";
+    if (reused) {
+      try {
+        if (!loadedSessions.has(reused)) {
+          await acp.loadSession(reused, threadCwd);
+          loadedSessions.add(reused);
+        }
+        sessionId = reused;
+      } catch (err) {
+        log("automation reuse failed, creating session", id, err);
+        sessionId = "";
+      }
+    }
+    if (!sessionId) {
+      sessionId = await acp.newSession(threadCwd, extra);
+      loadedSessions.add(sessionId);
+      bindSessionToProject(sessionId, unattached ? "" : projectCwd);
+      try {
+        renameThread(sessionId, threadCwd, job.title || "定时任务");
+      } catch {
+        /* title is best-effort */
+      }
+      invalidateWorkspace();
+      send("grok:workspace", workspace());
+    }
+    acp.markAutoSession(sessionId);
+    try {
+      await acp.prompt(sessionId, job.prompt);
+      markFinished(id, true, undefined, { sessionId, sessionCwd: threadCwd, durationMs: Date.now() - started });
+      invalidateWorkspace();
+      send("grok:workspace", workspace());
+    } finally {
+      acp.unmarkAutoSession(sessionId);
+    }
+  } catch (err) {
+    if (sessionId) acp.unmarkAutoSession(sessionId);
+    markFinished(id, false, err instanceof Error ? err.message : String(err), {
+      sessionId: sessionId || undefined,
+      sessionCwd: threadCwd || undefined,
+      durationMs: Date.now() - started,
+    });
+    if (!manual) log("automation failed", id, err);
+  } finally {
+    runningAutomations.delete(id);
+    publishAutomations();
+  }
+}
+
+function enqueueAutomation(id: string, manual = false) {
+  if (queuedAutomations.has(id) || runningAutomations.has(id)) return automationChain;
+  queuedAutomations.add(id);
+  automationChain = automationChain
+    .then(() => runAutomation(id, manual))
+    .catch((err) => log("automation queue failed", id, err))
+    .finally(() => {
+      queuedAutomations.delete(id);
+    });
+  return automationChain;
+}
+
+async function tickAutomations() {
+  for (const job of dueAutomations(Date.now(), runningAutomations)) {
+    void enqueueAutomation(job.id);
+  }
+}
+
 ipcMain.handle("grok:status", () => acp.status());
+ipcMain.handle("grok:account", () => loadAccount());
+ipcMain.handle("grok:accountUsage", () => loadAccountUsage());
+ipcMain.handle("grok:checkUpdate", () => checkAppUpdate());
+ipcMain.handle("grok:openUpdate", (_e, url?: string) => openUpdateUrl(url));
 ipcMain.handle("grok:installInfo", () => ({
   command: INSTALL_COMMAND,
   docs: INSTALL_DOCS,
@@ -200,6 +384,22 @@ ipcMain.handle("grok:removeProject", (_e, cwd: string) => {
   invalidateWorkspace();
   return workspace().projects;
 });
+ipcMain.handle("grok:renameProject", (_e, cwd: string, name: string) => {
+  const project = renameProject(cwd, name);
+  invalidateWorkspace();
+  return project;
+});
+ipcMain.handle("grok:renameThread", (_e, sessionId: string, cwd: string, title: string) => {
+  const thread = renameThread(sessionId, cwd, title);
+  invalidateWorkspace();
+  return thread;
+});
+ipcMain.handle("grok:removeThread", (_e, sessionId: string, cwd: string) => {
+  removeThread(sessionId, cwd);
+  unbindSession(sessionId);
+  invalidateWorkspace();
+  return true;
+});
 
 ipcMain.handle("grok:addProject", async () => {
   const result = await dialog.showOpenDialog(mainWindow!, {
@@ -214,34 +414,84 @@ ipcMain.handle("grok:addProject", async () => {
   return addProject(gitRoot || cwd, gitRoot);
 });
 
-ipcMain.handle("grok:newThread", async (_e, cwd: string, worktree: boolean) => {
-  const projectCwd = cwd;
-  const gitRoot = await findGitRoot(projectCwd);
-  addProject(projectCwd, gitRoot);
+ipcMain.handle("grok:newThread", async (_e, cwd?: string | null, worktree?: boolean) => {
+  const unattached = !cwd;
+  const projectCwd = unattached ? scratchCwd() : cwd;
+  const gitRoot = unattached ? null : await findGitRoot(projectCwd);
+  if (!unattached) addProject(projectCwd, gitRoot);
   let threadCwd = projectCwd;
   let worktreeMeta: { cwd: string; branch: string } | null = null;
-  if (worktree) {
+  if (!unattached && worktree) {
     worktreeMeta = await createWorktree(projectCwd);
     threadCwd = worktreeMeta.cwd;
   }
   acp.allowRoot(projectCwd);
   acp.allowRoot(threadCwd);
-  const extra = sessionMeta() as { _meta?: Record<string, unknown> };
-  const goal = getGoal(projectCwd);
-  if (goal) {
-    extra._meta = { ...(extra._meta ?? {}), rules: `持续目标：${goal}` };
-  }
+  const goal = unattached ? "" : getGoal(projectCwd);
+  const extra = sessionMeta(goal ? [`持续目标：${goal}`] : []);
   const sessionId = await acp.newSession(threadCwd, extra);
   loadedSessions.add(sessionId);
-  bindSessionToProject(sessionId, projectCwd);
+  if (unattached) bindSessionToProject(sessionId, "");
+  else bindSessionToProject(sessionId, projectCwd);
   invalidateWorkspace();
   return {
     sessionId,
     cwd: threadCwd,
-    projectCwd,
+    projectCwd: unattached ? "" : projectCwd,
     title: "新会话",
     worktree: worktreeMeta,
-    projectName: projectName(projectCwd),
+    projectName: unattached ? "对话" : projectName(projectCwd),
+    unattached,
+  };
+});
+
+ipcMain.handle("grok:forkThread", async (_e, sessionId: string, cwd: string) => {
+  if (!sessionId) throw new Error("会话还没创建完成");
+  acp.allowRoot(cwd);
+  if (!loadedSessions.has(sessionId)) {
+    try {
+      await acp.loadSession(sessionId, cwd);
+      loadedSessions.add(sessionId);
+    } catch {
+      /* fork can still copy from disk */
+    }
+  }
+
+  let forkedId = "";
+  let forkedCwd = cwd;
+  let title = "分叉会话";
+  try {
+    forkedId = await acp.forkSession(sessionId, cwd);
+  } catch {
+    const copied = copySession(sessionId, cwd);
+    forkedId = copied.id;
+    forkedCwd = copied.cwd;
+    title = copied.title;
+  }
+
+  acp.allowRoot(forkedCwd);
+  try {
+    await acp.loadSession(forkedId, forkedCwd);
+    loadedSessions.add(forkedId);
+  } catch {
+    /* transcript is enough to open the fork */
+  }
+
+  const source = listThreads().find((t) => t.id === sessionId);
+  const forked = listThreads().find((t) => t.id === forkedId);
+  const projectCwd = forked?.projectCwd || source?.projectCwd || "";
+  const unattached = Boolean(forked?.unattached ?? source?.unattached ?? !projectCwd);
+  if (unattached) bindSessionToProject(forkedId, "");
+  else bindSessionToProject(forkedId, projectCwd);
+  invalidateWorkspace();
+  return {
+    sessionId: forkedId,
+    cwd: forked?.cwd || forkedCwd,
+    projectCwd: unattached ? "" : projectCwd,
+    title: forked?.title || title,
+    worktree: forked?.worktree ? { cwd: forked.cwd, branch: "" } : null,
+    projectName: unattached ? "对话" : projectName(projectCwd || forkedCwd),
+    unattached,
   };
 });
 
@@ -264,8 +514,32 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
   return { sessionId, cwd };
 });
 
-ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string) => {
-  return acp.prompt(sessionId, text);
+ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: { path: string; mimeType: string }[]) => {
+  return acp.prompt(sessionId, text, images);
+});
+ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeType?: string }) => {
+  const mime = (payload?.mimeType || "image/png").toLowerCase();
+  const ext = mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : mime.includes("webp") ? "webp" : mime.includes("gif") ? "gif" : "png";
+  const raw = String(payload?.data || "").replace(/^data:[^;]+;base64,/, "");
+  if (!raw) throw new Error("剪贴板里没有图片");
+  const dir = path.join(app.getPath("temp"), "grok-pasted");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `paste-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${ext}`);
+  fs.writeFileSync(file, Buffer.from(raw, "base64"));
+  return { path: file, mimeType: mime.startsWith("image/") ? mime : `image/${ext}` };
+});
+ipcMain.handle("grok:saveClipboardImage", async () => {
+  const image = clipboard.readImage();
+  if (image.isEmpty()) return null;
+  const png = image.toPNG();
+  const dir = path.join(app.getPath("temp"), "grok-pasted");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `paste-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.png`);
+  fs.writeFileSync(file, png);
+  return { path: file, mimeType: "image/png", dataUrl: `data:image/png;base64,${png.toString("base64")}` };
+});
+ipcMain.handle("grok:generateMedia", async (_e, kind: "image" | "video", prompt: string) => {
+  return generateMedia(kind, prompt);
 });
 ipcMain.handle("grok:setMode", async (_e, sessionId: string, modeId: string) => {
   await acp.setMode(sessionId, modeId);
@@ -302,6 +576,8 @@ ipcMain.handle("grok:gitFileDiff", (_e, cwd: string, filePath: string) => gitFil
 ipcMain.handle("grok:gitDiscard", (_e, cwd: string, filePath: string) => gitDiscard(cwd, filePath));
 ipcMain.handle("grok:gitStage", (_e, cwd: string, filePath: string) => gitStage(cwd, filePath));
 ipcMain.handle("grok:gitUnstage", (_e, cwd: string, filePath: string) => gitUnstage(cwd, filePath));
+ipcMain.handle("grok:gitCommit", (_e, cwd: string, message: string) => gitCommit(cwd, message));
+ipcMain.handle("grok:gitPush", (_e, cwd: string) => gitPush(cwd));
 ipcMain.handle("grok:applyWorktree", (_e, fromCwd: string, destCwd: string) =>
   applyWorktree(fromCwd, destCwd),
 );
@@ -352,12 +628,195 @@ ipcMain.handle("grok:setModel", async (_e, id: string) => {
   await acp.stop();
   return loadSettings();
 });
+ipcMain.handle("grok:setReasoningEffort", async (_e, effort: ReasoningEffort) => {
+  setDefaultReasoningEffort(effort);
+  return loadSettings(undefined, { skipCli: true });
+});
+ipcMain.handle("grok:setBrowserControl", async (_e, enabled: boolean, cwd?: string | null) => {
+  setBrowserControl(enabled);
+  try {
+    const current = await loadSettings(cwd);
+    for (const server of current.mcpServers) {
+      if (!isBrowserControlServer(server.name)) continue;
+      if (enabled && !server.enabled) await mcpEnable(server.name, cwd);
+      if (!enabled && server.enabled) await mcpDisable(server.name, cwd);
+    }
+  } catch {
+    /* keep the UI flag even if MCP toggle fails */
+  }
+  return loadSettings(cwd);
+});
+ipcMain.handle("grok:setSubagentsEnabled", async (_e, enabled: boolean, cwd?: string | null) => {
+  setSubagentsEnabled(enabled);
+  return loadSettings(cwd, { skipCli: true });
+});
+ipcMain.handle(
+  "grok:setSubagentTypeEnabled",
+  async (_e, id: string, enabled: boolean, cwd?: string | null) => {
+    setSubagentTypeEnabled(id, enabled);
+    return loadSettings(cwd, { skipCli: true });
+  },
+);
+ipcMain.handle(
+  "grok:setSubagentTypeModel",
+  async (_e, id: string, model: string | null, cwd?: string | null) => {
+    setSubagentTypeModel(id, model);
+    return loadSettings(cwd, { skipCli: true });
+  },
+);
+ipcMain.handle("grok:openAgentsDir", async () => {
+  const dir = ensureUserAgentsDir();
+  await shell.openPath(dir);
+  return dir;
+});
+ipcMain.handle("grok:setComputerControl", async (_e, enabled: boolean, cwd?: string | null) => {
+  setComputerControl(enabled);
+  try {
+    const current = await loadSettings(cwd);
+    for (const server of current.mcpServers) {
+      if (!isComputerControlServer(server.name)) continue;
+      if (enabled && !server.enabled) await mcpEnable(server.name, cwd);
+      if (!enabled && server.enabled) await mcpDisable(server.name, cwd);
+    }
+    for (const plugin of current.plugins) {
+      if (!isComputerControlServer(plugin.name)) continue;
+      if (enabled && !plugin.enabled) await pluginEnable(plugin.name, cwd);
+      if (!enabled && plugin.enabled) await pluginDisable(plugin.name, cwd);
+    }
+  } catch {
+    /* keep the UI flag even if MCP/plugin toggle fails */
+  }
+  return loadSettings(cwd);
+});
 ipcMain.handle("grok:setPermission", (_e, mode: PermissionMode) => {
   setPermissionMode(mode);
   return loadSettings();
 });
 ipcMain.handle("grok:setSkillDisabled", async (_e, name: string, disabled: boolean, cwd?: string | null) => {
   setSkillDisabled(name, disabled);
+  return loadSettings(cwd);
+});
+ipcMain.handle("grok:openSkillsDir", async () => {
+  const dir = ensureUserSkillsDir();
+  await shell.openPath(dir);
+  return dir;
+});
+ipcMain.handle("grok:openHooksDir", async () => {
+  const dir = ensureUserHooksDir();
+  await shell.openPath(dir);
+  return dir;
+});
+ipcMain.handle("grok:mcpAdd", async (_e, input: McpAddInput, cwd?: string | null) => {
+  try {
+    await mcpAdd(input, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:mcpRemove", async (_e, name: string, scope: "user" | "project" | undefined, cwd?: string | null) => {
+  try {
+    await mcpRemove(name, scope, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:mcpSetEnabled", async (_e, name: string, enabled: boolean, cwd?: string | null) => {
+  try {
+    if (enabled) await mcpEnable(name, cwd);
+    else await mcpDisable(name, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:mcpDoctor", async (_e, name?: string, cwd?: string | null) => {
+  try {
+    return await mcpDoctor(name, cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginSetEnabled", async (_e, name: string, enabled: boolean, cwd?: string | null) => {
+  try {
+    if (enabled) await pluginEnable(name, cwd);
+    else await pluginDisable(name, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginInstall", async (_e, source: string, trust: boolean, cwd?: string | null) => {
+  try {
+    await pluginInstall(source, trust, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginUninstall", async (_e, name: string, cwd?: string | null) => {
+  try {
+    await pluginUninstall(name, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, cwd?: string | null) => {
+  try {
+    await marketplaceAdd(url, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:marketplaceRemove", async (_e, url: string, cwd?: string | null) => {
+  try {
+    await marketplaceRemove(url, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:availablePlugins", async () => {
+  try {
+    return await listAvailablePlugins();
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:trustProject", async (_e, cwd: string) => {
+  trustProject(cwd);
+  return loadSettings(cwd);
+});
+ipcMain.handle("grok:listAutomations", () => listAutomations());
+ipcMain.handle("grok:createAutomation", (_e, input: AutomationInput) => {
+  const row = createAutomation(input);
+  publishAutomations();
+  return row;
+});
+ipcMain.handle("grok:updateAutomation", (_e, id: string, patch: Partial<AutomationInput> & { enabled?: boolean }) => {
+  const row = updateAutomation(id, patch);
+  publishAutomations();
+  return row;
+});
+ipcMain.handle("grok:deleteAutomation", (_e, id: string) => {
+  const ok = deleteAutomation(id);
+  publishAutomations();
+  return ok;
+});
+ipcMain.handle("grok:runAutomation", (_e, id: string) => {
+  const job = getAutomation(id);
+  if (!job) return null;
+  if (job.lastStatus === "running" || runningAutomations.has(id) || queuedAutomations.has(id)) return job;
+  markRunning(id, { trigger: "manual" });
+  publishAutomations();
+  void enqueueAutomation(id, true);
+  return getAutomation(id);
+});
+ipcMain.handle("grok:addHook", async (_e, input: { name: string; event: string; matcher?: string; command: string }, cwd?: string | null) => {
+  writeUserHook(input);
   return loadSettings(cwd);
 });
 ipcMain.handle("grok:terminalStart", (_e, cwd: string) => {

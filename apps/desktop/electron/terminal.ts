@@ -13,7 +13,7 @@ export class ProjectTerminal extends EventEmitter {
     const args = isWin ? ["-NoLogo"] : ["-i"];
     this.proc = spawn(cmd, args, {
       cwd,
-      windowsHide: true,
+      windowsHide: false,
       env: {
         ...process.env,
         TERM: "dumb",

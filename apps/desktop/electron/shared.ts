@@ -1,5 +1,5 @@
 export type StreamItem =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; startedAt?: number; durationMs?: number }
   | { kind: "agent"; text: string }
   | { kind: "thought"; text: string }
   | {
@@ -11,8 +11,35 @@ export type StreamItem =
       detail?: string;
       path?: string;
     }
+  | {
+      kind: "subagent";
+      id: string;
+      title: string;
+      status: string;
+      type?: string;
+      detail?: string;
+      durationMs?: number;
+    }
   | { kind: "plan"; entries: { content: string; status?: string }[] }
-  | { kind: "status"; text: string };
+  | { kind: "status"; text: string }
+  | {
+      kind: "media";
+      mediaKind: MediaKind;
+      prompt: string;
+      urls: string[];
+      via?: "relay" | "oauth";
+      status?: "pending" | "done" | "error";
+      error?: string;
+    };
+
+export type MediaKind = "image" | "video";
+
+export type MediaResult = {
+  kind: MediaKind;
+  prompt: string;
+  urls: string[];
+  via: "relay" | "oauth";
+};
 
 export type ThreadInfo = {
   id: string;
@@ -26,6 +53,7 @@ export type ThreadInfo = {
   gitRoot?: string;
   projectCwd: string;
   worktree?: boolean;
+  unattached?: boolean;
 };
 
 export type ProjectInfo = {
@@ -50,7 +78,38 @@ export type GrokStatus = {
   error?: string;
 };
 
+export type AccountMethod = "oauth" | "api-key" | "none";
+
+export type AccountInfo = {
+  method: AccountMethod;
+  name: string;
+  email?: string;
+};
+
+export type AccountUsage = {
+  text: string;
+  percent?: number;
+  used?: number;
+  limit?: number;
+  prepaid?: number;
+  tier?: string;
+  periodStart?: string;
+  periodEnd?: string;
+};
+
+export type AppUpdateInfo = {
+  current: string;
+  latest: string | null;
+  hasUpdate: boolean;
+  url: string;
+  notes: string;
+  dev?: boolean;
+  error?: string;
+};
+
 export type PermissionMode = "ask" | "auto" | "always-approve";
+
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export type SkillInfo = {
   name: string;
@@ -58,13 +117,153 @@ export type SkillInfo = {
   source: string;
   path: string;
   disabled: boolean;
+  userInvocable?: boolean;
+  invocableAs?: string;
+};
+
+export type McpServerInfo = {
+  name: string;
+  transport: "stdio" | "http" | "sse" | string;
+  target: string;
+  source: string;
+  path: string;
+  vendor: string;
+  enabled: boolean;
+  status: string;
+  native: boolean;
+};
+
+export type PluginInfo = {
+  name: string;
+  scope: string;
+  path: string;
+  enabled: boolean;
+  skills: number;
+  agents: number;
+  hooks: boolean;
+  mcpServers: number;
+};
+
+export type MarketplaceInfo = {
+  name: string;
+  kind: string;
+  url: string;
+};
+
+export type AvailablePluginInfo = {
+  name: string;
+  version?: string;
+  description: string;
+  marketplace: string;
+  status: string;
+  skillCount: number;
+  hasHooks: boolean;
+  hasAgents: boolean;
+  hasMcp: boolean;
+};
+
+export type HookInfo = {
+  event: string;
+  matcher: string;
+  source: string;
+  path: string;
+  command: string;
+  type: string;
+  trusted: boolean;
+};
+
+export type IntervalUnit = "minute" | "hourly" | "daily" | "weekly" | "monthly" | "yearly";
+
+export type AutomationFrequency = "hourly" | "daily" | "weekdays" | "weekly" | "monthly" | "custom";
+
+export type AutomationRun = {
+  id: string;
+  at: number;
+  trigger: "schedule" | "manual";
+  status: "running" | "ok" | "error";
+  error?: string;
+  durationMs?: number;
+  sessionId?: string;
+};
+
+export type Automation = {
+  id: string;
+  title: string;
+  prompt: string;
+  cwd: string;
+  enabled: boolean;
+  recurring: boolean;
+  delayMinutes?: number | null;
+  cron?: string | null;
+  interval?: number | null;
+  intervalUnit?: IntervalUnit | null;
+  maxRuns?: number | null;
+  frequency?: AutomationFrequency | null;
+  time?: string | null;
+  minute?: number | null;
+  weekdays?: number[] | null;
+  dayOfMonth?: number | null;
+  endsAt?: number | null;
+  scheduleLabel: string;
+  nextRunAt: number;
+  lastRunAt?: number | null;
+  lastStatus?: "ok" | "error" | "running" | null;
+  lastError?: string;
+  lastSessionId?: string | null;
+  sessionCwd?: string | null;
+  runCount: number;
+  createdAt: number;
+  runs?: AutomationRun[];
+};
+
+export type AutomationInput = {
+  title: string;
+  prompt: string;
+  cwd?: string | null;
+  enabled?: boolean;
+  recurring?: boolean;
+  delayMinutes?: number | null;
+  cron?: string | null;
+  interval?: number | null;
+  intervalUnit?: IntervalUnit | null;
+  maxRuns?: number | null;
+  frequency?: AutomationFrequency | null;
+  time?: string | null;
+  minute?: number | null;
+  weekdays?: number[] | null;
+  dayOfMonth?: number | null;
+  endsAt?: number | null;
+  scheduleLabel?: string;
+};
+
+export type SubagentTypeInfo = {
+  id: string;
+  name: string;
+  description: string;
+  builtin: boolean;
+  enabled: boolean;
+  model: string | null;
+  source?: string;
+  path?: string;
 };
 
 export type AppSettings = {
   model: string;
+  reasoningEffort: ReasoningEffort;
   permissionMode: PermissionMode;
-  models: { id: string; name: string }[];
+  models: { id: string; name: string; contextWindow?: number }[];
   skills: SkillInfo[];
+  mcpServers: McpServerInfo[];
+  plugins: PluginInfo[];
+  marketplaces: MarketplaceInfo[];
+  availablePlugins: AvailablePluginInfo[];
+  hooks: HookInfo[];
+  projectTrusted: boolean;
+  browserControl: boolean;
+  computerControl: boolean;
+  subagentsEnabled: boolean;
+  subagentTypes: SubagentTypeInfo[];
+  inspectError?: string;
 };
 
 export type GitFile = {
@@ -76,9 +275,12 @@ export type GitFile = {
 
 export type GitStatus = {
   branch: string | null;
+  remote: string | null;
   isRepo: boolean;
   isWorktree: boolean;
   mainRoot: string | null;
+  added: number;
+  removed: number;
   files: GitFile[];
 };
 
@@ -86,20 +288,138 @@ export type AcpUpdatePayload = {
   sessionId: string;
   update: Record<string, unknown>;
   method?: string;
+  meta?: Record<string, unknown>;
 };
+
+function asTokenCount(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;
+}
+
+export type ContextPartId = "messages" | "tools" | "mcp" | "skills" | "system" | "other";
+
+export type ContextPart = {
+  id: ContextPartId;
+  label: string;
+  tokens: number;
+};
+
+export type ContextUsage = {
+  used: number | null;
+  inputTokens?: number | null;
+  cachedReadTokens?: number | null;
+  cacheHitRate?: number | null;
+  parts?: ContextPart[];
+};
+
+function usageRecord(update: Record<string, unknown>): Record<string, unknown> | undefined {
+  return update.usage && typeof update.usage === "object" ? (update.usage as Record<string, unknown>) : undefined;
+}
+
+export function extractContextUsed(
+  update: Record<string, unknown>,
+  meta?: Record<string, unknown>,
+): number | null {
+  const usage = usageRecord(update);
+  const nested = update._meta && typeof update._meta === "object" ? (update._meta as Record<string, unknown>) : undefined;
+  return (
+    asTokenCount(meta?.totalTokens) ??
+    asTokenCount(nested?.totalTokens) ??
+    asTokenCount(usage?.inputTokens) ??
+    asTokenCount(usage?.totalTokens)
+  );
+}
+
+export function extractContextUsage(
+  update: Record<string, unknown>,
+  meta?: Record<string, unknown>,
+): ContextUsage | null {
+  const usage = usageRecord(update);
+  const used = extractContextUsed(update, meta);
+  const inputTokens = asTokenCount(usage?.inputTokens);
+  const cachedReadTokens = asTokenCount(usage?.cachedReadTokens);
+  const cacheHitRate =
+    inputTokens != null && inputTokens > 0 && cachedReadTokens != null
+      ? Math.min(1, Math.max(0, cachedReadTokens / inputTokens))
+      : null;
+  if (used == null && cacheHitRate == null && inputTokens == null) return null;
+  return { used, inputTokens, cachedReadTokens, cacheHitRate };
+}
+
+export function mergeContextUsage(prev: ContextUsage | null, next: ContextUsage | null): ContextUsage | null {
+  if (!next) return prev;
+  if (!prev) return next;
+  return {
+    used: next.used ?? prev.used,
+    inputTokens: next.inputTokens ?? prev.inputTokens,
+    cachedReadTokens: next.cachedReadTokens ?? prev.cachedReadTokens,
+    cacheHitRate: next.cacheHitRate ?? prev.cacheHitRate,
+    parts: next.parts ?? prev.parts,
+  };
+}
 
 function pushText(
   items: StreamItem[],
   kind: "user" | "agent" | "thought",
   text: string,
+  startedAt?: number,
 ) {
   if (!text) return;
   const last = items[items.length - 1];
   if (last && last.kind === kind) {
     last.text += text;
+    if (kind === "user" && startedAt && !last.startedAt) last.startedAt = startedAt;
     return;
   }
-  items.push({ kind, text });
+  items.push(kind === "user" ? { kind, text, startedAt } : { kind, text });
+}
+
+function parseTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const asNum = Number(value);
+    if (Number.isFinite(asNum) && asNum > 0) return asNum < 1e12 ? asNum * 1000 : asNum;
+    const ms = Date.parse(value);
+    if (!Number.isNaN(ms)) return ms;
+  }
+  return undefined;
+}
+
+export function extractUpdateTimestamp(
+  parsed: Record<string, unknown>,
+  update: Record<string, unknown>,
+): number | undefined {
+  for (const source of [parsed, update, parsed.params as Record<string, unknown> | undefined]) {
+    if (!source || typeof source !== "object") continue;
+    for (const key of ["timestamp", "ts", "created_at", "createdAt", "time", "at"]) {
+      const ms = parseTimestamp(source[key]);
+      if (ms) return ms;
+    }
+  }
+  return undefined;
+}
+
+export function isSpawnSubagentUpdate(update: Record<string, unknown>): boolean {
+  const title = String(update.title ?? "").toLowerCase();
+  const toolKind = String(update.kind ?? update.toolKind ?? "").toLowerCase();
+  const meta = update._meta && typeof update._meta === "object" ? (update._meta as Record<string, unknown>) : null;
+  const xai = meta && meta["x.ai/tool"] && typeof meta["x.ai/tool"] === "object"
+    ? (meta["x.ai/tool"] as Record<string, unknown>)
+    : null;
+  const name = String(xai?.name ?? update.name ?? update.toolName ?? "").toLowerCase();
+  const raw = update.rawInput && typeof update.rawInput === "object" ? (update.rawInput as Record<string, unknown>) : null;
+  return (
+    title.includes("spawn_subagent") ||
+    name.includes("spawn_subagent") ||
+    toolKind.includes("subagent") ||
+    Boolean(raw && (raw.subagent_type || raw.subagentType))
+  );
 }
 
 function extractToolPath(update: Record<string, unknown>): string | undefined {
@@ -163,7 +483,8 @@ export function applyUpdateToItems(
         : kind === "agent_thought_chunk"
           ? "thought"
           : "agent";
-    pushText(items, mapped, text);
+    const startedAt = mapped === "user" ? extractUpdateTimestamp(update, update) : undefined;
+    pushText(items, mapped, text, startedAt);
     return;
   }
 
@@ -180,6 +501,32 @@ export function applyUpdateToItems(
     };
     tools.set(id, item);
     items.push(item);
+    if (isSpawnSubagentUpdate(update)) {
+      const raw = update.rawInput && typeof update.rawInput === "object"
+        ? (update.rawInput as Record<string, unknown>)
+        : null;
+      const title = String(raw?.description ?? update.title ?? "子智能体");
+      const existing = items.find(
+        (row) =>
+          row.kind === "subagent" &&
+          (row.id === id || row.title === title),
+      );
+      if (existing && existing.kind === "subagent") {
+        existing.title = title || existing.title;
+        existing.status = item.status === "completed" ? "completed" : existing.status || "running";
+        existing.type = raw?.subagent_type ? String(raw.subagent_type) : existing.type;
+        if (item.detail) existing.detail = item.detail;
+      } else {
+        items.push({
+          kind: "subagent",
+          id,
+          title,
+          status: item.status === "completed" ? "completed" : "running",
+          type: raw?.subagent_type ? String(raw.subagent_type) : undefined,
+          detail: item.detail,
+        });
+      }
+    }
     return;
   }
 
@@ -194,6 +541,56 @@ export function applyUpdateToItems(
       const toolPath = extractToolPath(update);
       if (toolPath) existing.path = toolPath;
     }
+    return;
+  }
+
+  if (kind === "subagent_spawned") {
+    const id = String(update.subagent_id ?? update.child_session_id ?? update.subagentId ?? `subagent-${items.length}`);
+    const title = String(update.description ?? update.title ?? "子智能体");
+    const existing = items.find(
+      (item) =>
+        item.kind === "subagent" &&
+        (item.id === id || item.title === title),
+    );
+    if (existing && existing.kind === "subagent") {
+      existing.id = id;
+      existing.title = title || existing.title;
+      existing.type = update.subagent_type ? String(update.subagent_type) : existing.type;
+      existing.status = existing.status === "completed" ? existing.status : "running";
+      return;
+    }
+    items.push({
+      kind: "subagent",
+      id,
+      title,
+      status: "running",
+      type: update.subagent_type ? String(update.subagent_type) : undefined,
+    });
+    return;
+  }
+
+  if (kind === "subagent_finished") {
+    const id = String(update.subagent_id ?? update.child_session_id ?? update.subagentId ?? "");
+    const existing = items.find((item) => item.kind === "subagent" && item.id === id);
+    const output = typeof update.output === "string" ? update.output.slice(0, 4000) : undefined;
+    const durationMs = typeof update.duration_ms === "number" ? update.duration_ms : undefined;
+    const status = String(update.status ?? "completed");
+    if (existing && existing.kind === "subagent") {
+      existing.status = status;
+      if (output) existing.detail = output;
+      if (durationMs) existing.durationMs = durationMs;
+      if (update.subagent_type) existing.type = String(update.subagent_type);
+      return;
+    }
+    items.push({
+      kind: "subagent",
+      id: id || `subagent-${items.length}`,
+      title: String(update.description ?? update.title ?? "子智能体"),
+      status,
+      type: update.subagent_type ? String(update.subagent_type) : undefined,
+      detail: output,
+      durationMs,
+    });
     return;
   }
 

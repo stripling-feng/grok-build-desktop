@@ -6,6 +6,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { GrokStatus, PermissionRequest } from "./shared";
 import { grokBin } from "./grok-bin";
+import { AcpTerminals } from "./acp-terminals";
+import { sessionMeta } from "./config";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,7 +26,7 @@ type Pending = {
 };
 
 export type AcpEvents = {
-  update: { sessionId: string; update: Record<string, unknown>; method?: string };
+  update: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown> };
   permission: PermissionRequest;
   status: { connected: boolean; message?: string };
   stderr: string;
@@ -39,10 +41,13 @@ export class GrokAcpClient extends EventEmitter {
   private grokPath: string | null = null;
   private starting: Promise<void> | null = null;
   private allowedRoots = new Set<string>();
+  private sessionCwds = new Map<string, string>();
+  private terminals = new AcpTerminals();
   private permissionWaiters = new Map<
     string,
     { resolve: (optionId: string) => void; reject: (err: Error) => void }
   >();
+  private autoSessions = new Set<string>();
 
   findGrok(): string | null {
     return grokBin();
@@ -117,7 +122,7 @@ export class GrokAcpClient extends EventEmitter {
       clientInfo: { name: "grok-build-desktop", version: "0.1.0" },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
+        terminal: true,
       },
     });
     this.initialized = true;
@@ -128,6 +133,7 @@ export class GrokAcpClient extends EventEmitter {
     const proc = this.proc;
     this.proc = null;
     this.initialized = false;
+    this.terminals.killAll();
     if (!proc) return;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 2000);
@@ -141,18 +147,25 @@ export class GrokAcpClient extends EventEmitter {
 
   async newSession(cwd: string, extra?: Record<string, unknown>): Promise<string> {
     await this.ensureStarted();
+    // ACP requires mcpServers. An empty array keeps servers from config.toml /
+    // Cursor / Claude / plugin discovery — it does not wipe them.
     const result = (await this.request("session/new", {
       cwd,
       mcpServers: [],
       ...(extra ?? {}),
     })) as { sessionId?: string };
     if (!result?.sessionId) throw new Error("创建会话失败：未返回 sessionId");
+    this.sessionCwds.set(result.sessionId, path.resolve(cwd));
+    this.allowRoot(cwd);
     return result.sessionId;
   }
 
   async loadSession(sessionId: string, cwd: string): Promise<void> {
     await this.ensureStarted();
-    await this.request("session/load", { sessionId, cwd, mcpServers: [] });
+    const extra = sessionMeta();
+    await this.request("session/load", { sessionId, cwd, mcpServers: [], ...extra });
+    this.sessionCwds.set(sessionId, path.resolve(cwd));
+    this.allowRoot(cwd);
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {
@@ -160,17 +173,82 @@ export class GrokAcpClient extends EventEmitter {
     await this.request("session/set_mode", { sessionId, modeId });
   }
 
-  async prompt(sessionId: string, text: string): Promise<unknown> {
+  async forkSession(sessionId: string, cwd: string): Promise<string> {
     await this.ensureStarted();
-    return this.request("session/prompt", {
-      sessionId,
-      prompt: [{ type: "text", text }],
-    });
+    const params = { sessionId, cwd, mcpServers: [] };
+    const methods = ["x.ai/session/fork", "_x.ai/session/fork", "session/fork"];
+    let lastError: Error | null = null;
+    for (const method of methods) {
+      try {
+        const result = (await this.request(method, params)) as Record<string, unknown>;
+        const id =
+          (typeof result?.sessionId === "string" && result.sessionId) ||
+          (typeof result?.session_id === "string" && result.session_id) ||
+          (result?.session && typeof result.session === "object"
+            ? String((result.session as { sessionId?: string }).sessionId ?? "")
+            : "");
+        if (id) {
+          this.sessionCwds.set(id, path.resolve(cwd));
+          this.allowRoot(cwd);
+          return id;
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (!/not found|unknown method|Method not found/i.test(lastError.message)) throw lastError;
+      }
+    }
+    throw lastError ?? new Error("当前代理不支持分叉会话");
+  }
+
+  async prompt(
+    sessionId: string,
+    text: string,
+    images?: { path: string; mimeType: string }[],
+  ): Promise<unknown> {
+    await this.ensureStarted();
+    const prompt: Record<string, unknown>[] = [];
+    if (text.trim()) prompt.push({ type: "text", text });
+    for (const image of images ?? []) {
+      let data = "";
+      try {
+        data = fs.readFileSync(image.path).toString("base64");
+      } catch {
+        continue;
+      }
+      if (!data) continue;
+      prompt.push({
+        type: "image",
+        mimeType: image.mimeType || "image/png",
+        data,
+      });
+    }
+    if (!prompt.length) throw new Error("没有可发送的内容");
+    try {
+      return await this.request("session/prompt", { sessionId, prompt });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!images?.length || !/invalid|unsupported|unknown|schema|type/i.test(message)) throw err;
+      const fallback = text.trim()
+        ? `${text.trim()}\n\n请同时参考这些图片：\n${images.map((img) => `- @${img.path}`).join("\n")}`
+        : `请查看这些图片：\n${images.map((img) => `- @${img.path}`).join("\n")}`;
+      return this.request("session/prompt", {
+        sessionId,
+        prompt: [{ type: "text", text: fallback }],
+      });
+    }
   }
 
   cancel(sessionId: string) {
     if (!this.proc) return;
     this.notify("session/cancel", { sessionId });
+  }
+
+  markAutoSession(sessionId: string) {
+    if (sessionId) this.autoSessions.add(sessionId);
+  }
+
+  unmarkAutoSession(sessionId: string) {
+    if (sessionId) this.autoSessions.delete(sessionId);
   }
 
   resolvePermission(requestId: string, optionId: string) {
@@ -234,7 +312,8 @@ export class GrokAcpClient extends EventEmitter {
     if (method === "session/update" || method === "_x.ai/session/update") {
       const sessionId = String(p.sessionId ?? "");
       const update = (p.update ?? p) as Record<string, unknown>;
-      this.emit("update", { sessionId, update, method });
+      const meta = p._meta && typeof p._meta === "object" ? (p._meta as Record<string, unknown>) : undefined;
+      this.emit("update", { sessionId, update, method, meta });
     }
   }
 
@@ -244,10 +323,22 @@ export class GrokAcpClient extends EventEmitter {
       const options = Array.isArray(p.options)
         ? (p.options as { optionId: string; name: string; kind: string }[])
         : [];
+      const sessionId = String(p.sessionId ?? "");
+      if (this.autoSessions.has(sessionId)) {
+        const blob = (opt: { optionId: string; name: string; kind: string }) =>
+          `${opt.kind} ${opt.name} ${opt.optionId}`.toLowerCase();
+        const allow =
+          options.find((opt) => /always|session|forever/.test(blob(opt)) && /allow|approve|accept/.test(blob(opt))) ||
+          options.find((opt) => /allow|approve|accept/.test(blob(opt))) ||
+          options[0];
+        if (allow?.optionId) {
+          return { outcome: { outcome: "selected", optionId: allow.optionId } };
+        }
+      }
       const toolCall = p.toolCall as { title?: string } | undefined;
       const request: PermissionRequest = {
         requestId: rpcId,
-        sessionId: String(p.sessionId ?? ""),
+        sessionId,
         title: toolCall?.title || "需要授权",
         toolCall: p.toolCall,
         options,
@@ -291,6 +382,33 @@ export class GrokAcpClient extends EventEmitter {
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, body, "utf8");
       return {};
+    }
+
+    const terminalMethod = method.replace(/^x\.ai\//, "");
+    if (terminalMethod === "terminal/create") {
+      const sessionId = String(p.sessionId ?? "");
+      const sessionCwd = this.sessionCwds.get(sessionId);
+      const cwd = p.cwd ? this.assertAllowed(String(p.cwd)) : sessionCwd;
+      return this.terminals.create({
+        command: String(p.command ?? ""),
+        args: Array.isArray(p.args) ? (p.args as string[]) : undefined,
+        env: Array.isArray(p.env) ? (p.env as { name?: string; value?: string }[]) : undefined,
+        cwd,
+        outputByteLimit: typeof p.outputByteLimit === "number" ? p.outputByteLimit : undefined,
+        sessionCwd,
+      });
+    }
+    if (terminalMethod === "terminal/output") {
+      return this.terminals.output(String(p.terminalId ?? ""));
+    }
+    if (terminalMethod === "terminal/wait_for_exit") {
+      return this.terminals.waitForExit(String(p.terminalId ?? ""));
+    }
+    if (terminalMethod === "terminal/kill") {
+      return this.terminals.kill(String(p.terminalId ?? ""));
+    }
+    if (terminalMethod === "terminal/release") {
+      return this.terminals.release(String(p.terminalId ?? ""));
     }
 
     throw new Error(`Unsupported client method: ${method}`);

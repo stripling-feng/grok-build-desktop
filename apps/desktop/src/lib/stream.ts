@@ -1,9 +1,10 @@
-import { applyUpdateToItems, type StreamItem } from "../../electron/shared";
+import { applyUpdateToItems, isSpawnSubagentUpdate, type StreamItem } from "../../electron/shared";
 
 function cloneItems(items: StreamItem[]): StreamItem[] {
   return items.map((item) => {
-    if (item.kind === "tool") return { ...item };
+    if (item.kind === "tool" || item.kind === "subagent") return { ...item };
     if (item.kind === "plan") return { ...item, entries: [...item.entries] };
+    if (item.kind === "media") return { ...item, urls: [...item.urls] };
     if (item.kind === "user" || item.kind === "agent" || item.kind === "thought" || item.kind === "status") {
       return { ...item };
     }
@@ -32,6 +33,15 @@ function toolInsertAt(items: StreamItem[]): number {
   return lastUserIndex(items) + 1;
 }
 
+export function isSpawnSubagentTool(
+  item: Extract<StreamItem, { kind: "tool" }> | Record<string, unknown>,
+): boolean {
+  if ("kind" in item && (item as StreamItem).kind === "subagent") return true;
+  const rec = item as Record<string, unknown>;
+  if (String(rec.title ?? "").toLowerCase().includes("spawn_subagent")) return true;
+  return isSpawnSubagentUpdate(rec);
+}
+
 export function applyLiveUpdate(
   items: StreamItem[],
   update: Record<string, unknown>,
@@ -54,30 +64,32 @@ export function applyLiveUpdate(
     const idx = indexInTurn(next, "thought");
     if (idx >= 0) {
       const item = next[idx] as Extract<StreamItem, { kind: "thought" }>;
-      if (idx === next.length - 1) item.text += text;
-      else item.text = text;
+      item.text += text;
     } else {
       next.splice(thoughtInsertAt(next), 0, { kind: "thought", text });
     }
     return next;
   }
   if (kind === "tool_call" || kind === "tool_call_update") {
-    const id = String(update.toolCallId ?? update.tool_call_id ?? "");
-    const existingIdx = indexInTurn(next, "tool");
-    if (kind === "tool_call_update") {
-      if (existingIdx >= 0) applyUpdateToItems(next, tools, kind, update);
+    if (kind === "tool_call_update" || isSpawnSubagentUpdate(update)) {
+      applyUpdateToItems(next, tools, kind === "tool_call_update" ? kind : "tool_call", update);
       return next;
     }
+    const existingIdx = (() => {
+      const start = lastUserIndex(next) + 1;
+      for (let i = start; i < next.length; i++) {
+        const item = next[i];
+        if (item.kind === "tool") return i;
+      }
+      return -1;
+    })();
     const insertAt = existingIdx >= 0 ? existingIdx : toolInsertAt(next);
     if (existingIdx >= 0) {
       const old = next[existingIdx];
       if (old.kind === "tool") tools.delete(old.id);
       next.splice(existingIdx, 1);
     }
-    applyUpdateToItems(next, tools, "tool_call", {
-      ...update,
-      toolCallId: id || `tool-${next.length}`,
-    });
+    applyUpdateToItems(next, tools, "tool_call", update);
     const created = next.pop();
     if (created) next.splice(Math.min(insertAt, next.length), 0, created);
     return next;
@@ -87,5 +99,23 @@ export function applyLiveUpdate(
 }
 
 export function stripEphemeral(items: StreamItem[]): StreamItem[] {
-  return items.filter((item) => item.kind !== "thought" && item.kind !== "tool");
+  return items.filter((item) => {
+    if (item.kind === "thought") return false;
+    if (item.kind === "tool") return false;
+    return true;
+  });
+}
+
+export function stampTurnDuration(items: StreamItem[]): StreamItem[] {
+  const next = items.slice();
+  for (let i = next.length - 1; i >= 0; i--) {
+    const item = next[i];
+    if (item.kind === "user") {
+      if (item.startedAt && !item.durationMs) {
+        next[i] = { ...item, durationMs: Math.max(1000, Date.now() - item.startedAt) };
+      }
+      break;
+    }
+  }
+  return next;
 }

@@ -42,16 +42,22 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
   if (!root) {
     return {
       branch: null,
+      remote: null,
       isRepo: false,
       isWorktree: false,
       mainRoot: null,
+      added: 0,
+      removed: 0,
       files: [],
     };
   }
-  const [branchRes, porcelain, common] = await Promise.all([
+  const [branchRes, porcelain, common, remoteRes, unstagedStat, stagedStat] = await Promise.all([
     git(["rev-parse", "--abbrev-ref", "HEAD"], cwd),
     git(["status", "--porcelain=v1", "-uall"], cwd),
     git(["rev-parse", "--git-common-dir"], cwd),
+    git(["remote", "get-url", "origin"], cwd),
+    git(["diff", "--numstat"], cwd),
+    git(["diff", "--numstat", "--cached"], cwd),
   ]);
   const gitDir = common.stdout.trim();
   const isWorktree = Boolean(gitDir) && path.resolve(cwd) !== path.resolve(root);
@@ -60,13 +66,45 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
   if (isWorktree && /(^|[\\/])\.git$/i.test(normalizedGitDir)) {
     mainRoot = path.dirname(normalizedGitDir);
   }
+  let remote = remoteRes.ok ? remoteRes.stdout.trim() || null : null;
+  if (!remote) {
+    const all = await git(["remote", "-v"], cwd);
+    const line = all.stdout.split(/\r?\n/).find((item) => /\s\(fetch\)\s*$/.test(item) || item.trim());
+    if (line) remote = line.trim().split(/\s+/)[1] || null;
+  }
+  const files = parsePorcelain(porcelain.stdout).slice(0, 300);
+  const counts = parseNumstat(unstagedStat.stdout, stagedStat.stdout, files);
   return {
     branch: branchRes.stdout.trim() || null,
+    remote,
     isRepo: true,
     isWorktree,
     mainRoot,
-    files: parsePorcelain(porcelain.stdout).slice(0, 300),
+    added: counts.added,
+    removed: counts.removed,
+    files,
   };
+}
+
+function parseNumstat(
+  unstaged: string,
+  staged: string,
+  files: GitFile[],
+): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const text of [unstaged, staged]) {
+    for (const raw of text.split(/\r?\n/)) {
+      const match = raw.match(/^(\d+|-)\t(\d+|-)\t/);
+      if (!match) continue;
+      if (match[1] !== "-") added += Number(match[1]);
+      if (match[2] !== "-") removed += Number(match[2]);
+    }
+  }
+  for (const file of files) {
+    if (file.untracked) added += 1;
+  }
+  return { added, removed };
 }
 
 function parsePorcelain(text: string): GitFile[] {
@@ -169,6 +207,35 @@ export async function createWorktree(cwd: string): Promise<{ cwd: string; branch
   const res = await git(["worktree", "add", "-b", branch, dest], root);
   if (!res.ok) throw new Error(res.stderr || "创建工作树失败");
   return { cwd: dest, branch };
+}
+
+export async function gitCommit(cwd: string, message: string): Promise<string> {
+  const root = await findGitRoot(cwd);
+  if (!root) throw new Error("当前目录不是 Git 仓库");
+  const msg = message.trim();
+  if (!msg) throw new Error("提交说明不能为空");
+  const staged = await git(["diff", "--cached", "--name-only"], cwd);
+  if (!staged.ok) throw new Error(staged.stderr || "无法读取暂存区");
+  if (!staged.stdout.trim()) {
+    const add = await git(["add", "-A"], cwd);
+    if (!add.ok) throw new Error(add.stderr || "暂存失败");
+  }
+  const res = await git(["commit", "-m", msg], cwd);
+  if (!res.ok) throw new Error(res.stderr || "提交失败");
+  return res.stdout.trim() || "已提交";
+}
+
+export async function gitPush(cwd: string): Promise<string> {
+  const root = await findGitRoot(cwd);
+  if (!root) throw new Error("当前目录不是 Git 仓库");
+  const branchRes = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const branch = branchRes.stdout.trim();
+  if (!branch || branch === "HEAD") throw new Error("当前不在已命名分支上");
+  const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
+  const args = upstream.ok ? ["push"] : ["push", "-u", "origin", branch];
+  const res = await git(args, cwd);
+  if (!res.ok) throw new Error(res.stderr || "推送失败");
+  return res.stdout.trim() || res.stderr.trim() || "已推送";
 }
 
 export async function applyWorktree(worktreeCwd: string, destCwd: string): Promise<string> {

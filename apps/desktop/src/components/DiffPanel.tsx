@@ -90,7 +90,7 @@ export function DiffPanel({
             编辑器
           </button>
           <button className="btn small ghost" type="button" onClick={onToggle}>
-            隐藏
+            关闭
           </button>
         </span>
       </div>

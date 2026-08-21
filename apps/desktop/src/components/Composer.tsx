@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState, type DragEvent } from "react";
-import type { AppSettings, PermissionMode, PermissionRequest } from "../../electron/shared";
+import type {
+  AppSettings,
+  ContextUsage,
+  GitStatus,
+  PermissionMode,
+  PermissionRequest,
+  ProjectInfo,
+  ReasoningEffort,
+} from "../../electron/shared";
 import { permissionOptionLabel } from "../lib/i18n";
 
 type Props = {
@@ -8,10 +16,14 @@ type Props = {
   disabled: boolean;
   worktree: boolean;
   canChooseEnv: boolean;
+  showWorktree?: boolean;
+  showGoal?: boolean;
   planMode: boolean;
   goal: string;
   attachments: string[];
   settings: AppSettings | null;
+  contextUsed?: number | null;
+  contextUsage?: ContextUsage | null;
   permission: PermissionRequest | null;
   onChange: (v: string) => void;
   onEnvChange: (worktree: boolean) => void;
@@ -20,16 +32,76 @@ type Props = {
   onAttachments: (paths: string[]) => void;
   onPermissionMode: (mode: PermissionMode) => void;
   onModel: (id: string) => void;
+  onReasoningEffort: (effort: ReasoningEffort) => void;
   onSend: () => void;
   onStop: () => void;
   onPermission: (optionId: string) => void;
+  onNewChat?: () => void;
+  onOpenSettings?: () => void;
+  projects?: ProjectInfo[];
+  selectedProject?: ProjectInfo | null;
+  git?: GitStatus | null;
+  onSelectProject?: (project: ProjectInfo | null) => void;
+  onPickProject?: () => void;
+  showProjectPicker?: boolean;
 };
 
-const PERM: { id: PermissionMode; label: string }[] = [
-  { id: "always-approve", label: "完全访问" },
-  { id: "auto", label: "自动" },
-  { id: "ask", label: "询问" },
+const PERM: { id: PermissionMode; label: string; hint: string; tone: "full" | "auto" | "ask" }[] = [
+  { id: "always-approve", label: "完全访问", hint: "跳过普通授权，直接改文件、跑命令", tone: "full" },
+  { id: "auto", label: "自动", hint: "安全操作自动通过，其余再问你", tone: "auto" },
+  { id: "ask", label: "询问", hint: "改文件、跑命令前先问你", tone: "ask" },
 ];
+
+const REASONING: { id: ReasoningEffort; label: string; hint: string }[] = [
+  { id: "low", label: "低", hint: "更快，适合简单问题" },
+  { id: "medium", label: "中", hint: "速度和深度折中" },
+  { id: "high", label: "高", hint: "更充分的推理" },
+  { id: "xhigh", label: "极高", hint: "最深推理，耗时更长" },
+];
+
+function samePath(a: string, b: string) {
+  return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function shortRemote(url: string) {
+  return url
+    .replace(/\.git$/i, "")
+    .replace(/^git@github\.com:/i, "")
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, "")
+    .replace(/^https?:\/\//i, "");
+}
+
+function IconFolderChip() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden>
+      <path
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+        d="M2.2 4.2A1.4 1.4 0 0 1 3.6 2.8h2.6c.3 0 .6.12.8.34l.7.76c.2.22.5.34.8.34h3.9A1.4 1.4 0 0 1 14 5.64v6.76A1.4 1.4 0 0 1 12.6 13.8h-9A1.4 1.4 0 0 1 2.2 12.4V4.2z"
+      />
+    </svg>
+  );
+}
+
+function IconBranchChip() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden>
+      <circle cx="5" cy="4" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="5" cy="12" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="11.2" cy="8" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <path
+        d="M5 5.6v4.8M5 8h2.2a2.4 2.4 0 0 1 2.4 2.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
 
 function IconClip() {
   return (
@@ -54,6 +126,23 @@ function IconGoal() {
     </svg>
   );
 }
+function IconImage() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+      <rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="1.25" />
+      <circle cx="5.6" cy="6.3" r="1.05" fill="currentColor" />
+      <path d="M3.2 11.4 6.4 8.4l2.1 2.1 1.7-1.7 2.6 2.6" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinejoin="round" />
+    </svg>
+  );
+}
+function IconVideo() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+      <rect x="1.8" y="3.6" width="8.8" height="8.8" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M11.2 6.4 14.2 4.8v6.4L11.2 9.6z" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinejoin="round" />
+    </svg>
+  );
+}
 function IconPlan() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
@@ -74,11 +163,48 @@ function IconPlus() {
     </svg>
   );
 }
-function IconSend() {
+function IconPermInfo() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+    <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden>
+      <circle cx="8" cy="8" r="6.1" fill="none" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M8 7.2v4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="8" cy="5.15" r="0.85" fill="currentColor" />
+    </svg>
+  );
+}
+function IconPermAuto() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden>
       <path
-        d="M8 12.2V3.8M4.2 7.4 8 3.8l3.8 3.6"
+        d="M9.2 2.4 4.2 9.1h3.3L6.8 13.6l5-6.7H8.5z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.35"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+function IconPermAsk() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden>
+      <circle cx="8" cy="8" r="6.1" fill="none" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M6.35 6.35a1.7 1.7 0 1 1 2.5 1.5c-.5.3-.85.7-.85 1.25"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.35"
+        strokeLinecap="round"
+      />
+      <circle cx="8" cy="11.35" r="0.75" fill="currentColor" />
+    </svg>
+  );
+}
+function IconCheck() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden>
+      <path
+        d="M3.6 8.2 6.5 11.1 12.4 4.8"
         fill="none"
         stroke="currentColor"
         strokeWidth="1.7"
@@ -88,9 +214,179 @@ function IconSend() {
     </svg>
   );
 }
+function permIcon(tone: "full" | "auto" | "ask") {
+  if (tone === "full") return <IconPermInfo />;
+  if (tone === "auto") return <IconPermAuto />;
+  return <IconPermAsk />;
+}
+function IconSend() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+      <path
+        d="M8 12.4V4.2M4.6 7.4 8 4l3.4 3.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function formatTokens(n: number) {
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${v >= 10 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (n >= 1000) {
+    const v = n / 1000;
+    return `${v >= 10 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(Math.round(n));
+}
+
+function formatCount(n: number) {
+  return Math.round(n).toLocaleString("zh-CN");
+}
+
+function formatCompact(n: number) {
+  if (n >= 10_000) {
+    const wan = n / 10_000;
+    return `${wan >= 10 ? wan.toFixed(0) : wan.toFixed(1).replace(/\.0$/, "")}万`;
+  }
+  return formatTokens(n);
+}
+
+function formatPct(ratio: number) {
+  const pct = ratio * 100;
+  if (pct > 0 && pct < 0.1) return "<0.1%";
+  return `${pct >= 10 ? pct.toFixed(1) : pct.toFixed(1)}%`;
+}
+
+const PART_COLORS: Record<string, string> = {
+  messages: "#3b6fd4",
+  tools: "#2f9e8f",
+  mcp: "#7a5af8",
+  skills: "#d08a12",
+  system: "#c45c9a",
+  other: "#8d8d92",
+};
+
+function ContextRing({
+  used,
+  limit,
+  usage,
+}: {
+  used: number;
+  limit?: number;
+  usage?: ContextUsage | null;
+}) {
+  const size = 16;
+  const stroke = 2.2;
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const ratio = limit && limit > 0 ? Math.min(1, Math.max(0, used / limit)) : 0;
+  const pctText = (ratio * 100).toFixed(1);
+  const tone = ratio >= 0.9 ? "hot" : ratio >= 0.7 ? "warm" : "ok";
+  const cacheHit = usage?.cacheHitRate;
+  const parts = usage?.parts ?? [];
+  const label = limit
+    ? `上下文容量 ${formatCompact(used)} / ${formatCompact(limit)}（${pctText}%）`
+    : `上下文 ${formatCount(used)} tokens`;
+  return (
+    <span className={`context-ring ${tone}`} aria-label={label}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={stroke}
+          className="context-ring-track"
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={stroke}
+          strokeLinecap="round"
+          strokeDasharray={`${c} ${c}`}
+          strokeDashoffset={c * (1 - (limit ? ratio : 0.08))}
+          transform={`rotate(-90 ${size / 2} ${size / 2})`}
+          className="context-ring-fill"
+        />
+      </svg>
+      <span className="context-tip">
+        <strong>上下文容量</strong>
+        <span className="context-tip-head">
+          {limit ? (
+            <>
+              {formatCompact(used)}/{formatCompact(limit)}
+              <em>（{pctText}%）</em>
+            </>
+          ) : (
+            <>已用 {formatCount(used)}</>
+          )}
+        </span>
+        {parts.length ? (
+          <span className="context-tip-stack" aria-hidden>
+            {parts
+              .filter((part) => part.tokens > 0)
+              .map((part) => (
+                <i
+                  key={part.id}
+                  style={{
+                    width: `${Math.max(0.4, part.tokens * 100)}%`,
+                    background: PART_COLORS[part.id] || PART_COLORS.other,
+                  }}
+                />
+              ))}
+          </span>
+        ) : limit ? (
+          <span className="context-tip-bar" aria-hidden>
+            <i style={{ width: `${Math.max(2, ratio * 100)}%` }} />
+          </span>
+        ) : null}
+        {parts.length ? (
+          <span className="context-tip-parts">
+            {parts.map((part) => (
+              <span key={part.id} className="context-tip-part">
+                <i style={{ background: PART_COLORS[part.id] || PART_COLORS.other }} />
+                <b>{part.label}</b>
+                <em>{formatPct(part.tokens)}</em>
+              </span>
+            ))}
+          </span>
+        ) : null}
+        {cacheHit != null ? (
+          <span className="context-tip-cache">
+            平均缓存命中率 <em>{(cacheHit * 100).toFixed(1)}%</em>
+          </span>
+        ) : null}
+      </span>
+    </span>
+  );
+}
 
 function fileName(p: string) {
   return p.replace(/^.*[\\/]/, "") || p;
+}
+
+function isImagePath(p: string) {
+  return /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(p);
+}
+
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取剪贴板图片失败"));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function dropPaths(e: DragEvent): string[] {
@@ -106,10 +402,14 @@ export function Composer({
   disabled,
   worktree,
   canChooseEnv,
+  showWorktree = true,
+  showGoal = true,
   planMode,
   goal,
   attachments,
   settings,
+  contextUsed,
+  contextUsage,
   permission,
   onChange,
   onEnvChange,
@@ -118,27 +418,48 @@ export function Composer({
   onAttachments,
   onPermissionMode,
   onModel,
+  onReasoningEffort,
   onSend,
   onStop,
   onPermission,
+  onNewChat,
+  onOpenSettings,
+  projects = [],
+  selectedProject = null,
+  git = null,
+  onSelectProject,
+  onPickProject,
+  showProjectPicker = false,
 }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
+  const [projectOpen, setProjectOpen] = useState(false);
   const [goalOpen, setGoalOpen] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
   const [goalDraft, setGoalDraft] = useState(goal);
   const [dragOver, setDragOver] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [previews, setPreviews] = useState<Record<string, string>>({});
 
   useEffect(() => setGoalDraft(goal), [goal]);
+  useEffect(() => setSlashIndex(0), [value]);
+  useEffect(() => {
+    setPreviews((cur) => {
+      const next: Record<string, string> = {};
+      for (const p of attachments) if (cur[p]) next[p] = cur[p];
+      return next;
+    });
+  }, [attachments]);
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, 52), 180)}px`;
+    const minHeight = parseFloat(getComputedStyle(el).minHeight) || 36;
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, minHeight), 180)}px`;
   }, [value]);
 
   useEffect(() => {
@@ -148,6 +469,7 @@ export function Composer({
         setPickOpen(false);
         setPermOpen(false);
         setModelOpen(false);
+        setProjectOpen(false);
       }
     };
     const onKey = (e: KeyboardEvent) => {
@@ -156,6 +478,7 @@ export function Composer({
         setPickOpen(false);
         setPermOpen(false);
         setModelOpen(false);
+        setProjectOpen(false);
       }
     };
     document.addEventListener("mousedown", onDoc);
@@ -167,20 +490,99 @@ export function Composer({
   }, []);
 
   const perm = settings?.permissionMode || "ask";
-  const permLabel = PERM.find((p) => p.id === perm)?.label || "询问";
+  const permMeta = PERM.find((p) => p.id === perm) || PERM[2];
   const model = settings?.models.find((m) => m.id === settings.model);
   const modelLabel = model?.name || settings?.model || "模型";
+  const effort = settings?.reasoningEffort || "high";
+  const effortMeta = REASONING.find((r) => r.id === effort) || REASONING[2];
+  const contextWindow = model?.contextWindow;
+  const showContext = contextUsed != null || Boolean(contextWindow);
+  const slashQuery = value.startsWith("/") && !/\s/.test(value) ? value.slice(1) : null;
+  const slashItems = (() => {
+    if (slashQuery === null) return [];
+    const q = slashQuery.toLowerCase();
+    const builtins = [
+      { id: "new", label: "/new", hint: "开始新对话", kind: "app" as const },
+      { id: "settings", label: "/settings", hint: "打开设置", kind: "app" as const },
+      { id: "plan", label: "/plan", hint: "切换计划模式", kind: "app" as const },
+      { id: "loop", label: "/loop 5m", hint: "当前会话循环任务，不是系统定时", kind: "insert" as const },
+      { id: "imagine", label: "/imagine", hint: "根据描述生成图片", kind: "insert" as const },
+      { id: "imagine-video", label: "/imagine-video", hint: "根据描述生成视频", kind: "insert" as const },
+    ];
+    const skills = (settings?.skills ?? [])
+      .filter((s) => !s.disabled && s.userInvocable !== false)
+      .map((s) => ({
+        id: `skill:${s.name}`,
+        label: s.invocableAs || `/${s.name}`,
+        hint: s.description || s.source,
+        kind: "insert" as const,
+      }));
+    return [...builtins, ...skills].filter((item) => {
+      const hay = `${item.label} ${item.hint}`.toLowerCase();
+      return !q || hay.includes(q) || item.label.slice(1).toLowerCase().startsWith(q);
+    });
+  })();
+  const slashOpen = slashItems.length > 0 && slashQuery !== null;
 
   function closeMenus() {
     setMenuOpen(false);
     setPickOpen(false);
     setPermOpen(false);
     setModelOpen(false);
+    setProjectOpen(false);
   }
 
   function addPaths(paths: string[]) {
     if (!paths.length) return;
     onAttachments([...attachments, ...paths.filter((p) => !attachments.includes(p))]);
+  }
+
+  async function pasteImages(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = [...e.clipboardData.items];
+    const files = items
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    if (!files.length) {
+      if (e.clipboardData.getData("text")) return;
+      const native = await window.grok.saveClipboardImage();
+      if (!native) return;
+      setPreviews((cur) => ({ ...cur, [native.path]: native.dataUrl }));
+      addPaths([native.path]);
+      return;
+    }
+    const saved: string[] = [];
+    for (const file of files) {
+      try {
+        const data = await blobToDataUrl(file);
+        const next = await window.grok.savePastedImage({ data, mimeType: file.type || "image/png" });
+        saved.push(next.path);
+        setPreviews((cur) => ({ ...cur, [next.path]: data }));
+      } catch {
+        /* skip a bad clipboard item */
+      }
+    }
+    addPaths(saved);
+  }
+
+  function applySlash(item: { id: string; label: string; kind: "app" | "insert" }) {
+    if (item.id === "new") {
+      onChange("");
+      onNewChat?.();
+      return;
+    }
+    if (item.id === "settings") {
+      onChange("");
+      onOpenSettings?.();
+      return;
+    }
+    if (item.id === "plan") {
+      onPlanMode(!planMode);
+      onChange("");
+      return;
+    }
+    onChange(item.label.endsWith(" ") ? item.label : `${item.label} `);
+    requestAnimationFrame(() => ref.current?.focus());
   }
 
   async function pick(kind: "files" | "folder") {
@@ -233,17 +635,47 @@ export function Composer({
                 </button>
               </>
             ) : null}
+            {showGoal ? (
+              <button
+                type="button"
+                onClick={() => {
+                  closeMenus();
+                  setGoalOpen(true);
+                }}
+              >
+                <IconGoal />
+                <span className="add-row">
+                  <strong>目标</strong>
+                  <em>设置要持续追求的目标</em>
+                </span>
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => {
+                onChange(value.trim() ? `/imagine ${value.trim()}` : "/imagine ");
                 closeMenus();
-                setGoalOpen(true);
+                requestAnimationFrame(() => ref.current?.focus());
               }}
             >
-              <IconGoal />
+              <IconImage />
               <span className="add-row">
-                <strong>目标</strong>
-                <em>设置要持续追求的目标</em>
+                <strong>生成图片</strong>
+                <em>中转走上游，OAuth 走官方</em>
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onChange(value.trim() ? `/imagine-video ${value.trim()}` : "/imagine-video ");
+                closeMenus();
+                requestAnimationFrame(() => ref.current?.focus());
+              }}
+            >
+              <IconVideo />
+              <span className="add-row">
+                <strong>生成视频</strong>
+                <em>中转走上游，OAuth 走官方</em>
               </span>
             </button>
             <button
@@ -276,6 +708,74 @@ export function Composer({
             addPaths(dropPaths(e));
           }}
         >
+          {showProjectPicker ? (
+          <div className="composer-context">
+            <div className="context-chip-wrap">
+              <button
+                type="button"
+                className={`context-chip${projectOpen ? " open" : ""}`}
+                onClick={() => {
+                  setMenuOpen(false);
+                  setPickOpen(false);
+                  setPermOpen(false);
+                  setModelOpen(false);
+                  setProjectOpen((v) => !v);
+                }}
+              >
+                <IconFolderChip />
+                <span>{selectedProject?.name || "普通对话"}</span>
+                <span className="context-caret">▾</span>
+              </button>
+              {projectOpen ? (
+                <div className="context-menu">
+                  <button
+                    type="button"
+                    className={!selectedProject ? "on" : ""}
+                    onClick={() => {
+                      onSelectProject?.(null);
+                      setProjectOpen(false);
+                    }}
+                  >
+                    普通对话
+                    <em>不绑定项目目录</em>
+                  </button>
+                  {projects.map((project) => (
+                    <button
+                      key={project.cwd}
+                      type="button"
+                      className={selectedProject && samePath(selectedProject.cwd, project.cwd) ? "on" : ""}
+                      title={project.cwd}
+                      onClick={() => {
+                        onSelectProject?.(project);
+                        setProjectOpen(false);
+                      }}
+                    >
+                      {project.name}
+                      <em>{project.cwd}</em>
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProjectOpen(false);
+                      onPickProject?.();
+                    }}
+                  >
+                    选择文件夹…
+                    <em>选中后会作为项目</em>
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {selectedProject && git?.isRepo ? (
+              <span className="context-chip static" title={git.remote || git.branch || ""}>
+                <IconBranchChip />
+                <span>{git.branch || "HEAD"}</span>
+                {git.remote ? <em className="context-remote">{shortRemote(git.remote)}</em> : null}
+              </span>
+            ) : null}
+          </div>
+          ) : null}
           {attachments.length || goal || planMode ? (
             <div className="composer-chips">
               {planMode ? (
@@ -295,8 +795,9 @@ export function Composer({
                 </span>
               ) : null}
               {attachments.map((p) => (
-                <span className="chip" key={p} title={p}>
-                  {fileName(p)}
+                <span className={`chip${isImagePath(p) ? " image" : ""}`} key={p} title={p}>
+                  {previews[p] ? <img className="chip-thumb" src={previews[p]} alt="" /> : null}
+                  {isImagePath(p) ? "截图" : fileName(p)}
                   <button type="button" onClick={() => onAttachments(attachments.filter((x) => x !== p))}>
                     ×
                   </button>
@@ -304,14 +805,55 @@ export function Composer({
               ))}
             </div>
           ) : null}
+          {slashOpen ? (
+            <div className="slash-menu">
+              {slashItems.slice(0, 12).map((item, i) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`slash-item${i === slashIndex ? " on" : ""}`}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applySlash(item);
+                  }}
+                >
+                  <strong>{item.label}</strong>
+                  <em>{item.hint}</em>
+                </button>
+              ))}
+            </div>
+          ) : null}
           <textarea
             ref={ref}
             value={value}
             disabled={disabled}
-            placeholder={disabled ? "先选择一个项目" : "随心输入"}
+            placeholder="随心输入，输入 / 可调用技能"
             onChange={(e) => onChange(e.target.value)}
+            onPaste={(e) => {
+              const hasImage = [...e.clipboardData.items].some(
+                (item) => item.kind === "file" && item.type.startsWith("image/"),
+              );
+              if (hasImage || !e.clipboardData.getData("text")) e.preventDefault();
+              void pasteImages(e);
+            }}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                e.preventDefault();
+                const max = Math.min(slashItems.length, 12);
+                setSlashIndex((i) =>
+                  e.key === "ArrowDown" ? (i + 1) % max : (i - 1 + max) % max,
+                );
+                return;
+              }
+              if (slashOpen && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+                const item = slashItems[slashIndex];
+                if (item) {
+                  e.preventDefault();
+                  applySlash(item);
+                  return;
+                }
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 if (busy) onStop();
@@ -330,6 +872,7 @@ export function Composer({
                   setPermOpen(false);
                   setModelOpen(false);
                   setPickOpen(false);
+                  setProjectOpen(false);
                   setMenuOpen((v) => !v);
                 }}
               >
@@ -338,36 +881,47 @@ export function Composer({
               <div className="perm-wrap">
                 <button
                   type="button"
-                  className={`access-chip${perm === "always-approve" ? " full" : ""}`}
+                  className={`access-chip ${permMeta.tone}${permOpen ? " open" : ""}`}
                   onClick={() => {
                     setMenuOpen(false);
                     setPickOpen(false);
                     setModelOpen(false);
+                    setProjectOpen(false);
                     setPermOpen((v) => !v);
                   }}
                 >
-                  <span className="access-dot">i</span>
-                  {permLabel}
+                  {permIcon(permMeta.tone)}
+                  {permMeta.label}
                 </button>
                 {permOpen ? (
-                  <div className="mini-menu">
+                  <div className="perm-menu">
+                    <div className="perm-menu-label">权限模式</div>
                     {PERM.map((p) => (
                       <button
                         key={p.id}
                         type="button"
-                        className={perm === p.id ? "on" : ""}
+                        className={`perm-option ${p.tone}${perm === p.id ? " on" : ""}`}
                         onClick={() => {
                           onPermissionMode(p.id);
                           setPermOpen(false);
                         }}
                       >
-                        {p.label}
+                        <span className={`perm-option-icon ${p.tone}`}>{permIcon(p.tone)}</span>
+                        <span className="perm-option-copy">
+                          <strong>{p.label}</strong>
+                          <em>{p.hint}</em>
+                        </span>
+                        {perm === p.id ? (
+                          <span className="perm-option-check">
+                            <IconCheck />
+                          </span>
+                        ) : null}
                       </button>
                     ))}
                   </div>
                 ) : null}
               </div>
-              {canChooseEnv || worktree ? (
+              {showWorktree && (canChooseEnv || worktree) ? (
                 <button
                   type="button"
                   className={`worktree-chip${worktree ? " on" : ""}`}
@@ -382,33 +936,67 @@ export function Composer({
             </div>
             <div className="composer-right">
               <div className="model-wrap">
+                {showContext ? (
+                  <ContextRing used={contextUsed ?? 0} limit={contextWindow} usage={contextUsage} />
+                ) : null}
                 <button
                   type="button"
-                  className="model-chip"
+                  className={`model-chip${modelOpen ? " open" : ""}`}
                   onClick={() => {
                     setMenuOpen(false);
                     setPickOpen(false);
                     setPermOpen(false);
+                    setProjectOpen(false);
                     setModelOpen((v) => !v);
                   }}
                 >
-                  {modelLabel}
+                  <span className="model-chip-name">{modelLabel}</span>
+                  <span className="model-chip-effort">{effortMeta.label}</span>
                 </button>
                 {modelOpen && settings ? (
-                  <div className="mini-menu right">
-                    {settings.models.map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        className={m.id === settings.model ? "on" : ""}
-                        onClick={() => {
-                          onModel(m.id);
-                          setModelOpen(false);
-                        }}
-                      >
-                        {m.name === m.id ? m.id : `${m.name}（${m.id}）`}
-                      </button>
-                    ))}
+                  <div className="model-menu">
+                    <div className="model-menu-section">
+                      <div className="model-menu-kicker">模型</div>
+                      <div className="model-menu-list">
+                        {settings.models.map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            className={`model-option${m.id === settings.model ? " on" : ""}`}
+                            onClick={() => onModel(m.id)}
+                          >
+                            <span className={`model-radio${m.id === settings.model ? " on" : ""}`} />
+                            <span className="perm-option-copy">
+                              <strong>{m.name}</strong>
+                              {m.name !== m.id ? <em>{m.id}</em> : null}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="model-menu-section">
+                      <div className="model-menu-kicker">推理等级</div>
+                      <div className="effort-seg">
+                        <span
+                          className="effort-thumb"
+                          style={{
+                            transform: `translateX(${REASONING.findIndex((r) => r.id === effort) * 100}%)`,
+                          }}
+                        />
+                        {REASONING.map((r) => (
+                          <button
+                            key={r.id}
+                            type="button"
+                            className={effort === r.id ? "on" : ""}
+                            title={r.hint}
+                            onClick={() => onReasoningEffort(r.id)}
+                          >
+                            {r.label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="effort-hint">{effortMeta.hint}</p>
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -420,7 +1008,7 @@ export function Composer({
                 <button
                   className="send-round"
                   type="button"
-                  disabled={disabled || !value.trim()}
+                  disabled={disabled || (!value.trim() && !attachments.length)}
                   onClick={onSend}
                   aria-label="发送"
                 >

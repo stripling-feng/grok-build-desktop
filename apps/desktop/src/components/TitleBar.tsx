@@ -1,3 +1,5 @@
+import grokMark from "../assets/grok-mark.jpg";
+
 export function TitleBar({
   subtitle,
   onSettings,
@@ -10,12 +12,7 @@ export function TitleBar({
   return (
     <header className="titlebar">
       <div className="titlebar-left">
-        <svg className="titlebar-mark" viewBox="0 0 16 16" aria-hidden>
-          <path
-            fill="currentColor"
-            d="M8 1.2 9.7 6.3 15 8 9.7 9.7 8 14.8 6.3 9.7 1 8l5.3-1.7L8 1.2z"
-          />
-        </svg>
+        <img className="titlebar-mark" src={grokMark} alt="" />
         <span>Grok Build 桌面端</span>
         {subtitle ? <span>· {subtitle}</span> : null}
       </div>
