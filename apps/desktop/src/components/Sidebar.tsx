@@ -403,7 +403,7 @@ export function Sidebar({
   return (
     <aside className="sidebar" onContextMenu={(e) => e.preventDefault()}>
       <div className="sidebar-nav">
-        <button type="button" className="sidebar-new-task" onClick={onOpenNewTask}>
+        <button type="button" className="btn primary block" onClick={onOpenNewTask}>
           <NewTaskIcon />
           新建任务
         </button>

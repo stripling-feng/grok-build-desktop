@@ -175,15 +175,7 @@ function RestItem({
     );
   }
   if (item.kind === "plan") {
-    return (
-      <ol className="plan">
-        {item.entries.map((e, j) => (
-          <li key={j} className={e.status}>
-            {e.content}
-          </li>
-        ))}
-      </ol>
-    );
+    return null;
   }
   if (item.kind === "tool") {
     return <ToolCard item={item} onOpenFile={onOpenFile} />;

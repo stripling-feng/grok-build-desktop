@@ -20,7 +20,11 @@ export type StreamItem =
       detail?: string;
       durationMs?: number;
     }
-  | { kind: "plan"; entries: { content: string; status?: string }[] }
+  | {
+      kind: "plan";
+      revision: number;
+      entries: { content: string; status: PlanEntryStatus }[];
+    }
   | { kind: "status"; text: string }
   | {
       kind: "media";
@@ -33,6 +37,45 @@ export type StreamItem =
     };
 
 export type MediaKind = "image" | "video";
+
+export type PlanEntryStatus =
+  | "pending"
+  | "in_progress"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+const PLAN_STATUS_ALIASES: Record<string, PlanEntryStatus> = {
+  pending: "pending",
+  todo: "pending",
+  queued: "pending",
+  waiting: "pending",
+  in_progress: "in_progress",
+  running: "in_progress",
+  active: "in_progress",
+  doing: "in_progress",
+  working: "in_progress",
+  started: "in_progress",
+  done: "done",
+  completed: "done",
+  complete: "done",
+  success: "done",
+  succeeded: "done",
+  finished: "done",
+  failed: "failed",
+  error: "failed",
+  failure: "failed",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+  rejected: "cancelled",
+  aborted: "cancelled",
+};
+
+export function normalizePlanStatus(raw: unknown): PlanEntryStatus {
+  if (typeof raw !== "string") return "pending";
+  const key = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return PLAN_STATUS_ALIASES[key] ?? "pending";
+}
 
 export type MediaResult = {
   kind: MediaKind;
@@ -595,17 +638,47 @@ export function applyUpdateToItems(
   }
 
   if (kind === "plan") {
-    const entries = Array.isArray(update.entries)
-      ? (update.entries as { content?: string; status?: string }[]).map((e) => ({
-          content: String(e.content ?? ""),
-          status: e.status,
-        }))
-      : [];
+    const rawRevision = update.revision;
+    const parsedRevision =
+      typeof rawRevision === "number" && Number.isFinite(rawRevision) && rawRevision > 0
+        ? Math.floor(rawRevision)
+        : undefined;
+    const incoming = Array.isArray(update.entries)
+      ? (update.entries as { content?: string; status?: string }[])
+    : [];
+    const normalized: { content: string; status: PlanEntryStatus }[] = incoming
+      .map((e) => ({
+        content: String(e.content ?? ""),
+        status: normalizePlanStatus(e.status),
+      }))
+      .filter((e) => e.content.length > 0);
+
     const last = items[items.length - 1];
-    if (last?.kind === "plan") {
-      last.entries = entries;
-    } else {
-      items.push({ kind: "plan", entries });
+    const isSameRevision =
+      last?.kind === "plan" &&
+      parsedRevision !== undefined &&
+      last.revision === parsedRevision;
+    const isLatestRevision =
+      last?.kind === "plan" &&
+      parsedRevision === undefined &&
+      true;
+
+    if (isSameRevision || isLatestRevision) {
+      const target = last as Extract<StreamItem, { kind: "plan" }>;
+      const byContent = new Map<string, PlanEntryStatus>();
+      for (const entry of target.entries) byContent.set(entry.content, entry.status);
+      const merged = normalized.map((entry) => {
+        const prev = byContent.get(entry.content);
+        if (prev && prev !== "pending" && entry.status === "pending") {
+          return entry;
+        }
+        return { content: entry.content, status: entry.status };
+      });
+      target.entries = merged;
+      return;
     }
+
+    const targetRevision = parsedRevision ?? 1;
+    items.push({ kind: "plan", revision: targetRevision, entries: normalized });
   }
 }

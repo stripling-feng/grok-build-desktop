@@ -1,15 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import type { GitStatus, StreamItem } from "../../electron/shared";
-type PlanEntry = { content: string; status?: string };
+import { normalizePlanStatus, type GitStatus, type StreamItem } from "../../electron/shared";
+import { latestPlan, type PlanEntry } from "../lib/stream";
 type AgentItem = Extract<StreamItem, { kind: "subagent" }>;
-
-function latestPlan(items: StreamItem[]): PlanEntry[] {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i];
-    if (item.kind === "plan") return item.entries;
-  }
-  return [];
-}
 
 function agentsFrom(items: StreamItem[]): AgentItem[] {
   const seen = new Map<string, AgentItem>();
@@ -20,8 +12,13 @@ function agentsFrom(items: StreamItem[]): AgentItem[] {
 }
 
 function planCounts(entries: PlanEntry[]) {
-  const done = entries.filter((e) => /complet|done|success/i.test(e.status || "")).length;
-  const running = entries.find((e) => /in_progress|running|active/i.test(e.status || ""));
+  let done = 0;
+  let running: PlanEntry | undefined;
+  for (const e of entries) {
+    const status = normalizePlanStatus(e.status);
+    if (status === "done") done += 1;
+    else if (!running && status === "in_progress") running = e;
+  }
   return { total: entries.length, done, running };
 }
 
@@ -83,17 +80,6 @@ export function StatusCard({
       setCommitOpen(false);
     }
   }, [open]);
-
-  const mini = (() => {
-    if (todos.running) return todos.running.content;
-    if (dirty && (added || removed)) return `+${added} −${removed}`;
-    if (todos.total) return `进程 ${todos.done}/${todos.total}`;
-    if (workingAgents.length) return `${workingAgents.length} 个智能体工作中`;
-    if (doneAgents.length) return `${doneAgents.length} 个智能体已完成`;
-    if (inRepo && git?.branch) return dirty ? `${git.files.length} 个更改` : git.branch;
-    if (showGit && git && !git.isRepo) return "不是 Git 仓库";
-    return "状态";
-  })();
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
@@ -265,7 +251,7 @@ export function StatusCard({
               </div>
               <ol className="status-todos">
                 {plan.map((entry, i) => (
-                  <li key={`${i}-${entry.content}`} className={entry.status || ""}>
+                  <li key={`${i}-${entry.content}`} className={normalizePlanStatus(entry.status)}>
                     {entry.content}
                   </li>
                 ))}
@@ -293,10 +279,6 @@ export function StatusCard({
           ) : null}
         </div>
       ) : null}
-      <button className="status-mini" type="button" onClick={() => setOpen((v) => !v)}>
-        <span className="status-mini-dot" />
-        <span className="status-mini-text">{mini || "状态"}</span>
-      </button>
     </div>
   );
 }

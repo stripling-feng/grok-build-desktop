@@ -14,14 +14,31 @@ export function TerminalPanel({
   const pre = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
-    if (!open || !cwd) return;
+    if (!open) return;
+    if (!cwd) {
+      setOutput("");
+      setLine("");
+      return;
+    }
+    let cancelled = false;
     setOutput(`$ ${cwd}\n`);
-    void window.grok.terminalStart(cwd);
-    const off = window.grok.onTerminalData((chunk) => {
-      setOutput((prev) => (prev + chunk).slice(-80_000));
-    });
+    let off: (() => void) | null = null;
+    void window.grok
+      .terminalStart(cwd)
+      .then(() => {
+        if (cancelled) return;
+        off = window.grok.onTerminalData((chunk) => {
+          if (cancelled) return;
+          setOutput((prev) => (prev + chunk).slice(-80_000));
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setOutput((prev) => (prev + `\n[无法启动终端：${err instanceof Error ? err.message : String(err)}]\n`).slice(-80_000));
+      });
     return () => {
-      off();
+      cancelled = true;
+      if (off) off();
       void window.grok.terminalKill();
     };
   }, [open, cwd]);

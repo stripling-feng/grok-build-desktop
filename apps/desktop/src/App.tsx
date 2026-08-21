@@ -8,7 +8,8 @@ import { Sidebar } from "./components/Sidebar";
 import { AutomationPage, MarketplacePage, type WorkspacePage } from "./components/WorkspacePages";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
-import { applyLiveUpdate, stampTurnDuration, stripEphemeral } from "./lib/stream";
+import { PlanPanel } from "./components/PlanPanel";
+import { applyLiveUpdate, stampTurnDuration, stripEphemeral, planRevisions } from "./lib/stream";
 import { extractContextUsage, mergeContextUsage } from "../electron/shared";
 import type {
   AccountInfo,
@@ -132,6 +133,12 @@ export function App() {
     readWidth("grok.sidebarWidth", 252, SIDEBAR_MIN),
   );
   const [winW, setWinW] = useState(() => (typeof window === "undefined" ? 1280 : window.innerWidth));
+  const [planPanel, setPlanPanel] = useState<{
+    open: boolean;
+    pendingPrompt: string;
+    pendingImages: { path: string; mimeType: string }[];
+    sessionId: string;
+  } | null>(null);
   const sendingRef = useRef(false);
   const pendingThreadRef = useRef<Promise<Active | null> | null>(null);
   const restoredRef = useRef(false);
@@ -561,35 +568,119 @@ export function App() {
       try {
         await window.grok.setMode(session.sessionId, "plan");
       } catch {
-        payload = `/plan ${payload}`;
+        /* fall through: agent should still respond in plan-like manner */
       }
-    }
-    const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
-    setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: Date.now() }]);
-    try {
-      await window.grok.sendPrompt(
-        session.sessionId,
-        payload,
-        imageFiles.map((p) => ({
+      const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
+      setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: Date.now() }]);
+      setPlanPanel({
+        open: true,
+        pendingPrompt: payload,
+        pendingImages: imageFiles.map((p) => ({
           path: p,
-          mimeType: /\.jpe?g$/i.test(p) ? "image/jpeg" : /\.gif$/i.test(p) ? "image/gif" : /\.webp$/i.test(p) ? "image/webp" : "image/png",
+          mimeType: /\.jpe?g$/i.test(p)
+            ? "image/jpeg"
+            : /\.gif$/i.test(p)
+              ? "image/gif"
+              : /\.webp$/i.test(p)
+                ? "image/webp"
+                : "image/png",
         })),
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      sendingRef.current = false;
-      setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
-      setRunningIds((s) => {
-        const n = new Set(s);
-        n.delete(session.sessionId);
-        return n;
+        sessionId: session.sessionId,
       });
-      void refresh();
-      if (isUnattached(session)) setGit(null);
-      else void window.grok.gitStatus(session.cwd).then(setGit);
+      setRunningIds((s) => new Set(s).add(session.sessionId));
+      try {
+        await window.grok.sendPrompt(
+          session.sessionId,
+          payload,
+          imageFiles.map((p) => ({
+            path: p,
+            mimeType: /\.jpe?g$/i.test(p) ? "image/jpeg" : /\.gif$/i.test(p) ? "image/gif" : /\.webp$/i.test(p) ? "image/webp" : "image/png",
+          })),
+        );
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        setPlanPanel(null);
+        setRunningIds((s) => {
+          const n = new Set(s);
+          n.delete(session.sessionId);
+          return n;
+        });
+      } finally {
+        sendingRef.current = false;
+      }
+      return;
     }
   }, [active, attachments, draft, createThread, planMode, refresh, runningIds, selectedProjectCwd, worktreeMode]);
+
+  const approvePlan = useCallback(async () => {
+    if (!planPanel) return;
+    const { pendingPrompt, pendingImages, sessionId } = planPanel;
+    setPlanPanel(null);
+    setItems((prev) =>
+      prev.map((it) => {
+        if (it.kind !== "plan") return it;
+        return {
+          ...it,
+          entries: it.entries.map((e) => ({
+            content: e.content,
+            status: "done" as const,
+          })),
+        };
+      }),
+    );
+    try {
+      await window.grok.setMode(sessionId, "act");
+    } catch {
+      /* best effort */
+    }
+    setRunningIds((s) => new Set(s).add(sessionId));
+    try {
+      await window.grok.sendPrompt(sessionId, pendingPrompt, pendingImages);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setRunningIds((s) => {
+        const n = new Set(s);
+        n.delete(sessionId);
+        return n;
+      });
+    }
+  }, [planPanel]);
+
+  const rejectPlan = useCallback(() => {
+    if (!planPanel) return;
+    void window.grok.cancel(planPanel.sessionId);
+    setRunningIds((s) => {
+      const n = new Set(s);
+      n.delete(planPanel.sessionId);
+      return n;
+    });
+    setPlanPanel(null);
+    setItems((prev) =>
+      prev.map((it) => {
+        if (it.kind !== "plan") return it;
+        return {
+          ...it,
+          entries: it.entries.map((e) => ({
+            content: e.content,
+            status: "cancelled" as const,
+          })),
+        };
+      }),
+    );
+  }, [planPanel]);
+
+  const revisePlan = useCallback(
+    (note: string) => {
+      if (!planPanel || !note.trim()) return;
+      const sid = planPanel.sessionId;
+      setItems((prev) => [
+        ...prev,
+        { kind: "user", text: `[计划修订] ${note.trim()}`, startedAt: Date.now() },
+      ]);
+      void window.grok.sendPrompt(sid, `按以下调整重新计划：\n${note.trim()}`);
+    },
+    [planPanel],
+  );
 
   const stop = useCallback(() => {
     if (!active) return;
@@ -670,16 +761,19 @@ export function App() {
   const envIsWorktree = active ? isWorktree : Boolean(selectedProject) && worktreeMode;
   const showProjectChrome = Boolean(selectedProject && !unattachedActive);
   const sidebarCol = fitSidebar(winW, sidebarWidth);
+  const hasRunning = runningIds.size > 0;
+  const hasPermission = permission != null;
+  const hasError = error != null;
+  const hasGitChanges = Boolean(!unattachedActive && git?.isRepo && git.files.length > 0);
+  const statusCardVisible =
+    page === "chat" && (hasRunning || hasPermission || hasError || hasGitChanges);
 
   return (
     <div className="app">
       <TitleBar
         subtitle={active?.title}
-        onSettings={() => {
-          setSettingsOpen(true);
-          void window.grok.settings(active?.cwd || selectedProjectCwd).then(setSettings);
-        }}
         onTerminal={() => setTerminalOpen((v) => !v)}
+        terminalActive={terminalOpen}
       />
       <div
         className="shell"
@@ -841,11 +935,6 @@ export function App() {
                   : "开始对话"
             }
           />
-          <TerminalPanel
-            open={terminalOpen}
-            cwd={active?.cwd || selectedProjectCwd}
-            onClose={() => setTerminalOpen(false)}
-          />
           <Composer
             value={draft}
             busy={sessionBusy}
@@ -901,11 +990,25 @@ export function App() {
             onPickProject={() => void openProject()}
             showProjectPicker={items.length === 0 && (!active?.sessionId || Boolean(active.pending))}
           />
+          <TerminalPanel
+            open={terminalOpen}
+            cwd={active?.cwd || selectedProjectCwd}
+            onClose={() => setTerminalOpen(false)}
+          />
+          <PlanPanel
+            open={Boolean(planPanel?.open)}
+            revisions={planRevisions(items)}
+            busy={planPanel ? runningIds.has(planPanel.sessionId) : false}
+            onApprove={() => void approvePlan()}
+            onReject={rejectPlan}
+            onRevise={revisePlan}
+            onClose={() => setPlanPanel((p) => (p ? { ...p, open: false } : p))}
+          />
             </>
           ) : null}
         </section>
       </div>
-      {page === "chat" ? (
+      {statusCardVisible ? (
         <StatusCard
           git={unattachedActive ? null : git}
           cwd={gitCwd}

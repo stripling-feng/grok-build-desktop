@@ -10,14 +10,26 @@ export class ProjectTerminal extends EventEmitter {
     this.cwd = cwd;
     const isWin = process.platform === "win32";
     const cmd = isWin ? "powershell.exe" : process.env.SHELL || "/bin/bash";
-    const args = isWin ? ["-NoLogo"] : ["-i"];
-    this.proc = spawn(cmd, args, {
-      cwd,
-      windowsHide: false,
-      env: {
-        ...process.env,
-        TERM: "dumb",
-      },
+    const args = isWin ? ["-NoLogo", "-NoExit", "-Command", "-"] : ["-i"];
+    try {
+      this.proc = spawn(cmd, args, {
+        cwd,
+        windowsHide: false,
+        env: {
+          ...process.env,
+          TERM: "dumb",
+          PS1: "$ ",
+        },
+      });
+    } catch (err) {
+      this.emit(
+        "data",
+        `\n[无法启动终端：${err instanceof Error ? err.message : String(err)}]\n`,
+      );
+      return;
+    }
+    this.proc.on("error", (err) => {
+      this.emit("data", `\n[终端错误：${err.message}]\n`);
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");

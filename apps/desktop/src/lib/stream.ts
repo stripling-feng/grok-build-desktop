@@ -1,5 +1,38 @@
 import { applyUpdateToItems, isSpawnSubagentUpdate, type StreamItem } from "../../electron/shared";
 
+export type PlanEntryStatus =
+  | "pending"
+  | "in_progress"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export type PlanEntry = { content: string; status: PlanEntryStatus };
+
+export type PlanRevision = { revision: number; entries: PlanEntry[] };
+
+export function latestPlan(items: StreamItem[]): PlanEntry[] {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.kind === "plan") return item.entries;
+  }
+  return [];
+}
+
+export function planRevisions(items: StreamItem[]): PlanRevision[] {
+  const revisions: PlanRevision[] = [];
+  for (const item of items) {
+    if (item.kind !== "plan") continue;
+    const last = revisions[revisions.length - 1];
+    if (last && last.revision === item.revision) {
+      last.entries = item.entries;
+    } else {
+      revisions.push({ revision: item.revision, entries: item.entries });
+    }
+  }
+  return revisions;
+}
+
 function cloneItems(items: StreamItem[]): StreamItem[] {
   return items.map((item) => {
     if (item.kind === "tool" || item.kind === "subagent") return { ...item };
