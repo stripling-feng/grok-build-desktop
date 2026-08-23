@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, session as electronSession, shell } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -67,9 +67,10 @@ import {
 import { ProjectTerminal } from "./terminal";
 import type { PermissionMode, ReasoningEffort } from "./shared";
 import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
+import { startGrokInstall, stopGrokInstall, type InstallLogLine } from "./install-cli";
 import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
-import { loadAccount, loadAccountUsage } from "./account";
+import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearApiKey } from "./account";
 import { checkAppUpdate, openUpdateUrl } from "./update";
 import { generateMedia } from "./media";
 import {
@@ -92,6 +93,73 @@ const acp = new GrokAcpClient();
 const loadedSessions = new Set<string>();
 const terminal = new ProjectTerminal();
 let mainWindow: BrowserWindow | null = null;
+let systemProxyPromise: Promise<string | null> | null = null;
+let accountLoginController: AbortController | null = null;
+
+function proxyUrlFromRules(rules: string): string | null {
+  for (const rule of rules.split(";")) {
+    const match = rule.trim().match(/^(PROXY|HTTPS|SOCKS5|SOCKS4|SOCKS)\s+(.+)$/i);
+    if (!match) continue;
+    const scheme = match[1].toUpperCase().startsWith("SOCKS") ? "socks5" : "http";
+    const candidate = `${scheme}://${match[2].trim()}`;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.hostname && parsed.port) return candidate;
+    } catch {
+      /* try the next proxy rule */
+    }
+  }
+  return null;
+}
+
+function existingProxy(): string | null {
+  return (
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.ALL_PROXY ||
+    process.env.all_proxy ||
+    null
+  );
+}
+
+function proxyLabel(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
+  } catch {
+    return "configured";
+  }
+}
+
+async function ensureSystemProxyEnvironment(): Promise<string | null> {
+  if (systemProxyPromise) return systemProxyPromise;
+  systemProxyPromise = (async () => {
+    const configured = existingProxy();
+    const proxy =
+      configured ||
+      proxyUrlFromRules(
+        await electronSession.defaultSession.resolveProxy(
+          "https://auth.x.ai/.well-known/openid-configuration",
+        ),
+      );
+    if (!proxy) {
+      log("network proxy direct");
+      return null;
+    }
+    // Grok CLI uses the conventional proxy environment variables, while
+    // Electron/Chrome reads the Windows proxy settings itself. Bridge the two.
+    if (!process.env.HTTPS_PROXY && !process.env.https_proxy) process.env.HTTPS_PROXY = proxy;
+    if (!process.env.HTTP_PROXY && !process.env.http_proxy) process.env.HTTP_PROXY = proxy;
+    log("network proxy", proxyLabel(proxy));
+    return proxy;
+  })().catch((err) => {
+    log("system proxy detection failed", err);
+    return null;
+  });
+  return systemProxyPromise;
+}
 
 function send(channel: string, payload: unknown) {
   mainWindow?.webContents.send(channel, payload);
@@ -174,7 +242,9 @@ if (!gotLock) {
     initLog();
     pruneLogs();
     createWindow();
-    void acp.ensureStarted().catch((err) => log("agent warmup failed", err));
+    void ensureSystemProxyEnvironment()
+      .then(() => acp.ensureStarted())
+      .catch((err) => log("agent warmup failed", err));
     recoverStuckAutomations(Date.now(), { force: true, skipIds: runningAutomations });
     startAutomationLoop(() => {
       void tickAutomations();
@@ -190,6 +260,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopGrokInstall();
   terminal.kill();
   void acp.stop();
 });
@@ -344,6 +415,48 @@ async function tickAutomations() {
 ipcMain.handle("grok:status", () => acp.status());
 ipcMain.handle("grok:account", () => loadAccount());
 ipcMain.handle("grok:accountUsage", () => loadAccountUsage());
+ipcMain.handle("grok:loginAccount", async () => {
+  await ensureSystemProxyEnvironment();
+  accountLoginController?.abort();
+  const controller = new AbortController();
+  accountLoginController = controller;
+  try {
+    return await startAccountLogin(
+      (url) => {
+        void shell.openExternal(url);
+      },
+      { signal: controller.signal },
+    );
+  } finally {
+    if (accountLoginController === controller) accountLoginController = null;
+  }
+});
+ipcMain.handle("grok:cancelAccountLogin", () => {
+  accountLoginController?.abort();
+  return true;
+});
+ipcMain.handle("grok:loginApiKey", (_e, input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) => {
+  try {
+    const payload =
+      input?.fromCcSwitchId
+        ? (() => {
+            const provider = getCcSwitchProvider(input.fromCcSwitchId);
+            if (!provider) throw new Error("cc-switch 中没有找到该供应商");
+            return { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: input.model };
+          })()
+        : input;
+    if (!payload || !payload.baseUrl || !payload.apiKey) {
+      throw new Error("请填写 Base URL 和 API Key");
+    }
+    const account = saveApiKey({ baseUrl: payload.baseUrl, apiKey: payload.apiKey, model: payload.model });
+    return { ok: true, account };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, account: loadAccount(), message };
+  }
+});
+ipcMain.handle("grok:listCcSwitchProviders", () => listCcSwitchProviders());
+ipcMain.handle("grok:logout", () => clearApiKey());
 ipcMain.handle("grok:checkUpdate", () => checkAppUpdate());
 ipcMain.handle("grok:openUpdate", (_e, url?: string) => openUpdateUrl(url));
 ipcMain.handle("grok:installInfo", () => ({
@@ -358,17 +471,11 @@ ipcMain.handle("grok:copyInstallCommand", () => {
 ipcMain.handle("grok:openInstallDocs", () => shell.openExternal(INSTALL_DOCS));
 ipcMain.handle("grok:openLogs", () => shell.openPath(logsDir()));
 ipcMain.handle("grok:runInstall", async () => {
-  if (process.platform !== "win32") {
-    await shell.openExternal(INSTALL_DOCS);
-    return { ok: true, launched: false };
-  }
-  spawn(
-    "powershell.exe",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", INSTALL_COMMAND],
-    { detached: true, stdio: "ignore", windowsHide: false },
-  ).unref();
-  log("launched grok install script");
-  return { ok: true, launched: true };
+  log("started in-app grok install");
+  return startGrokInstall((line: InstallLogLine) => {
+    send("grok:install-log", line);
+    log("install", line.text);
+  });
 });
 ipcMain.handle("grok:listProjects", () => workspace().projects);
 ipcMain.handle("grok:listThreads", (_e, cwd?: string) => {

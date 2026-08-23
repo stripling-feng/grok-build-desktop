@@ -4,6 +4,12 @@ contextBridge.exposeInMainWorld("grok", {
   status: () => ipcRenderer.invoke("grok:status"),
   account: () => ipcRenderer.invoke("grok:account"),
   accountUsage: () => ipcRenderer.invoke("grok:accountUsage"),
+  loginAccount: () => ipcRenderer.invoke("grok:loginAccount"),
+  cancelAccountLogin: () => ipcRenderer.invoke("grok:cancelAccountLogin"),
+  loginApiKey: (input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) =>
+    ipcRenderer.invoke("grok:loginApiKey", input),
+  listCcSwitchProviders: () => ipcRenderer.invoke("grok:listCcSwitchProviders"),
+  logout: () => ipcRenderer.invoke("grok:logout"),
   checkUpdate: () => ipcRenderer.invoke("grok:checkUpdate"),
   openUpdate: (url?: string) => ipcRenderer.invoke("grok:openUpdate", url),
   installInfo: () => ipcRenderer.invoke("grok:installInfo"),
@@ -11,6 +17,12 @@ contextBridge.exposeInMainWorld("grok", {
   openInstallDocs: () => ipcRenderer.invoke("grok:openInstallDocs"),
   openLogs: () => ipcRenderer.invoke("grok:openLogs"),
   runInstall: () => ipcRenderer.invoke("grok:runInstall"),
+  onInstallLog: (cb: (payload: { ts: number; text: string; tone: "info" | "ok" | "warn" | "error" }) => void) => {
+    const listener = (_event: unknown, payload: { ts: number; text: string; tone: "info" | "ok" | "warn" | "error" }) =>
+      cb(payload);
+    ipcRenderer.on("grok:install-log", listener);
+    return () => ipcRenderer.removeListener("grok:install-log", listener);
+  },
   listProjects: () => ipcRenderer.invoke("grok:listProjects"),
   addProject: () => ipcRenderer.invoke("grok:addProject"),
   removeProject: (cwd: string) => ipcRenderer.invoke("grok:removeProject", cwd),

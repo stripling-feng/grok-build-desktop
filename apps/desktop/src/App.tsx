@@ -9,6 +9,7 @@ import { AutomationPage, MarketplacePage, type WorkspacePage } from "./component
 import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
 import { PlanPanel } from "./components/PlanPanel";
+import grokLogo from "./assets/grok-logo.jpg";
 import { applyLiveUpdate, stampTurnDuration, stripEphemeral, planRevisions } from "./lib/stream";
 import { extractContextUsage, mergeContextUsage } from "../electron/shared";
 import type {
@@ -125,6 +126,9 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [installHint, setInstallHint] = useState("");
+  const [installing, setInstalling] = useState(false);
+  const [installLogs, setInstallLogs] = useState<{ ts: number; text: string; tone: "info" | "ok" | "warn" | "error" }[]>([]);
+  const installLogRef = useRef<HTMLDivElement | null>(null);
   const [planMode, setPlanMode] = useState(false);
   const [goal, setGoal] = useState("");
   const [attachments, setAttachments] = useState<string[]>([]);
@@ -164,6 +168,19 @@ export function App() {
     void window.grok.account().then(setAccount);
     void window.grok.settings().then(setSettings);
   }, []);
+
+  useEffect(() => {
+    if (typeof window.grok.onInstallLog !== "function") return;
+    return window.grok.onInstallLog((line) => {
+      setInstallLogs((prev) => [...prev, line]);
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = installLogRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [installLogs]);
 
   useEffect(() => {
     if (typeof window.grok.onWorkspace !== "function") return;
@@ -700,28 +717,76 @@ export function App() {
   }, [status]);
 
   if (status && !status.ok) {
+    const copyLogs = () => {
+      const text = installLogs
+        .map((line) => `[${new Date(line.ts).toLocaleTimeString("zh-CN", { hour12: false })}] ${line.text}`)
+        .join("\n");
+      void navigator.clipboard.writeText(text).then(() => setInstallHint("安装日志已复制"));
+    };
     return (
       <div className="app">
         <TitleBar />
         <div className="setup">
           <div className="setup-card">
-            <h2>请先安装 Grok CLI</h2>
-            <p>
-              桌面端只是界面，智能层用本机 <code>grok</code>。检测到未安装或无法运行。
-            </p>
-            <pre>irm https://x.ai/cli/install.ps1 | iex{"\n"}grok --version</pre>
-            <p>{status.error}</p>
-            {installHint ? <p>{installHint}</p> : null}
+            <img className="setup-logo" src={grokLogo} alt="Grok" />
+            {installing || installLogs.length > 0 ? (
+              <div className="setup-console">
+                <div className="setup-console-head">
+                  <span>安装日志</span>
+                  <button className="setup-copy-log" type="button" onClick={copyLogs} disabled={!installLogs.length}>
+                    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                      <rect x="5.2" y="5.2" width="7.3" height="7.3" rx="1.2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                      <path d="M3.5 10.2V3.8A1.3 1.3 0 0 1 4.8 2.5h6.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                    </svg>
+                    复制日志
+                  </button>
+                </div>
+                <div className="setup-console-body" ref={installLogRef}>
+                  {installLogs.length ? (
+                    installLogs.map((line, i) => (
+                      <div className={`setup-log setup-log-${line.tone}`} key={`${line.ts}-${i}`}>
+                        <span className="setup-log-time">
+                          [{new Date(line.ts).toLocaleTimeString("zh-CN", { hour12: false })}]
+                        </span>{" "}
+                        {line.text}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="setup-log setup-log-muted">正在启动安装…</div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="setup-empty">没有检测到 grok-cli</div>
+            )}
+            {installHint ? <p className="setup-hint">{installHint}</p> : null}
             <div className="setup-actions">
               <button
                 className="btn primary"
                 type="button"
+                disabled={installing}
                 onClick={() => {
-                  setInstallHint("已启动官方安装脚本，完成后点「重新检测」。");
-                  void window.grok.runInstall();
+                  setInstalling(true);
+                  setInstallHint("");
+                  setInstallLogs([]);
+                  void window.grok
+                    .runInstall()
+                    .then((result) => {
+                      setInstalling(false);
+                      if (result.ok) {
+                        setInstallHint("安装完成，正在进入应用…");
+                        void window.grok.status().then(setStatus);
+                        return;
+                      }
+                      setInstallHint(result.error || "安装未完成，可查看上方日志后重试。");
+                    })
+                    .catch((err) => {
+                      setInstalling(false);
+                      setInstallHint(err instanceof Error ? err.message : String(err));
+                    });
                 }}
               >
-                运行安装脚本
+                {installing ? "正在安装…" : "运行安装脚本"}
               </button>
               <button
                 className="btn"
@@ -738,6 +803,7 @@ export function App() {
               <button
                 className="btn"
                 type="button"
+                disabled={installing}
                 onClick={() => {
                   setInstallHint("正在检测…");
                   void window.grok.status().then((next) => {
@@ -789,6 +855,7 @@ export function App() {
           runningIds={runningIds}
           grokLabel={grokLabel}
           account={account}
+          onAccountChange={setAccount}
           onOpenProject={() => void openProject()}
           onNewChat={() => beginComposer(null)}
           page={page}

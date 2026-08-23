@@ -412,13 +412,19 @@ function pushText(
   startedAt?: number,
 ) {
   if (!text) return;
-  const last = items[items.length - 1];
+  const last = items[items.length - 1] as (StreamItem & { text?: string; startedAt?: number }) | undefined;
   if (last && last.kind === kind) {
-    last.text += text;
-    if (kind === "user" && startedAt && !last.startedAt) last.startedAt = startedAt;
+    last.text = (last.text ?? "") + text;
+    if (kind === "user" && startedAt && !last.startedAt) {
+      last.startedAt = startedAt;
+    }
     return;
   }
-  items.push(kind === "user" ? { kind, text, startedAt } : { kind, text });
+  if (kind === "user") {
+    items.push({ kind, text, startedAt });
+  } else {
+    items.push({ kind, text });
+  }
 }
 
 function parseTimestamp(value: unknown): number | undefined {

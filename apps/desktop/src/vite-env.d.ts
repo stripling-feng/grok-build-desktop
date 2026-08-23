@@ -37,13 +37,21 @@ declare global {
       status: () => Promise<GrokStatus>;
       account: () => Promise<AccountInfo>;
       accountUsage: () => Promise<AccountUsage>;
+      loginAccount: () => Promise<{ ok: boolean; account: AccountInfo; message?: string; url?: string }>;
+      cancelAccountLogin: () => Promise<boolean>;
+      loginApiKey: (input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) => Promise<{ ok: boolean; account: AccountInfo; message?: string }>;
+      listCcSwitchProviders: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string }>>;
+      logout: () => Promise<AccountInfo>;
       checkUpdate: () => Promise<AppUpdateInfo>;
       openUpdate: (url?: string) => Promise<void>;
       installInfo: () => Promise<{ command: string; docs: string; logsDir: string }>;
       copyInstallCommand: () => Promise<boolean>;
       openInstallDocs: () => Promise<void>;
       openLogs: () => Promise<string>;
-      runInstall: () => Promise<{ ok: boolean; launched: boolean }>;
+      runInstall: () => Promise<{ ok: boolean; launched: boolean; error?: string }>;
+      onInstallLog: (
+        cb: (payload: { ts: number; text: string; tone: "info" | "ok" | "warn" | "error" }) => void,
+      ) => () => void;
       listProjects: () => Promise<ProjectInfo[]>;
       addProject: () => Promise<ProjectInfo | null>;
       removeProject: (cwd: string) => Promise<ProjectInfo[]>;

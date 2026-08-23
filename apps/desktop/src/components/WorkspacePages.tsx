@@ -275,6 +275,11 @@ function clockLabel(ms: number) {
   return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+function dateInputLabel(ms: number) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function relativeWhen(ms?: number | null, now = Date.now()) {
   if (!ms) return "未安排";
   const delta = ms - now;
@@ -295,13 +300,22 @@ function relativeWhen(ms?: number | null, now = Date.now()) {
   return delta >= 0 ? `${amount}后` : `${amount}前`;
 }
 
-function lifecycle(row: Automation) {
+function isFinished(row: Automation, now = Date.now()) {
+  const runLimit = row.maxRuns ?? (row.recurring ? null : 1);
+  return Boolean(
+    (runLimit != null && row.runCount >= runLimit) ||
+      (row.endsAt != null && row.endsAt <= now),
+  );
+}
+
+function lifecycle(row: Automation, now = Date.now()) {
   if (row.lastStatus === "running") return { id: "running", label: "正在执行" };
-  if (!row.enabled && row.lastStatus === "error") return { id: "failed", label: "已失败" };
-  if (!row.enabled && (row.nextRunAt === 0 || Boolean(row.maxRuns && row.runCount >= row.maxRuns))) {
+  if (!row.enabled && isFinished(row, now)) {
+    if (row.lastStatus === "error") return { id: "failed", label: "执行失败" };
     return { id: "completed", label: "已完成" };
   }
   if (!row.enabled) return { id: "paused", label: "已暂停" };
+  if (row.lastStatus === "error") return { id: "failed", label: "上次失败" };
   return { id: "active", label: "已启用" };
 }
 
@@ -337,7 +351,7 @@ function draftFromRow(row: Automation): ScheduleDraft {
     intervalUnit: row.intervalUnit || "daily",
     recurring: row.recurring,
     maxRuns: row.maxRuns ? String(row.maxRuns) : "",
-    endsAt: row.endsAt ? new Date(row.endsAt).toISOString().slice(0, 10) : "",
+    endsAt: row.endsAt ? dateInputLabel(row.endsAt) : "",
   };
 }
 
@@ -402,6 +416,7 @@ export function AutomationPage({
   const [now, setNow] = useState(Date.now());
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; row?: Automation; seed?: Partial<ScheduleDraft>; history?: boolean } | null>(null);
   const [menuId, setMenuId] = useState<string | null>(null);
+  const [pending, setPending] = useState<{ id: string; action: "run" | "toggle" | "delete" } | null>(null);
   const { busy, error, run } = useWorkspaceActions();
 
   useEffect(() => {
@@ -431,8 +446,15 @@ export function AutomationPage({
       if (el?.closest(".auto-more")) return;
       setMenuId(null);
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuId(null);
+    };
     window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
   }, [menuId]);
 
   useEffect(() => {
@@ -449,6 +471,34 @@ export function AutomationPage({
   }, [rows]);
 
   const projectName = (path: string) => projects.find((p) => p.cwd.toLowerCase() === path.toLowerCase())?.name || path || "普通会话";
+  const counts = useMemo(() => {
+    let active = 0;
+    let paused = 0;
+    let running = 0;
+    for (const row of rows) {
+      const state = lifecycle(row, now).id;
+      if (state === "running") running += 1;
+      else if (row.enabled) active += 1;
+      else if (state === "paused") paused += 1;
+    }
+    return { active, paused, running };
+  }, [rows, now]);
+
+  async function perform(
+    row: Automation,
+    action: "run" | "toggle" | "delete",
+    label: string,
+    work: () => Promise<Automation[]>,
+  ) {
+    if (pending) return;
+    setPending({ id: row.id, action });
+    try {
+      const next = await run(label, work);
+      if (next) setRows(next);
+    } finally {
+      setPending(null);
+    }
+  }
 
   return (
     <section className="workspace-page">
@@ -462,29 +512,43 @@ export function AutomationPage({
           <button className="btn small ghost" type="button" onClick={() => onCreateViaChat(CHAT_CREATE_PROMPT)}>
             去会话中创建
           </button>
-          <button className="btn small" type="button" onClick={() => setEditor({ mode: "create" })}>
+          <button className="btn small primary" type="button" onClick={() => setEditor({ mode: "create" })}>
             创建定时任务
           </button>
         </div>
       </div>
       <div className="workspace-body auto-page">
-        <p className="settings-hint">
-          {rows.length
-            ? "按计划运行任务，或在需要时随时执行。电脑唤醒且应用开着时才会触发。"
-            : "创建定时任务，到点后开一条会话执行指令。不选项目就是普通会话。"}
-        </p>
-        {error ? <p className="settings-error">{error}</p> : null}
-        {busy ? <p className="settings-hint">{busy}…</p> : null}
+        <div className="auto-intro">
+          <div>
+            <h2>让任务按计划自动执行</h2>
+            <p>应用保持运行且电脑处于唤醒状态时，任务会在独立会话中执行。</p>
+          </div>
+          {rows.length ? (
+            <div className="auto-summary" aria-label="任务概览">
+              <span><strong>{counts.active}</strong> 已启用</span>
+              <span><strong>{counts.running}</strong> 执行中</span>
+              <span><strong>{counts.paused}</strong> 已暂停</span>
+            </div>
+          ) : null}
+        </div>
+        {error ? <p className="auto-feedback error" role="alert">{error}</p> : null}
+        {busy ? <p className="auto-feedback" role="status">{busy}…</p> : null}
 
         {rows.length === 0 ? (
           <div className="workspace-empty">
-            <h2>还没有定时任务</h2>
-            <p>创建一个任务，按周期自动运行你的指令。</p>
+            <div className="auto-empty-icon" aria-hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="8.25" fill="none" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M12 7.6v4.9l3.2 1.9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <h2>还没有自动化任务</h2>
+            <p>从空白任务开始，或直接使用下方模板。</p>
             <div className="auto-empty-actions">
               <button className="btn small ghost" type="button" onClick={() => onCreateViaChat(CHAT_CREATE_PROMPT)}>
                 去会话中创建
               </button>
-              <button className="btn small" type="button" onClick={() => setEditor({ mode: "create" })}>
+              <button className="btn small primary" type="button" onClick={() => setEditor({ mode: "create" })}>
                 手动创建
               </button>
             </div>
@@ -494,82 +558,115 @@ export function AutomationPage({
             <h2 className="auto-section-title">定时任务</h2>
             <div className="auto-list">
               {rows.map((row) => {
-                const life = lifecycle(row);
+                const life = lifecycle(row, now);
+                const isPending = pending?.id === row.id;
+                const timing = row.lastStatus === "running"
+                  ? `正在执行${row.runs?.find((item) => item.status === "running")?.trigger === "manual" ? "（手动）" : ""}`
+                  : row.enabled && row.nextRunAt
+                    ? `下次运行 ${relativeWhen(row.nextRunAt, now)}`
+                    : row.lastRunAt
+                      ? `上次 ${relativeWhen(row.lastRunAt, now)}`
+                      : "";
                 return (
                   <article className={`auto-card${row.enabled ? "" : " off"}`} key={row.id}>
                     <div className="auto-card-top">
-                      <div>
-                        <h3>{row.title || "未命名定时任务"}</h3>
+                      <div className={`auto-state-icon ${life.id}`} aria-hidden>
+                        {life.id === "running" ? (
+                          <span className="auto-spinner" />
+                        ) : (
+                          <svg width="17" height="17" viewBox="0 0 20 20">
+                            <circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
+                            <path d="M10 5.8v4.5l2.9 1.7" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        )}
+                      </div>
+                      <div className="auto-card-main">
+                        <div className="auto-title-row">
+                          <h3>{row.title || "未命名定时任务"}</h3>
+                          <span className={`auto-life ${life.id}`}>{life.label}</span>
+                        </div>
                         <p className="auto-schedule">{row.scheduleLabel}</p>
                       </div>
-                      <span className={`auto-life ${life.id}`}>{life.label}</span>
                     </div>
-                    <p className="auto-prompt">{row.prompt}</p>
-                    <div className="auto-meta">
-                      <span>{row.cwd ? projectName(row.cwd) : "普通会话"}</span>
-                      {row.lastStatus === "running" ? (
-                        <span>正在执行{row.runs?.find((item) => item.status === "running")?.trigger === "manual" ? "（手动）" : ""}</span>
-                      ) : row.enabled && row.nextRunAt ? (
-                        <span title={clockLabel(row.nextRunAt)}>下次运行 {relativeWhen(row.nextRunAt, now)}</span>
-                      ) : row.lastRunAt ? (
-                        <span title={clockLabel(row.lastRunAt)}>上次 {relativeWhen(row.lastRunAt, now)}</span>
-                      ) : null}
+                    <p className="auto-prompt" title={row.prompt}>{row.prompt}</p>
+                    <div className="auto-meta" aria-label="任务信息">
+                      <span className="auto-meta-project" title={row.cwd || "普通会话"}>{row.cwd ? projectName(row.cwd) : "普通会话"}</span>
+                      {timing ? <><span className="auto-meta-sep" aria-hidden>·</span><span title={row.lastStatus === "running" ? undefined : clockLabel((row.enabled && row.nextRunAt) || row.lastRunAt || 0)}>{timing}</span></> : null}
+                      <span className="auto-meta-sep" aria-hidden>·</span>
                       <span>{row.maxRuns ? `已运行 ${row.runCount}/${row.maxRuns} 次` : `已运行 ${row.runCount} 次`}</span>
                     </div>
-                    {row.lastError ? <p className="settings-error">{row.lastError}</p> : null}
+                    {row.lastError ? <p className="auto-card-error" title={row.lastError}>{row.lastError}</p> : null}
                     <div className="auto-actions">
                       <button
-                        className="btn small"
+                        className="btn small auto-run"
                         type="button"
-                        disabled={row.lastStatus === "running"}
+                        disabled={row.lastStatus === "running" || Boolean(pending)}
                         onClick={() => {
-                          void window.grok.runAutomation(row.id).then((next) => {
-                            if (next) {
-                              setRows((cur) => cur.map((item) => (item.id === next.id ? next : item)));
-                            }
-                            return window.grok.listAutomations().then(setRows);
-                          }).catch((err) => console.error(err));
+                          void perform(row, "run", "正在启动任务", async () => {
+                            await window.grok.runAutomation(row.id);
+                            return window.grok.listAutomations();
+                          });
                         }}
                       >
-                        立即运行
+                        {isPending && pending.action === "run" ? "启动中…" : row.lastStatus === "running" ? "执行中" : "立即运行"}
                       </button>
-                      <button
-                        className="btn small ghost"
-                        type="button"
-                        onClick={() => {
-                          void run(row.enabled ? "暂停" : "继续", () =>
-                            window.grok.updateAutomation(row.id, { enabled: !row.enabled }).then(() =>
-                              window.grok.listAutomations().then(setRows),
-                            ),
-                          );
-                        }}
-                      >
-                        {row.enabled ? "暂停" : "继续"}
-                      </button>
+                      {life.id === "active" || life.id === "paused" || (life.id === "failed" && row.enabled) ? (
+                        <button
+                          className="btn small ghost"
+                          type="button"
+                          disabled={row.lastStatus === "running" || Boolean(pending)}
+                          onClick={() => {
+                            void perform(row, "toggle", row.enabled ? "正在暂停任务" : "正在启用任务", async () => {
+                              await window.grok.updateAutomation(row.id, { enabled: !row.enabled });
+                              return window.grok.listAutomations();
+                            });
+                          }}
+                        >
+                          {isPending && pending.action === "toggle" ? "处理中…" : row.enabled ? "暂停" : "继续"}
+                        </button>
+                      ) : null}
+                      {row.lastSessionId && onOpenSession ? (
+                        <button className="btn small ghost" type="button" onClick={() => onOpenSession(row.lastSessionId!, row.cwd)}>
+                          打开结果
+                        </button>
+                      ) : null}
                       <div className="auto-more">
-                        <button className="btn small ghost" type="button" onClick={() => setMenuId(menuId === row.id ? null : row.id)}>
-                          更多操作
+                        <button
+                          className="auto-more-button"
+                          type="button"
+                          aria-label={`更多操作：${row.title || "未命名定时任务"}`}
+                          aria-haspopup="menu"
+                          aria-expanded={menuId === row.id}
+                          disabled={Boolean(pending)}
+                          onClick={() => setMenuId(menuId === row.id ? null : row.id)}
+                        >
+                          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+                            <circle cx="3" cy="8" r="1.1" fill="currentColor" />
+                            <circle cx="8" cy="8" r="1.1" fill="currentColor" />
+                            <circle cx="13" cy="8" r="1.1" fill="currentColor" />
+                          </svg>
                         </button>
                         {menuId === row.id ? (
-                          <div className="auto-menu">
-                            <button type="button" onClick={() => { setMenuId(null); setEditor({ mode: "edit", row }); }}>
+                          <div className="auto-menu" role="menu">
+                            <button role="menuitem" type="button" disabled={row.lastStatus === "running"} onClick={() => { setMenuId(null); setEditor({ mode: "edit", row }); }}>
                               编辑
                             </button>
-                            <button type="button" onClick={() => { setMenuId(null); setEditor({ mode: "edit", row, history: true }); }}>
+                            <button role="menuitem" type="button" onClick={() => { setMenuId(null); setEditor({ mode: "edit", row, history: true }); }}>
                               查看历史
                             </button>
-                            {row.lastSessionId && onOpenSession ? (
-                              <button type="button" onClick={() => { setMenuId(null); onOpenSession(row.lastSessionId!, row.cwd); }}>
-                                跳到会话
-                              </button>
-                            ) : null}
+                            <div className="auto-menu-sep" role="separator" />
                             <button
+                              role="menuitem"
                               type="button"
                               className="danger"
+                              disabled={row.lastStatus === "running"}
                               onClick={() => {
                                 setMenuId(null);
                                 if (!window.confirm(`确定删除“${row.title}”？此操作无法撤销。`)) return;
-                                void run("删除", () => window.grok.deleteAutomation(row.id).then(() => window.grok.listAutomations().then(setRows)));
+                                void perform(row, "delete", "正在删除任务", async () => {
+                                  await window.grok.deleteAutomation(row.id);
+                                  return window.grok.listAutomations();
+                                });
                               }}
                             >
                               删除
@@ -626,7 +723,6 @@ export function AutomationPage({
             setEditor(null);
           }}
           onOpenSession={onOpenSession}
-          run={run}
         />
       ) : null}
     </section>
@@ -642,7 +738,6 @@ function AutomationForm({
   onClose,
   onSaved,
   onOpenSession,
-  run,
 }: {
   cwd?: string | null;
   projects: ProjectInfo[];
@@ -652,10 +747,11 @@ function AutomationForm({
   onClose: () => void;
   onSaved: (rows: Automation[]) => void;
   onOpenSession?: (sessionId: string, cwd: string) => void;
-  run: SettingsRun;
 }) {
   const [draft, setDraft] = useState(initial);
   const [tab, setTab] = useState<"settings" | "history">(historyFirst ? "history" : "settings");
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState("");
   const preview = useMemo(() => schedulePreview(draft), [draft]);
   const showTime = draft.frequency !== "hourly" && !(draft.frequency === "custom" && draft.intervalUnit === "minute");
   const showMinute = draft.frequency === "hourly" || (draft.frequency === "custom" && draft.intervalUnit === "hourly");
@@ -664,26 +760,76 @@ function AutomationForm({
 
   function patch(next: Partial<ScheduleDraft>) {
     setDraft((cur) => ({ ...cur, ...next }));
+    setFormError("");
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !saving) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, saving]);
+
+  async function save() {
+    if (saving) return;
+    if (!draft.prompt.trim()) {
+      setFormError("请填写每次运行时要执行的指令。");
+      return;
+    }
+    if (showWeekdays && !draft.weekdays.length) {
+      setFormError("请至少选择一个星期。");
+      return;
+    }
+    if (!Number.isInteger(draft.interval) || draft.interval < 1) {
+      setFormError("执行间隔必须是大于 0 的整数。");
+      return;
+    }
+    if (!draft.recurring) {
+      const maxRuns = Number(draft.maxRuns);
+      if (!Number.isInteger(maxRuns) || maxRuns < 1) {
+        setFormError("固定运行次数必须是大于 0 的整数。");
+        return;
+      }
+    }
+    if (draft.endsAt && new Date(`${draft.endsAt}T23:59:59`).getTime() < Date.now()) {
+      setFormError("截止日期不能早于今天。");
+      return;
+    }
+    setSaving(true);
+    setFormError("");
+    try {
+      const input = toInput(draft);
+      if (editing) await window.grok.updateAutomation(editing.id, { ...input, enabled: editing.enabled });
+      else await window.grok.createAutomation(input);
+      onSaved(await window.grok.listAutomations());
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
-    <div className="modal-backdrop nested" onClick={onClose}>
-      <div className="modal settings-modal auto-form" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">
+    <div className="modal-backdrop nested" onClick={() => { if (!saving) onClose(); }}>
+      <div className="modal settings-modal auto-form" role="dialog" aria-modal="true" aria-labelledby="automation-form-title" onClick={(e) => e.stopPropagation()}>
+        <div className="auto-form-head">
           <div>
-            <h2>{editing ? "编辑定时任务" : "新建定时任务"}</h2>
+            <h2 id="automation-form-title">{editing ? "编辑定时任务" : "新建定时任务"}</h2>
             <p className="settings-hint">{editing ? "调整此任务的执行时间、指令和运行方式。" : "配置任务的执行时间、指令和运行方式。"}</p>
           </div>
-          <button className="btn small ghost" type="button" onClick={onClose}>
-            取消
+          <button className="auto-form-close" type="button" aria-label="关闭" disabled={saving} onClick={onClose}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+              <path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            </svg>
           </button>
         </div>
         {editing ? (
-          <div className="workspace-tabs">
-            <button type="button" className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>
+          <div className="auto-form-tabs" role="tablist" aria-label="任务详情">
+            <button role="tab" aria-selected={tab === "settings"} type="button" className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>
               设置
             </button>
-            <button type="button" className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>
+            <button role="tab" aria-selected={tab === "history"} type="button" className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>
               历史
             </button>
           </div>
@@ -691,177 +837,181 @@ function AutomationForm({
 
         {tab === "history" && editing ? (
           <div className="auto-history">
-            <p className="settings-hint">定时任务仅在电脑处于唤醒状态时运行。</p>
             {(editing.runs || []).length === 0 ? (
-              <p className="workspace-empty">还没有运行记录。</p>
+              <div className="auto-history-empty">
+                <strong>还没有运行记录</strong>
+                <span>手动运行或到达计划时间后，结果会显示在这里。</span>
+              </div>
             ) : (
-              <table className="auto-history-table">
-                <thead>
-                  <tr>
-                    <th>触发时间</th>
-                    <th>来源</th>
-                    <th>状态</th>
-                    <th>时长</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {(editing.runs || []).map((item) => (
-                    <tr key={item.id}>
-                      <td>{clockLabel(item.at)}</td>
-                      <td>{item.trigger === "manual" ? "手动" : "定时"}</td>
-                      <td>{item.status === "running" ? "进行中" : item.status === "ok" ? "成功" : "失败"}</td>
-                      <td>{formatDuration(item.durationMs)}</td>
-                      <td>
-                        {item.sessionId && onOpenSession ? (
-                          <button className="btn small ghost" type="button" onClick={() => onOpenSession(item.sessionId!, editing.cwd)}>
-                            跳到会话
-                          </button>
-                        ) : null}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="auto-history-list">
+                {(editing.runs || []).map((item) => (
+                  <div className="auto-history-row" key={item.id}>
+                    <span className={`auto-history-status ${item.status}`} aria-hidden />
+                    <div className="auto-history-main">
+                      <strong>{item.status === "running" ? "正在执行" : item.status === "ok" ? "运行成功" : "运行失败"}</strong>
+                      <span>{clockLabel(item.at)} · {item.trigger === "manual" ? "手动触发" : "定时触发"} · {formatDuration(item.durationMs)}</span>
+                      {item.error ? <em>{item.error}</em> : null}
+                    </div>
+                    {item.sessionId && onOpenSession ? (
+                      <button className="btn small ghost" type="button" onClick={() => onOpenSession(item.sessionId!, editing.cwd)}>
+                        打开会话
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         ) : (
           <>
-            <label className="field">
-              <span>任务标题</span>
-              <input value={draft.title} onChange={(e) => patch({ title: e.target.value })} placeholder="例如：每日站会摘要" />
-            </label>
-            <label className="field">
-              <span>项目</span>
-              <select value={draft.cwd} onChange={(e) => patch({ cwd: e.target.value })}>
-                <option value="">普通会话</option>
-                {projects.map((project) => (
-                  <option key={project.cwd} value={project.cwd}>
-                    {project.name}
-                  </option>
-                ))}
-                {cwd && !projects.some((p) => p.cwd === cwd) ? <option value={cwd}>{cwd}</option> : null}
-              </select>
-            </label>
-            {!draft.cwd ? <p className="settings-hint">不选项目时，到点后会开一条普通对话来执行。</p> : null}
-            <label className="field">
-              <span>调度</span>
-              <select value={draft.frequency} onChange={(e) => patch({ frequency: e.target.value as AutomationFrequency })}>
-                <option value="hourly">每小时</option>
-                <option value="daily">每天</option>
-                <option value="weekdays">每工作日</option>
-                <option value="weekly">每周</option>
-                <option value="monthly">每月</option>
-                <option value="custom">自定义</option>
-              </select>
-            </label>
-            {draft.frequency === "custom" ? (
-              <div className="auto-custom-row">
-                <label className="field">
-                  <span>每</span>
-                  <input type="number" min={1} value={draft.interval} onChange={(e) => patch({ interval: Number(e.target.value) || 1 })} />
-                </label>
-                <label className="field">
-                  <span>单位</span>
-                  <select value={draft.intervalUnit} onChange={(e) => patch({ intervalUnit: e.target.value as IntervalUnit })}>
-                    <option value="minute">分钟</option>
-                    <option value="hourly">小时</option>
-                    <option value="daily">天</option>
-                    <option value="weekly">周</option>
-                    <option value="monthly">个月</option>
-                  </select>
-                </label>
-              </div>
-            ) : null}
-            {showTime ? (
-              <label className="field">
-                <span>于</span>
-                <input type="time" value={draft.time} onChange={(e) => patch({ time: e.target.value })} />
-              </label>
-            ) : null}
-            {showMinute ? (
-              <label className="field">
-                <span>第</span>
-                <input type="number" min={0} max={59} value={draft.minute} onChange={(e) => patch({ minute: Math.min(59, Math.max(0, Number(e.target.value) || 0)) })} />
-                <span className="settings-hint">分钟</span>
-              </label>
-            ) : null}
-            {showWeekdays ? (
-              <div className="field">
-                <span>选择星期</span>
-                <div className="auto-weekdays">
-                  {WEEKDAYS.map((day) => (
-                    <label key={day.id} className={draft.weekdays.includes(day.id) ? "on" : ""}>
-                      <input
-                        type="checkbox"
-                        checked={draft.weekdays.includes(day.id)}
-                        onChange={(e) => {
-                          const next = e.target.checked
-                            ? [...draft.weekdays, day.id]
-                            : draft.weekdays.filter((id) => id !== day.id);
-                          patch({ weekdays: next.length ? next.sort() : [day.id] });
-                        }}
-                      />
-                      {day.label}
-                    </label>
-                  ))}
+            <div className="auto-form-body">
+              <section className="auto-form-section">
+                <div className="auto-form-section-head">
+                  <h3>任务内容</h3>
+                  <p>给任务起名，并说明每次需要完成什么。</p>
                 </div>
+                <div className="auto-form-grid two">
+                  <label className="field">
+                    <span>任务标题</span>
+                    <input value={draft.title} onChange={(e) => patch({ title: e.target.value })} placeholder="例如：每日站会摘要" autoFocus />
+                  </label>
+                  <label className="field">
+                    <span>运行位置</span>
+                    <select value={draft.cwd} onChange={(e) => patch({ cwd: e.target.value })}>
+                      <option value="">普通会话</option>
+                      {projects.map((project) => (
+                        <option key={project.cwd} value={project.cwd}>{project.name}</option>
+                      ))}
+                      {cwd && !projects.some((p) => p.cwd === cwd) ? <option value={cwd}>{cwd}</option> : null}
+                    </select>
+                  </label>
+                </div>
+                <label className="field auto-prompt-field">
+                  <span>执行指令 <em>必填</em></span>
+                  <textarea value={draft.prompt} onChange={(e) => patch({ prompt: e.target.value })} rows={5} placeholder="清楚描述每次运行时要检查、整理或生成什么。" />
+                </label>
+              </section>
+
+              <section className="auto-form-section">
+                <div className="auto-form-section-head">
+                  <h3>运行计划</h3>
+                  <p>所有时间均使用本机时区。</p>
+                </div>
+                <div className="auto-form-grid schedule">
+                  <label className="field">
+                    <span>频率</span>
+                    <select value={draft.frequency} onChange={(e) => patch({ frequency: e.target.value as AutomationFrequency })}>
+                      <option value="hourly">每小时</option>
+                      <option value="daily">每天</option>
+                      <option value="weekdays">每工作日</option>
+                      <option value="weekly">每周</option>
+                      <option value="monthly">每月</option>
+                      <option value="custom">自定义间隔</option>
+                    </select>
+                  </label>
+                  {draft.frequency === "custom" ? (
+                    <>
+                      <label className="field">
+                        <span>间隔</span>
+                        <input type="number" min={1} step={1} value={draft.interval} onChange={(e) => patch({ interval: Number(e.target.value) })} />
+                      </label>
+                      <label className="field">
+                        <span>单位</span>
+                        <select value={draft.intervalUnit} onChange={(e) => patch({ intervalUnit: e.target.value as IntervalUnit })}>
+                          <option value="minute">分钟</option>
+                          <option value="hourly">小时</option>
+                          <option value="daily">天</option>
+                          <option value="weekly">周</option>
+                          <option value="monthly">个月</option>
+                        </select>
+                      </label>
+                    </>
+                  ) : null}
+                  {showTime ? (
+                    <label className="field">
+                      <span>时间</span>
+                      <input type="time" value={draft.time} onChange={(e) => patch({ time: e.target.value })} />
+                    </label>
+                  ) : null}
+                  {showMinute ? (
+                    <label className="field">
+                      <span>小时内第几分钟</span>
+                      <input type="number" min={0} max={59} value={draft.minute} onChange={(e) => patch({ minute: Math.min(59, Math.max(0, Number(e.target.value) || 0)) })} />
+                    </label>
+                  ) : null}
+                  {showMonthDay ? (
+                    <label className="field">
+                      <span>每月日期</span>
+                      <input type="number" min={1} max={31} value={draft.dayOfMonth} onChange={(e) => patch({ dayOfMonth: Math.min(31, Math.max(1, Number(e.target.value) || 1)) })} />
+                    </label>
+                  ) : null}
+                </div>
+                {showWeekdays ? (
+                  <div className="field auto-weekday-field">
+                    <span>星期</span>
+                    <div className="auto-weekdays">
+                      {WEEKDAYS.map((day) => (
+                        <label key={day.id} className={draft.weekdays.includes(day.id) ? "on" : ""}>
+                          <input
+                            type="checkbox"
+                            checked={draft.weekdays.includes(day.id)}
+                            onChange={(e) => {
+                              const next = e.target.checked ? [...draft.weekdays, day.id] : draft.weekdays.filter((id) => id !== day.id);
+                              patch({ weekdays: next.sort((a, b) => a - b) });
+                            }}
+                          />
+                          {day.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                <div className="auto-preview">
+                  <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden>
+                    <circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
+                    <path d="M10 5.8v4.5l2.9 1.7" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                  </svg>
+                  <span><strong>运行时间</strong>{preview}</span>
+                </div>
+              </section>
+
+              <section className="auto-form-section">
+                <div className="auto-form-section-head">
+                  <h3>停止条件</h3>
+                  <p>可以持续运行，也可以在指定次数或日期后停止。</p>
+                </div>
+                <div className="auto-repeat-options" role="group" aria-label="运行次数">
+                  <button type="button" aria-pressed={draft.recurring} className={draft.recurring ? "on" : ""} onClick={() => patch({ recurring: true })}>
+                    <strong>持续运行</strong><span>保持启用，直到手动暂停</span>
+                  </button>
+                  <button type="button" aria-pressed={!draft.recurring} className={!draft.recurring ? "on" : ""} onClick={() => patch({ recurring: false, maxRuns: draft.maxRuns || "1" })}>
+                    <strong>固定次数</strong><span>达到运行次数后自动停用</span>
+                  </button>
+                </div>
+                <div className="auto-form-grid two">
+                  {!draft.recurring ? (
+                    <label className="field">
+                      <span>运行次数</span>
+                      <input type="number" min={1} step={1} value={draft.maxRuns} onChange={(e) => patch({ maxRuns: e.target.value })} />
+                    </label>
+                  ) : null}
+                  <label className="field">
+                    <span>截止日期 <em>可选</em></span>
+                    <input type="date" value={draft.endsAt} onChange={(e) => patch({ endsAt: e.target.value })} />
+                  </label>
+                </div>
+              </section>
+
+              {formError ? <p className="auto-form-error" role="alert">{formError}</p> : null}
+            </div>
+            <div className="auto-form-footer">
+              <span>{editing ? (editing.enabled ? "保存后任务保持启用" : "保存后任务仍保持暂停") : "创建后将立即启用任务"}</span>
+              <div>
+                <button className="btn" type="button" disabled={saving} onClick={onClose}>取消</button>
+                <button className="btn primary" type="button" disabled={saving} onClick={() => void save()}>
+                  {saving ? "正在保存…" : editing ? "保存更改" : "创建定时任务"}
+                </button>
               </div>
-            ) : null}
-            {showMonthDay ? (
-              <label className="field">
-                <span>日期</span>
-                <input type="number" min={1} max={31} value={draft.dayOfMonth} onChange={(e) => patch({ dayOfMonth: Math.min(31, Math.max(1, Number(e.target.value) || 1)) })} />
-              </label>
-            ) : null}
-            <p className="settings-hint">运行时间：{preview}</p>
-            <label className="toggle">
-              <input type="checkbox" checked={draft.recurring} onChange={(e) => patch({ recurring: e.target.checked })} />
-              无限重复
-            </label>
-            <p className="settings-hint">关闭后，运行固定次数即停止。</p>
-            {!draft.recurring ? (
-              <label className="field">
-                <span>最大运行次数</span>
-                <input value={draft.maxRuns} onChange={(e) => patch({ maxRuns: e.target.value })} placeholder="例如：5" />
-              </label>
-            ) : (
-              <label className="field">
-                <span>结束</span>
-                <input type="date" value={draft.endsAt} onChange={(e) => patch({ endsAt: e.target.value })} />
-              </label>
-            )}
-            <label className="field">
-              <span>指令</span>
-              <textarea
-                value={draft.prompt}
-                onChange={(e) => patch({ prompt: e.target.value })}
-                rows={6}
-                placeholder="每次运行时这个任务要做什么？"
-              />
-            </label>
-            <div className="permission-actions">
-              <button
-                className="btn primary"
-                type="button"
-                disabled={!draft.prompt.trim()}
-                onClick={() => {
-                  if (!draft.prompt.trim()) return;
-                  if ((draft.frequency === "weekly" || (draft.frequency === "custom" && draft.intervalUnit === "weekly")) && !draft.weekdays.length) {
-                    return;
-                  }
-                  void run(editing ? "保存" : "创建", async () => {
-                    const input = toInput(draft);
-                    if (editing) await window.grok.updateAutomation(editing.id, { ...input, enabled: editing.enabled });
-                    else await window.grok.createAutomation(input);
-                    const rows = await window.grok.listAutomations();
-                    onSaved(rows);
-                    return rows;
-                  });
-                }}
-              >
-                {editing ? "保存" : "创建定时任务"}
-              </button>
             </div>
           </>
         )}

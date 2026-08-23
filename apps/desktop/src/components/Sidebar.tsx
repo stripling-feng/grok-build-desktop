@@ -24,6 +24,7 @@ type Props = {
   onOpenAutomation?: () => void;
   onOpenNewTask?: () => void;
   onSettings?: () => void;
+  onAccountChange?: (account: AccountInfo) => void;
 };
 
 type MenuState =
@@ -268,6 +269,192 @@ function clampMenu(x: number, y: number, width: number, height: number) {
   };
 }
 
+type CcSwitchProvider = { id: string; name: string; baseUrl: string; apiKey: string };
+
+type ApiLoginViewProps = {
+  baseUrl: string;
+  setBaseUrl: (v: string) => void;
+  apiKey: string;
+  setApiKey: (v: string) => void;
+  loginBusy: boolean;
+  setLoginBusy: (v: boolean) => void;
+  loginError: string;
+  setLoginError: (v: string) => void;
+  ccSwitchProviders: CcSwitchProvider[];
+  ccSwitchLoading: boolean;
+  showManualEntry: boolean;
+  setShowManualEntry: (v: boolean) => void;
+  selectedProviderId: string | null;
+  setSelectedProviderId: (v: string | null) => void;
+  onBack: () => void;
+  onSuccess: (account: AccountInfo) => void;
+};
+
+function ApiLoginView({
+  baseUrl,
+  setBaseUrl,
+  apiKey,
+  setApiKey,
+  loginBusy,
+  setLoginBusy,
+  loginError,
+  setLoginError,
+  ccSwitchProviders,
+  ccSwitchLoading,
+  showManualEntry,
+  setShowManualEntry,
+  selectedProviderId,
+  setSelectedProviderId,
+  onBack,
+  onSuccess,
+}: ApiLoginViewProps) {
+  const submitManual = () => {
+    if (!baseUrl.trim() || !apiKey.trim()) {
+      setLoginError("请填写 Base URL 和 API Key");
+      return;
+    }
+    setLoginBusy(true);
+    setLoginError("");
+    void window.grok
+      .loginApiKey({ baseUrl, apiKey })
+      .then((result) => {
+        if (!result.ok) {
+          setLoginError(result.message || "保存失败");
+          return;
+        }
+        onSuccess(result.account);
+      })
+      .catch((err) => {
+        setLoginError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => setLoginBusy(false));
+  };
+
+  const submitCcSwitch = (id: string) => {
+    setLoginBusy(true);
+    setLoginError("");
+    void window.grok
+      .loginApiKey({ fromCcSwitchId: id })
+      .then((result) => {
+        if (!result.ok) {
+          setLoginError(result.message || "切换失败");
+          return;
+        }
+        onSuccess(result.account);
+      })
+      .catch((err) => {
+        setLoginError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => setLoginBusy(false));
+  };
+
+  const hasProviders = ccSwitchProviders.length > 0;
+
+  return (
+    <>
+      <p className="settings-hint">凭据仅写入本机 ~/.grok，不会上传到桌面端。</p>
+      {loginError ? <p className="settings-error">{loginError}</p> : null}
+
+      {ccSwitchLoading ? (
+        <p className="settings-hint">正在读取 cc-switch 供应商…</p>
+      ) : null}
+
+      {hasProviders ? (
+        <>
+          <p className="ccswitch-section-title">来自 cc-switch 的中转站</p>
+          <ul className="ccswitch-list">
+            {ccSwitchProviders.map((p) => {
+              const selected = selectedProviderId === p.id;
+              return (
+                <li key={p.id} className={`ccswitch-item${selected ? " on" : ""}`}>
+                  <div className="ccswitch-meta">
+                    <strong>{p.name}</strong>
+                    <span>{p.baseUrl}</span>
+                  </div>
+                  <button
+                    className="btn small primary"
+                    type="button"
+                    disabled={loginBusy}
+                    onClick={() => {
+                      setSelectedProviderId(p.id);
+                      submitCcSwitch(p.id);
+                    }}
+                  >
+                    {loginBusy && selected ? "切换中…" : "使用"}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {!showManualEntry ? (
+            <div className="permission-actions">
+              <button
+                className="btn small ghost"
+                type="button"
+                disabled={loginBusy}
+                onClick={() => setShowManualEntry(true)}
+              >
+                手动填写 Base URL + API Key
+              </button>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+
+      {showManualEntry ? (
+        <>
+          <p className="ccswitch-section-title">手动填写</p>
+          <label className="field">
+            Base URL
+            <input
+              type="url"
+              value={baseUrl}
+              autoFocus
+              placeholder="https://api.x.ai/v1"
+              onChange={(e) => setBaseUrl(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            API Key
+            <input
+              type="password"
+              value={apiKey}
+              placeholder="sk-... 或 xai-..."
+              onChange={(e) => setApiKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                submitManual();
+              }}
+            />
+          </label>
+        </>
+      ) : null}
+
+      <div className="permission-actions">
+        <button
+          className="btn"
+          type="button"
+          disabled={loginBusy}
+          onClick={onBack}
+        >
+          返回
+        </button>
+        {showManualEntry ? (
+          <button
+            className="btn primary"
+            type="button"
+            disabled={loginBusy || !baseUrl.trim() || !apiKey.trim()}
+            onClick={submitManual}
+          >
+            {loginBusy ? "保存中…" : "保存并登录"}
+          </button>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
 export function Sidebar({
   projects,
   threads,
@@ -291,9 +478,22 @@ export function Sidebar({
   onOpenAutomation,
   onOpenNewTask,
   onSettings,
+  onAccountChange,
 }: Props) {
   const [usage, setUsage] = useState<AccountUsage | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginView, setLoginView] = useState<"choose" | "api">("choose");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("https://api.x.ai/v1");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [ccSwitchProviders, setCcSwitchProviders] = useState<
+    Array<{ id: string; name: string; baseUrl: string; apiKey: string }>
+  >([]);
+  const [ccSwitchLoading, setCcSwitchLoading] = useState(false);
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [showManualEntry, setShowManualEntry] = useState(false);
   const [update, setUpdate] = useState<AppUpdateInfo | null>(null);
   const [updateLoading, setUpdateLoading] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
@@ -301,6 +501,18 @@ export function Sidebar({
   const [rename, setRename] = useState<RenameState | null>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  const closeLogin = () => {
+    if (loginBusy) void window.grok.cancelAccountLogin();
+    setLoginBusy(false);
+    setLoginOpen(false);
+    setLoginError("");
+    setLoginView("choose");
+    setApiKey("");
+    setBaseUrl("https://api.x.ai/v1");
+    setSelectedProviderId(null);
+    setShowManualEntry(false);
+  };
 
   const grouped = useMemo(() => {
     return projects.map((project) => ({
@@ -328,6 +540,22 @@ export function Sidebar({
   useEffect(() => {
     if (rename) renameRef.current?.focus();
   }, [rename]);
+
+  useEffect(() => {
+    if (!loginOpen || loginView !== "api" || ccSwitchProviders.length > 0 || ccSwitchLoading) return;
+    setCcSwitchLoading(true);
+    void window.grok
+      .listCcSwitchProviders()
+      .then((providers) => {
+        setCcSwitchProviders(providers);
+        setShowManualEntry(providers.length === 0);
+      })
+      .catch(() => {
+        setCcSwitchProviders([]);
+        setShowManualEntry(true);
+      })
+      .finally(() => setCcSwitchLoading(false));
+  }, [loginOpen, loginView, ccSwitchProviders.length, ccSwitchLoading]);
 
   useEffect(() => {
     if (!menu) return;
@@ -567,7 +795,27 @@ export function Sidebar({
       <div className="sidebar-foot">
         <div
           className="account-pill"
-          title={usageTitle}
+          role="button"
+          tabIndex={0}
+          title={account?.method === "none" ? "点击登录" : usageTitle}
+          onClick={() => {
+            if (account?.method !== "none") return;
+            setLoginError("");
+            setLoginView("choose");
+            setApiKey("");
+            setBaseUrl("https://api.x.ai/v1");
+            setLoginOpen(true);
+          }}
+          onKeyDown={(e) => {
+            if (account?.method !== "none") return;
+            if (e.key !== "Enter" && e.key !== " ") return;
+            e.preventDefault();
+            setLoginError("");
+            setLoginView("choose");
+            setApiKey("");
+            setBaseUrl("https://api.x.ai/v1");
+            setLoginOpen(true);
+          }}
           onMouseEnter={() => {
             if (!canShowUsage || usageLoading) return;
             setUsageLoading(true);
@@ -599,6 +847,102 @@ export function Sidebar({
           更新
         </button>
       </div>
+      {loginOpen ? (
+        <div
+          className="modal-backdrop"
+          onClick={closeLogin}
+        >
+          <div className="modal login-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h2>{loginView === "api" ? "API 登录" : "登录 Grok"}</h2>
+              <button
+                className="btn small ghost"
+                type="button"
+                onClick={closeLogin}
+              >
+                {loginBusy ? "取消" : "关闭"}
+              </button>
+            </div>
+            {loginView === "choose" ? (
+              <>
+                <p className="settings-hint">选择一种登录方式。</p>
+                {loginError ? <p className="settings-error">{loginError}</p> : null}
+                <div className="login-choices">
+                  <button
+                    className="login-choice"
+                    type="button"
+                    disabled={loginBusy}
+                    onClick={() => {
+                      setLoginBusy(true);
+                      setLoginError("正在打开授权页，请在浏览器中完成 xAI 账号登录…");
+                      void window.grok
+                        .loginAccount()
+                        .then((result) => {
+                          if (result.ok) {
+                            onAccountChange?.(result.account);
+                            setLoginError("");
+                            setLoginOpen(false);
+                            return;
+                          }
+                          setLoginError(result.message || "账号登录未完成");
+                        })
+                        .catch((err) => {
+                          setLoginError(err instanceof Error ? err.message : String(err));
+                        })
+                        .finally(() => setLoginBusy(false));
+                    }}
+                  >
+                    <strong>账号登录</strong>
+                    <span>使用 xAI 账号，浏览器完成授权</span>
+                  </button>
+                  <button
+                    className="login-choice"
+                    type="button"
+                    disabled={loginBusy}
+                    onClick={() => {
+                      setLoginError("");
+                      setLoginView("api");
+                    }}
+                  >
+                    <strong>API 登录</strong>
+                    <span>中转站 Base URL + API Key</span>
+                  </button>
+                </div>
+                {loginBusy ? (
+                  <p className="settings-hint">正在打开登录页，请在浏览器中完成授权…</p>
+                ) : null}
+              </>
+            ) : (
+              <ApiLoginView
+                baseUrl={baseUrl}
+                setBaseUrl={setBaseUrl}
+                apiKey={apiKey}
+                setApiKey={setApiKey}
+                loginBusy={loginBusy}
+                setLoginBusy={setLoginBusy}
+                loginError={loginError}
+                setLoginError={setLoginError}
+                ccSwitchProviders={ccSwitchProviders}
+                ccSwitchLoading={ccSwitchLoading}
+                showManualEntry={showManualEntry}
+                setShowManualEntry={setShowManualEntry}
+                selectedProviderId={selectedProviderId}
+                setSelectedProviderId={setSelectedProviderId}
+                onBack={() => {
+                  setLoginError("");
+                  setLoginView("choose");
+                }}
+                onSuccess={(account) => {
+                  onAccountChange?.(account);
+                  setLoginOpen(false);
+                  setApiKey("");
+                  setSelectedProviderId(null);
+                }}
+              />
+            )}
+          </div>
+        </div>
+      ) : null}
       {updateOpen && update ? (
         <div className="modal-backdrop" onClick={() => setUpdateOpen(false)}>
           <div className="modal update-modal" onClick={(e) => e.stopPropagation()}>

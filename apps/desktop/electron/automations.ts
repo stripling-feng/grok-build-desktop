@@ -179,6 +179,30 @@ function addCalendarMonths(from: Date, months: number) {
   return next;
 }
 
+function addCalendarDays(from: Date, days: number) {
+  const next = new Date(from.getTime());
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function localDayNumber(value: Date) {
+  return Math.floor(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()) / UNIT_MS.daily);
+}
+
+function startOfWeek(value: Date) {
+  const next = new Date(value.getTime());
+  next.setHours(0, 0, 0, 0);
+  next.setDate(next.getDate() - next.getDay());
+  return next;
+}
+
+function atMonthDay(value: Date, dayOfMonth: number, hour: number, minute: number) {
+  const next = new Date(value.getFullYear(), value.getMonth(), 1, hour, minute, 0, 0);
+  const lastDay = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate();
+  next.setDate(Math.min(Math.max(1, dayOfMonth), lastDay));
+  return next;
+}
+
 function alignClock(at: Date, hour: number, minute: number) {
   at.setHours(hour, minute, 0, 0);
   return at;
@@ -195,6 +219,7 @@ export function computeNextRun(
     | "lastRunAt"
     | "createdAt"
     | "runCount"
+    | "maxRuns"
     | "frequency"
     | "time"
     | "minute"
@@ -204,6 +229,8 @@ export function computeNextRun(
   >,
   from = Date.now(),
 ) {
+  const runLimit = job.maxRuns ?? (job.recurring ? null : 1);
+  if (runLimit != null && job.runCount >= runLimit) return 0;
   if (job.endsAt && job.endsAt <= from) return 0;
   if (!job.recurring && job.delayMinutes && job.runCount === 0) {
     const at = job.createdAt + job.delayMinutes * 60_000;
@@ -224,7 +251,9 @@ export function computeNextRun(
   const custom = job.frequency === "custom" || (!job.frequency && Boolean(unit && n > 1));
 
   if (custom && unit) {
-    const origin = job.lastRunAt || job.createdAt || from;
+    // Keep custom intervals anchored to creation time. A manual run should not
+    // shift the future schedule.
+    const origin = job.createdAt || from;
     let at = 0;
     if (unit === "minute") {
       const step = n * UNIT_MS.minute;
@@ -238,24 +267,42 @@ export function computeNextRun(
       while (d.getTime() <= from) d.setTime(d.getTime() + step);
       at = d.getTime();
     } else if (unit === "daily") {
-      const step = n * UNIT_MS.daily;
-      const d = alignClock(new Date(origin), clock.hour, clock.minute);
-      if (d.getTime() <= origin) d.setTime(d.getTime() + step);
-      while (d.getTime() <= from) d.setTime(d.getTime() + step);
+      let d = alignClock(new Date(origin), clock.hour, clock.minute);
+      if (d.getTime() <= origin) d = addCalendarDays(d, n);
+      while (d.getTime() <= from) d = addCalendarDays(d, n);
       at = d.getTime();
     } else if (unit === "weekly") {
-      const step = n * UNIT_MS.weekly;
-      const d = alignClock(new Date(origin), clock.hour, clock.minute);
-      if (d.getTime() <= origin) d.setTime(d.getTime() + step);
-      while (d.getTime() <= from) d.setTime(d.getTime() + step);
-      at = d.getTime();
+      const anchorWeek = startOfWeek(new Date(origin));
+      const currentWeek = startOfWeek(new Date(from));
+      const weeksSinceAnchor = Math.max(0, Math.floor((localDayNumber(currentWeek) - localDayNumber(anchorWeek)) / 7));
+      let cycleWeek = Math.floor(weeksSinceAnchor / n) * n;
+      const days = [...new Set(job.weekdays?.length ? job.weekdays : [1])]
+        .map((day) => Math.min(6, Math.max(0, day)))
+        .sort((a, b) => a - b);
+      for (let cycle = 0; cycle < 2 && !at; cycle += 1, cycleWeek += n) {
+        const cycleStart = addCalendarDays(anchorWeek, cycleWeek * 7);
+        for (const day of days) {
+          const candidate = alignClock(addCalendarDays(cycleStart, day), clock.hour, clock.minute);
+          if (candidate.getTime() > from && candidate.getTime() > origin) {
+            at = candidate.getTime();
+            break;
+          }
+        }
+      }
     } else if (unit === "monthly") {
-      let d = alignClock(new Date(origin), clock.hour, clock.minute);
-      if (d.getTime() <= origin) d = addCalendarMonths(d, n);
-      while (d.getTime() <= from) d = addCalendarMonths(d, n);
-      at = d.getTime();
+      const anchorMonth = new Date(new Date(origin).getFullYear(), new Date(origin).getMonth(), 1);
+      const current = new Date(from);
+      const monthsSinceAnchor = Math.max(0, (current.getFullYear() - anchorMonth.getFullYear()) * 12 + current.getMonth() - anchorMonth.getMonth());
+      let cycleMonth = Math.floor(monthsSinceAnchor / n) * n;
+      for (let cycle = 0; cycle < 2 && !at; cycle += 1, cycleMonth += n) {
+        const month = addCalendarMonths(anchorMonth, cycleMonth);
+        const candidate = atMonthDay(month, job.dayOfMonth || 1, clock.hour, clock.minute);
+        if (candidate.getTime() > from && candidate.getTime() > origin) at = candidate.getTime();
+      }
     } else if (unit === "yearly") {
-      const d = alignClock(new Date(origin), clock.hour, clock.minute);
+      const originDate = new Date(origin);
+      const d = new Date(originDate.getFullYear(), originDate.getMonth(), originDate.getDate(), clock.hour, clock.minute, 0, 0);
+      if (d.getTime() <= origin) d.setFullYear(d.getFullYear() + n);
       while (d.getTime() <= from) d.setFullYear(d.getFullYear() + n);
       at = d.getTime();
     }
@@ -337,6 +384,7 @@ export function createAutomation(input: AutomationInput) {
     runs: [],
   };
   row.nextRunAt = computeNextRun(row, now);
+  if (row.nextRunAt <= 0) row.enabled = false;
   const rows = readAll();
   rows.unshift(row);
   writeAll(rows);
@@ -406,7 +454,10 @@ export function updateAutomation(
   };
   if (patch.nextRunAt === undefined) {
     if (!next.enabled) next.nextRunAt = 0;
-    else if (scheduleTouched || cur.nextRunAt <= 0) next.nextRunAt = computeNextRun(next);
+    else if (scheduleTouched || cur.nextRunAt <= 0) {
+      next.nextRunAt = computeNextRun(next);
+      if (next.nextRunAt <= 0) next.enabled = false;
+    }
   }
   rows[idx] = next;
   writeAll(rows);
@@ -479,7 +530,8 @@ export function markFinished(
   const cur = getAutomation(id);
   if (!cur) throw new Error("找不到这条自动化");
   const runCount = cur.runCount + 1;
-  const done = !cur.recurring || (cur.maxRuns != null && runCount >= cur.maxRuns) || (cur.endsAt != null && Date.now() >= cur.endsAt);
+  const runLimit = cur.maxRuns ?? (cur.recurring ? null : 1);
+  const done = (runLimit != null && runCount >= runLimit) || (cur.endsAt != null && Date.now() >= cur.endsAt);
   const lastRunAt = Date.now();
   const runs = [...(cur.runs || [])];
   const idx = runs.findIndex((row) => row.status === "running");
