@@ -7,7 +7,6 @@ import { toolStatusLabel } from "../lib/i18n";
 type UserItem = Extract<StreamItem, { kind: "user" }>;
 type ThoughtItem = Extract<StreamItem, { kind: "thought" }>;
 type ToolItem = Extract<StreamItem, { kind: "tool" }>;
-type MediaItem = Extract<StreamItem, { kind: "media" }>;
 
 type Turn = {
   user?: UserItem;
@@ -93,45 +92,6 @@ function groupTurns(items: StreamItem[]): Turn[] {
   return turns;
 }
 
-function MediaCard({ item }: { item: MediaItem }) {
-  const label = item.mediaKind === "video" ? "视频" : "图片";
-  if (item.status === "pending") {
-    return (
-      <div className="msg media pending">
-        <div className="media-kicker">正在生成{label}</div>
-        <p className="media-prompt">{item.prompt}</p>
-      </div>
-    );
-  }
-  if (item.status === "error") {
-    return (
-      <div className="msg media error">
-        <div className="media-kicker">{label}生成失败</div>
-        <p className="media-prompt">{item.error || "未知错误"}</p>
-      </div>
-    );
-  }
-  return (
-    <div className="msg media">
-      <div className="media-kicker">
-        {label}
-        {item.via === "relay" ? " · 中转" : item.via === "oauth" ? " · 官方" : ""}
-      </div>
-      <div className="media-grid">
-        {item.urls.map((url) =>
-          item.mediaKind === "video" || /\.(mp4|webm|mov)(\?|$)/i.test(url) ? (
-            <video key={url} className="media-frame" src={url} controls playsInline />
-          ) : (
-            <a key={url} href={url} target="_blank" rel="noreferrer">
-              <img className="media-frame" src={url} alt={item.prompt} />
-            </a>
-          ),
-        )}
-      </div>
-    </div>
-  );
-}
-
 function ToolCard({
   item,
   onOpenFile,
@@ -204,9 +164,6 @@ function RestItem({
       </div>
     );
   }
-  if (item.kind === "media") {
-    return <MediaCard item={item} />;
-  }
   return <div className="msg thought">{item.kind === "status" ? item.text : ""}</div>;
 }
 
@@ -218,11 +175,17 @@ function railPreview(text: string) {
 export function MessageStream({
   items,
   busy,
+  error,
+  onRetryError,
+  onDismissError,
   emptyTitle,
   onOpenFile,
 }: {
   items: StreamItem[];
   busy?: boolean;
+  error?: string | null;
+  onRetryError?: () => void;
+  onDismissError?: () => void;
   emptyTitle: string;
   onOpenFile?: (path: string) => void;
 }) {
@@ -239,7 +202,7 @@ export function MessageStream({
 
   useEffect(() => {
     if (followRef.current) end.current?.scrollIntoView({ block: "end" });
-  }, [items]);
+  }, [items, error]);
 
   useEffect(() => {
     const root = streamRef.current;
@@ -380,6 +343,19 @@ export function MessageStream({
                 />
               </svg>
               <span>正在运行</span>
+            </div>
+          ) : null}
+          {error ? (
+            <div className="chat-error" role="alert">
+              <div className="chat-error-head">
+                <strong>任务未完成</strong>
+                <div>
+                  {onRetryError ? <button type="button" onClick={onRetryError}>重试</button> : null}
+                  <button type="button" onClick={() => void navigator.clipboard.writeText(error)}>复制详情</button>
+                  {onDismissError ? <button type="button" onClick={onDismissError}>关闭</button> : null}
+                </div>
+              </div>
+              <pre>{error}</pre>
             </div>
           ) : null}
         </div>

@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AccountInfo, AccountUsage, AppUpdateInfo, ProjectInfo, ThreadInfo } from "../../electron/shared";
+import type {
+  AccountInfo,
+  AccountUsage,
+  AppUpdateInfo,
+  ProjectInfo,
+  ThreadInfo,
+  ThreadSearchResult,
+} from "../../electron/shared";
 
 type Props = {
   projects: ProjectInfo[];
@@ -196,6 +203,15 @@ function NewTaskIcon() {
   );
 }
 
+function SearchIcon() {
+  return (
+    <Icon className="nav-icon">
+      <circle cx="7" cy="7" r="3.8" fill="none" stroke="currentColor" strokeWidth="1.35" />
+      <path d="m10 10 3 3" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+    </Icon>
+  );
+}
+
 function AutoIcon() {
   return (
     <Icon className="nav-icon">
@@ -251,6 +267,21 @@ function UserIcon() {
         stroke="currentColor"
         strokeWidth="1.3"
         strokeLinecap="round"
+      />
+    </Icon>
+  );
+}
+
+function SwitchLoginIcon() {
+  return (
+    <Icon className="login-switch-icon">
+      <path
+        d="M3 5.2h8.7M9.7 3.2l2 2-2 2M13 10.8H4.3M6.3 8.8l-2 2 2 2"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.35"
+        strokeLinecap="round"
+        strokeLinejoin="round"
       />
     </Icon>
   );
@@ -497,10 +528,16 @@ export function Sidebar({
   const [update, setUpdate] = useState<AppUpdateInfo | null>(null);
   const [updateLoading, setUpdateLoading] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<ThreadSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [rename, setRename] = useState<RenameState | null>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchRequestRef = useRef(0);
 
   const closeLogin = () => {
     if (loginBusy) void window.grok.cancelAccountLogin();
@@ -512,6 +549,16 @@ export function Sidebar({
     setBaseUrl("https://api.x.ai/v1");
     setSelectedProviderId(null);
     setShowManualEntry(false);
+  };
+
+  const openLogin = () => {
+    setLoginError("");
+    setLoginView("choose");
+    setApiKey("");
+    setBaseUrl("https://api.x.ai/v1");
+    setSelectedProviderId(null);
+    setShowManualEntry(false);
+    setLoginOpen(true);
   };
 
   const grouped = useMemo(() => {
@@ -540,6 +587,42 @@ export function Sidebar({
   useEffect(() => {
     if (rename) renameRef.current?.focus();
   }, [rename]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSearchOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    const query = searchQuery.trim();
+    const requestId = ++searchRequestRef.current;
+    if (!query) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      return;
+    }
+    setSearchLoading(true);
+    const timer = window.setTimeout(() => {
+      void window.grok
+        .searchThreads(query)
+        .then((results) => {
+          if (searchRequestRef.current === requestId) setSearchResults(results);
+        })
+        .catch(() => {
+          if (searchRequestRef.current === requestId) setSearchResults([]);
+        })
+        .finally(() => {
+          if (searchRequestRef.current === requestId) setSearchLoading(false);
+        });
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [searchOpen, searchQuery]);
 
   useEffect(() => {
     if (!loginOpen || loginView !== "api" || ccSwitchProviders.length > 0 || ccSwitchLoading) return;
@@ -631,6 +714,18 @@ export function Sidebar({
   return (
     <aside className="sidebar" onContextMenu={(e) => e.preventDefault()}>
       <div className="sidebar-nav">
+        <button
+          type="button"
+          className="sidebar-nav-item sidebar-search-button"
+          onClick={() => {
+            setSearchQuery("");
+            setSearchResults([]);
+            setSearchOpen(true);
+          }}
+        >
+          <SearchIcon />
+          搜索会话
+        </button>
         <button type="button" className="btn primary block" onClick={onOpenNewTask}>
           <NewTaskIcon />
           新建任务
@@ -793,60 +888,107 @@ export function Sidebar({
         </div>
       </div>
       <div className="sidebar-foot">
-        <div
-          className="account-pill"
-          role="button"
-          tabIndex={0}
-          title={account?.method === "none" ? "点击登录" : usageTitle}
-          onClick={() => {
-            if (account?.method !== "none") return;
-            setLoginError("");
-            setLoginView("choose");
-            setApiKey("");
-            setBaseUrl("https://api.x.ai/v1");
-            setLoginOpen(true);
-          }}
-          onKeyDown={(e) => {
-            if (account?.method !== "none") return;
-            if (e.key !== "Enter" && e.key !== " ") return;
-            e.preventDefault();
-            setLoginError("");
-            setLoginView("choose");
-            setApiKey("");
-            setBaseUrl("https://api.x.ai/v1");
-            setLoginOpen(true);
-          }}
-          onMouseEnter={() => {
-            if (!canShowUsage || usageLoading) return;
-            setUsageLoading(true);
-            void window.grok
-              .accountUsage()
-              .then(setUsage)
-              .catch(() => setUsage({ text: "无法获取用量" }))
-              .finally(() => setUsageLoading(false));
-          }}
-        >
-          <UserIcon />
-          <span className="account-name">{accountLabel(account)}</span>
-          {account?.method === "oauth" ? <span className="account-kind">OAuth</span> : null}
-        </div>
-        {onSettings ? (
-          <button className="update-btn" type="button" title="设置" onClick={onSettings}>
-            <SettingsIcon />
-            设置
-          </button>
-        ) : null}
         <button
-          className={`update-btn${update?.hasUpdate ? " has-update" : ""}`}
+          className="login-switch-button"
           type="button"
-          title="检查更新"
-          disabled={updateLoading}
-          onClick={() => void checkUpdate()}
+          title="切换账号登录或 API 登录"
+          onClick={openLogin}
         >
-          {updateLoading ? <SpinnerIcon /> : <UpdateIcon />}
-          更新
+          <SwitchLoginIcon />
+          <span>切换登录方式</span>
         </button>
+        <div className="sidebar-foot-actions">
+          <div
+            className="account-pill"
+            role="button"
+            tabIndex={0}
+            title={account?.method === "none" ? "点击登录" : usageTitle}
+            onClick={() => {
+              if (account?.method === "none") openLogin();
+            }}
+            onKeyDown={(e) => {
+              if (account?.method !== "none") return;
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              openLogin();
+            }}
+            onMouseEnter={() => {
+              if (!canShowUsage || usageLoading) return;
+              setUsageLoading(true);
+              void window.grok
+                .accountUsage()
+                .then(setUsage)
+                .catch(() => setUsage({ text: "无法获取用量" }))
+                .finally(() => setUsageLoading(false));
+            }}
+          >
+            <UserIcon />
+            <span className="account-name">{accountLabel(account)}</span>
+            {account?.method === "oauth" ? <span className="account-kind">OAuth</span> : null}
+          </div>
+          {onSettings ? (
+            <button className="update-btn" type="button" title="设置" onClick={onSettings}>
+              <SettingsIcon />
+              设置
+            </button>
+          ) : null}
+          <button
+            className={`update-btn${update?.hasUpdate ? " has-update" : ""}`}
+            type="button"
+            title="检查更新"
+            disabled={updateLoading}
+            onClick={() => void checkUpdate()}
+          >
+            {updateLoading ? <SpinnerIcon /> : <UpdateIcon />}
+            更新
+          </button>
+        </div>
       </div>
+      {searchOpen ? (
+        <div className="modal-backdrop" onClick={() => setSearchOpen(false)}>
+          <div className="modal thread-search-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-head">
+              <h2>搜索所有会话</h2>
+              <button className="btn small ghost" type="button" onClick={() => setSearchOpen(false)}>
+                关闭
+              </button>
+            </div>
+            <label className="thread-search-box">
+              <SearchIcon />
+              <input
+                ref={searchInputRef}
+                value={searchQuery}
+                placeholder="输入会话内容关键词"
+                onChange={(event) => setSearchQuery(event.target.value)}
+              />
+              {searchLoading ? <SpinnerIcon /> : null}
+            </label>
+            <div className="thread-search-results">
+              {!searchQuery.trim() ? <div className="thread-search-empty">输入关键词搜索全部会话内容</div> : null}
+              {searchQuery.trim() && !searchLoading && searchResults.length === 0 ? (
+                <div className="thread-search-empty">没有找到匹配的会话</div>
+              ) : null}
+              {searchResults.map((result) => (
+                <button
+                  key={result.thread.id}
+                  type="button"
+                  className="thread-search-result"
+                  onClick={() => {
+                    setSearchOpen(false);
+                    onSelectThread(result.thread);
+                  }}
+                >
+                  <span className="thread-search-result-head">
+                    <strong>{result.thread.title}</strong>
+                    <em>{result.matchCount} 处匹配</em>
+                  </span>
+                  <span className="thread-search-snippet">{result.snippet}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
       {loginOpen ? (
         <div
           className="modal-backdrop"
@@ -854,7 +996,7 @@ export function Sidebar({
         >
           <div className="modal login-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <h2>{loginView === "api" ? "API 登录" : "登录 Grok"}</h2>
+              <h2>{loginView === "api" ? "API 登录" : "选择登录方式"}</h2>
               <button
                 className="btn small ghost"
                 type="button"
@@ -865,11 +1007,13 @@ export function Sidebar({
             </div>
             {loginView === "choose" ? (
               <>
-                <p className="settings-hint">选择一种登录方式。</p>
+                <p className="settings-hint">
+                  {account?.method === "none" ? "选择一种登录方式。" : `当前登录：${accountLabel(account)}`}
+                </p>
                 {loginError ? <p className="settings-error">{loginError}</p> : null}
                 <div className="login-choices">
                   <button
-                    className="login-choice"
+                    className={`login-choice${account?.method === "oauth" ? " current" : ""}`}
                     type="button"
                     disabled={loginBusy}
                     onClick={() => {
@@ -892,11 +1036,14 @@ export function Sidebar({
                         .finally(() => setLoginBusy(false));
                     }}
                   >
-                    <strong>账号登录</strong>
+                    <strong>
+                      账号登录
+                      {account?.method === "oauth" ? <em>当前使用</em> : null}
+                    </strong>
                     <span>使用 xAI 账号，浏览器完成授权</span>
                   </button>
                   <button
-                    className="login-choice"
+                    className={`login-choice${account?.method === "api-key" ? " current" : ""}`}
                     type="button"
                     disabled={loginBusy}
                     onClick={() => {
@@ -904,7 +1051,10 @@ export function Sidebar({
                       setLoginView("api");
                     }}
                   >
-                    <strong>API 登录</strong>
+                    <strong>
+                      API 登录
+                      {account?.method === "api-key" ? <em>当前使用</em> : null}
+                    </strong>
                     <span>中转站 Base URL + API Key</span>
                   </button>
                 </div>

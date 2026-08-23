@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld("grok", {
   removeThread: (sessionId: string, cwd: string) =>
     ipcRenderer.invoke("grok:removeThread", sessionId, cwd),
   listThreads: (cwd?: string) => ipcRenderer.invoke("grok:listThreads", cwd),
+  searchThreads: (query: string) => ipcRenderer.invoke("grok:searchThreads", query),
   loadTranscript: (sessionId: string, cwd: string) =>
     ipcRenderer.invoke("grok:loadTranscript", sessionId, cwd),
   newThread: (cwd?: string | null, worktree?: boolean) =>
@@ -45,8 +46,6 @@ contextBridge.exposeInMainWorld("grok", {
   savePastedImage: (payload: { data: string; mimeType?: string }) =>
     ipcRenderer.invoke("grok:savePastedImage", payload),
   saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
-  generateMedia: (kind: "image" | "video", prompt: string) =>
-    ipcRenderer.invoke("grok:generateMedia", kind, prompt),
   setMode: (sessionId: string, modeId: string) =>
     ipcRenderer.invoke("grok:setMode", sessionId, modeId),
   pickFiles: () => ipcRenderer.invoke("grok:pickFiles"),

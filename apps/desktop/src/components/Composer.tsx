@@ -126,23 +126,6 @@ function IconGoal() {
     </svg>
   );
 }
-function IconImage() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
-      <rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="1.25" />
-      <circle cx="5.6" cy="6.3" r="1.05" fill="currentColor" />
-      <path d="M3.2 11.4 6.4 8.4l2.1 2.1 1.7-1.7 2.6 2.6" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinejoin="round" />
-    </svg>
-  );
-}
-function IconVideo() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
-      <rect x="1.8" y="3.6" width="8.8" height="8.8" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.25" />
-      <path d="M11.2 6.4 14.2 4.8v6.4L11.2 9.6z" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinejoin="round" />
-    </svg>
-  );
-}
 function IconPlan() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
@@ -506,8 +489,6 @@ export function Composer({
       { id: "settings", label: "/settings", hint: "打开设置", kind: "app" as const },
       { id: "plan", label: "/plan", hint: "切换计划模式", kind: "app" as const },
       { id: "loop", label: "/loop 5m", hint: "当前会话循环任务，不是系统定时", kind: "insert" as const },
-      { id: "imagine", label: "/imagine", hint: "根据描述生成图片", kind: "insert" as const },
-      { id: "imagine-video", label: "/imagine-video", hint: "根据描述生成视频", kind: "insert" as const },
     ];
     const skills = (settings?.skills ?? [])
       .filter((s) => !s.disabled && s.userInvocable !== false)
@@ -650,34 +631,6 @@ export function Composer({
                 </span>
               </button>
             ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                onChange(value.trim() ? `/imagine ${value.trim()}` : "/imagine ");
-                closeMenus();
-                requestAnimationFrame(() => ref.current?.focus());
-              }}
-            >
-              <IconImage />
-              <span className="add-row">
-                <strong>生成图片</strong>
-                <em>中转走上游，OAuth 走官方</em>
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onChange(value.trim() ? `/imagine-video ${value.trim()}` : "/imagine-video ");
-                closeMenus();
-                requestAnimationFrame(() => ref.current?.focus());
-              }}
-            >
-              <IconVideo />
-              <span className="add-row">
-                <strong>生成视频</strong>
-                <em>中转走上游，OAuth 走官方</em>
-              </span>
-            </button>
             <button
               type="button"
               className={planMode ? "on" : ""}

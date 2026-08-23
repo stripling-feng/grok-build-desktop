@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, session as electronSession, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session as electronSession, shell, Tray } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -15,7 +15,7 @@ import {
   threadBelongsToProject,
   unbindSession,
 } from "./projects";
-import { copySession, listThreads, loadTranscript, removeThread, renameThread } from "./sessions";
+import { copySession, listThreads, loadTranscript, removeThread, renameThread, searchThreads, touchThreadActivity } from "./sessions";
 import {
   applyWorktree,
   createWorktree,
@@ -72,7 +72,6 @@ import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
 import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearApiKey } from "./account";
 import { checkAppUpdate, openUpdateUrl } from "./update";
-import { generateMedia } from "./media";
 import {
   createAutomation,
   deleteAutomation,
@@ -93,6 +92,8 @@ const acp = new GrokAcpClient();
 const loadedSessions = new Set<string>();
 const terminal = new ProjectTerminal();
 let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let isQuitting = false;
 let systemProxyPromise: Promise<string | null> | null = null;
 let accountLoginController: AbortController | null = null;
 
@@ -166,7 +167,37 @@ function send(channel: string, payload: unknown) {
 }
 
 function appIconPath() {
-  return path.join(__dirname, "..", "build", "icon.ico");
+  return path.join(__dirname, "..", "build", "icon-rounded.ico");
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (tray && !tray.isDestroyed()) return;
+  tray = new Tray(appIconPath());
+  tray.setToolTip("Grok Build");
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "显示主窗口", click: showMainWindow },
+      { type: "separator" },
+      {
+        label: "退出",
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        },
+      },
+    ]),
+  );
+  tray.on("double-click", showMainWindow);
 }
 
 function createWindow() {
@@ -191,6 +222,11 @@ function createWindow() {
   });
 
   mainWindow.once("ready-to-show", () => mainWindow?.show());
+  mainWindow.on("close", (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    mainWindow?.hide();
+  });
   mainWindow.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     log("renderer", level, message, sourceId, line);
   });
@@ -220,7 +256,17 @@ function createWindow() {
   });
 }
 
-acp.on("update", (payload) => send("grok:update", payload));
+acp.on("update", (payload) => {
+  // Completion is the renderer's authoritative signal to stop showing a busy
+  // session. Deliver it before best-effort workspace bookkeeping so a refresh
+  // failure cannot leave the UI spinning forever.
+  send("grok:update", payload);
+  if (String(payload.update?.sessionUpdate ?? "") === "turn_completed") {
+    touchThreadActivity(payload.sessionId);
+    invalidateWorkspace();
+    send("grok:workspace", workspace());
+  }
+});
 acp.on("permission", (payload) => send("grok:permission", payload));
 acp.on("status", (payload) => send("grok:agent-status", payload));
 acp.on("stderr", (chunk: string) => log("grok stderr", String(chunk).slice(0, 2000)));
@@ -241,6 +287,7 @@ if (!gotLock) {
     app.setAppUserModelId("ai.x.grok.build.desktop");
     initLog();
     pruneLogs();
+    createTray();
     createWindow();
     void ensureSystemProxyEnvironment()
       .then(() => acp.ensureStarted())
@@ -250,7 +297,7 @@ if (!gotLock) {
       void tickAutomations();
     });
     app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      showMainWindow();
     });
   });
 }
@@ -260,6 +307,9 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  isQuitting = true;
+  tray?.destroy();
+  tray = null;
   stopGrokInstall();
   terminal.kill();
   void acp.stop();
@@ -483,6 +533,7 @@ ipcMain.handle("grok:listThreads", (_e, cwd?: string) => {
   if (!cwd) return threads;
   return threads.filter((t) => t.projectCwd === cwd || t.cwd === cwd);
 });
+ipcMain.handle("grok:searchThreads", (_e, query: string) => searchThreads(query, workspace().threads));
 ipcMain.handle("grok:loadTranscript", (_e, sessionId: string, cwd: string) =>
   loadTranscript(sessionId, cwd),
 );
@@ -622,7 +673,12 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
 });
 
 ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: { path: string; mimeType: string }[]) => {
-  return acp.prompt(sessionId, text, images);
+  try {
+    return await acp.prompt(sessionId, text, images);
+  } catch (err) {
+    log("sendPrompt failed", sessionId, err);
+    throw err;
+  }
 });
 ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeType?: string }) => {
   const mime = (payload?.mimeType || "image/png").toLowerCase();
@@ -644,9 +700,6 @@ ipcMain.handle("grok:saveClipboardImage", async () => {
   const file = path.join(dir, `paste-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.png`);
   fs.writeFileSync(file, png);
   return { path: file, mimeType: "image/png", dataUrl: `data:image/png;base64,${png.toString("base64")}` };
-});
-ipcMain.handle("grok:generateMedia", async (_e, kind: "image" | "video", prompt: string) => {
-  return generateMedia(kind, prompt);
 });
 ipcMain.handle("grok:setMode", async (_e, sessionId: string, modeId: string) => {
   await acp.setMode(sessionId, modeId);

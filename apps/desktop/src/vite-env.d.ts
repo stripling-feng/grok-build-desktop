@@ -17,8 +17,7 @@ import type {
   ProjectInfo,
   StreamItem,
   ThreadInfo,
-  MediaKind,
-  MediaResult,
+  ThreadSearchResult,
 } from "../electron/shared";
 
 export type NewThreadResult = {
@@ -59,6 +58,7 @@ declare global {
       renameThread: (sessionId: string, cwd: string, title: string) => Promise<ThreadInfo>;
       removeThread: (sessionId: string, cwd: string) => Promise<boolean>;
       listThreads: (cwd?: string) => Promise<ThreadInfo[]>;
+      searchThreads: (query: string) => Promise<ThreadSearchResult[]>;
       loadTranscript: (
         sessionId: string,
         cwd: string,
@@ -73,7 +73,6 @@ declare global {
       ) => Promise<unknown>;
       savePastedImage: (payload: { data: string; mimeType?: string }) => Promise<{ path: string; mimeType: string }>;
       saveClipboardImage: () => Promise<{ path: string; mimeType: string; dataUrl: string } | null>;
-      generateMedia: (kind: MediaKind, prompt: string) => Promise<MediaResult>;
       setMode: (sessionId: string, modeId: string) => Promise<void>;
       pickFiles: () => Promise<string[]>;
       pickFolder: () => Promise<string[]>;

@@ -13,6 +13,7 @@ import {
   type ContextUsage,
   type StreamItem,
   type ThreadInfo,
+  type ThreadSearchResult,
 } from "./shared";
 
 export function grokHome(): string {
@@ -306,6 +307,108 @@ export function findSessionDir(sessionId: string, cwd?: string): string | null {
     }
   }
   return null;
+}
+
+function searchTextFromValue(value: unknown): string {
+  if (typeof value === "string") {
+    if (value.startsWith("data:") || value.length > 200_000) return "";
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(searchTextFromValue).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  const rec = value as Record<string, unknown>;
+  const preferred = ["content", "text", "message", "update", "title", "detail"]
+    .filter((key) => rec[key] != null)
+    .map((key) => searchTextFromValue(rec[key]))
+    .filter(Boolean);
+  if (preferred.length) return preferred.join("\n");
+  return "";
+}
+
+function sessionSearchText(dir: string): string {
+  const chunks: string[] = [];
+  for (const name of ["chat_history.jsonl", "updates.jsonl"]) {
+    const file = path.join(dir, name);
+    if (!fs.existsSync(file)) continue;
+    let raw = "";
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const text = searchTextFromValue(JSON.parse(line));
+        if (text) chunks.push(text);
+      } catch {
+        /* ignore a partial JSONL line */
+      }
+    }
+  }
+  return chunks.join("\n");
+}
+
+function countMatches(text: string, query: string): number {
+  let count = 0;
+  let from = 0;
+  while (from < text.length) {
+    const at = text.indexOf(query, from);
+    if (at < 0) break;
+    count += 1;
+    from = at + Math.max(1, query.length);
+  }
+  return count;
+}
+
+function matchSnippet(text: string, query: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  const at = compact.toLocaleLowerCase().indexOf(query);
+  if (at < 0) return compact.slice(0, 180);
+  const start = Math.max(0, at - 70);
+  const end = Math.min(compact.length, at + query.length + 120);
+  return `${start > 0 ? "…" : ""}${compact.slice(start, end)}${end < compact.length ? "…" : ""}`;
+}
+
+export function searchThreads(
+  rawQuery: string,
+  source: ThreadInfo[] = listThreads(),
+  limit = 100,
+): ThreadSearchResult[] {
+  const query = rawQuery.trim().toLocaleLowerCase();
+  if (!query) return [];
+  const results: ThreadSearchResult[] = [];
+  for (const thread of source) {
+    const dir = findSessionDir(thread.id, thread.cwd);
+    const content = dir ? sessionSearchText(dir) : "";
+    const searchable = [thread.title, thread.summary, thread.lastTurnSummary, content]
+      .filter((part): part is string => Boolean(part))
+      .join("\n");
+    const normalized = searchable.toLocaleLowerCase();
+    const matchCount = countMatches(normalized, query);
+    if (!matchCount) continue;
+    results.push({ thread, snippet: matchSnippet(searchable, query), matchCount });
+  }
+  return results
+    .sort((a, b) => b.matchCount - a.matchCount || b.thread.updatedAt.localeCompare(a.thread.updatedAt))
+    .slice(0, limit);
+}
+
+export function touchThreadActivity(sessionId: string, cwd?: string): boolean {
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return false;
+  const summaryPath = path.join(dir, "summary.json");
+  const raw = readJson(summaryPath);
+  if (!raw) return false;
+  const now = new Date().toISOString();
+  raw.last_active_at = now;
+  raw.updated_at = now;
+  try {
+    fs.writeFileSync(summaryPath, JSON.stringify(raw, null, 2), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function charsOf(value: unknown): number {

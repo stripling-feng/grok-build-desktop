@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { normalizePlanStatus, type PlanEntryStatus } from "../../electron/shared";
 import type { PlanEntry, PlanRevision } from "../lib/stream";
+import { planFlowLabel, type PlanFlowPhase } from "../lib/plan-flow";
 
 type Props = {
   open: boolean;
   revisions: PlanRevision[];
+  phase: PlanFlowPhase;
+  error?: string;
   busy: boolean;
-  onApprove: () => void;
+  onApprove: (revision: PlanRevision) => void;
   onReject: () => void;
-  onRevise: (note: string) => void;
+  onRevise: (note: string, revision: PlanRevision) => void;
+  onRetry: () => void;
   onClose: () => void;
 };
 
@@ -22,10 +26,13 @@ function revisionHasUnfinished(entries: PlanEntry[]): boolean {
 export function PlanPanel({
   open,
   revisions,
+  phase,
+  error,
   busy,
   onApprove,
   onReject,
   onRevise,
+  onRetry,
   onClose,
 }: Props) {
   const [note, setNote] = useState("");
@@ -46,6 +53,10 @@ export function PlanPanel({
     const target = sortedRevisions.find((r) => r.revision === resolvedActive);
     return target?.entries ?? [];
   }, [sortedRevisions, resolvedActive]);
+  const currentRevision = useMemo(
+    () => sortedRevisions.find((r) => r.revision === resolvedActive) ?? null,
+    [sortedRevisions, resolvedActive],
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -74,7 +85,10 @@ export function PlanPanel({
   return (
     <div className="plan-panel">
       <div className="plan-head">
-        <span>计划{latestRevision != null ? ` · 第 ${latestRevision} 版` : ""}</span>
+        <span>
+          计划{latestRevision != null ? ` · 第 ${latestRevision} 版` : ""}
+          <em className={`plan-phase ${phase}`}>{planFlowLabel(phase)}</em>
+        </span>
         <div className="plan-actions">
           <button className="btn small ghost" type="button" onClick={onClose}>
             收起
@@ -122,14 +136,15 @@ export function PlanPanel({
           })
         )}
       </ol>
+      {error ? <div className="plan-error">{error}</div> : null}
       <div className="plan-foot">
         <form
           className="plan-revise"
           onSubmit={(e) => {
             e.preventDefault();
             const value = note.trim();
-            if (!value) return;
-            onRevise(value);
+            if (!value || !currentRevision) return;
+            onRevise(value, currentRevision);
             setNote("");
           }}
         >
@@ -137,9 +152,13 @@ export function PlanPanel({
             value={note}
             onChange={(e) => setNote(e.target.value)}
             placeholder="调整意见，例如：先别动 package.json"
-            disabled={busy}
+            disabled={busy || currentEntries.length === 0}
           />
-          <button className="btn small" type="submit" disabled={busy || !note.trim()}>
+          <button
+            className="btn small"
+            type="submit"
+            disabled={busy || currentEntries.length === 0 || !note.trim()}
+          >
             重新计划
           </button>
         </form>
@@ -147,9 +166,20 @@ export function PlanPanel({
           <button className="btn small reject" type="button" onClick={onReject} disabled={busy}>
             拒绝
           </button>
-          <button className="btn primary small" type="button" onClick={onApprove} disabled={busy}>
-            接受并执行
-          </button>
+          {phase === "failed" && currentEntries.length === 0 ? (
+            <button className="btn primary small" type="button" onClick={onRetry} disabled={busy}>
+              重试生成
+            </button>
+          ) : (
+            <button
+              className="btn primary small"
+              type="button"
+              onClick={() => currentRevision && onApprove(currentRevision)}
+              disabled={busy || !currentRevision || currentEntries.length === 0}
+            >
+              接受第 {currentRevision?.revision ?? "—"} 版并执行
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -253,7 +253,12 @@ const TEMPLATES: Template[] = [
   },
 ];
 
-const CHAT_CREATE_PROMPT = "每个工作日 9 点，汇总当前项目的代码变更和待跟进事项。";
+const QUICK_CREATE_DRAFT: Partial<ScheduleDraft> = {
+  title: "工作日项目摘要",
+  prompt: "汇总当前项目的代码变更和待跟进事项。",
+  frequency: "weekdays",
+  time: "09:00",
+};
 
 function pad(n: number) {
   return String(n).padStart(2, "0");
@@ -403,13 +408,11 @@ export function AutomationPage({
   cwd,
   projects,
   createRequest = 0,
-  onCreateViaChat,
   onOpenSession,
 }: {
   cwd?: string | null;
   projects: ProjectInfo[];
   createRequest?: number;
-  onCreateViaChat: (prompt: string) => void;
   onOpenSession?: (sessionId: string, cwd: string) => void;
 }) {
   const [rows, setRows] = useState<Automation[]>([]);
@@ -509,8 +512,12 @@ export function AutomationPage({
           </h1>
         </div>
         <div className="workspace-head-actions">
-          <button className="btn small ghost" type="button" onClick={() => onCreateViaChat(CHAT_CREATE_PROMPT)}>
-            去会话中创建
+          <button
+            className="btn small ghost"
+            type="button"
+            onClick={() => setEditor({ mode: "create", seed: { ...QUICK_CREATE_DRAFT, cwd: cwd || "" } })}
+          >
+            快速创建
           </button>
           <button className="btn small primary" type="button" onClick={() => setEditor({ mode: "create" })}>
             创建定时任务
@@ -545,8 +552,12 @@ export function AutomationPage({
             <h2>还没有自动化任务</h2>
             <p>从空白任务开始，或直接使用下方模板。</p>
             <div className="auto-empty-actions">
-              <button className="btn small ghost" type="button" onClick={() => onCreateViaChat(CHAT_CREATE_PROMPT)}>
-                去会话中创建
+              <button
+                className="btn small ghost"
+                type="button"
+                onClick={() => setEditor({ mode: "create", seed: { ...QUICK_CREATE_DRAFT, cwd: cwd || "" } })}
+              >
+                快速创建
               </button>
               <button className="btn small primary" type="button" onClick={() => setEditor({ mode: "create" })}>
                 手动创建

@@ -10,7 +10,17 @@ import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
 import { PlanPanel } from "./components/PlanPanel";
 import grokLogo from "./assets/grok-logo.jpg";
-import { applyLiveUpdate, stampTurnDuration, stripEphemeral, planRevisions } from "./lib/stream";
+import { applyLiveUpdate, stampTurnDuration, stripEphemeral, type PlanRevision } from "./lib/stream";
+import {
+  PLAN_FLOW_STORAGE_KEY,
+  buildPlanExecutionPrompt,
+  isPlanFlow,
+  markFlowPlans,
+  planFlowBusy,
+  planRevisionsForFlow,
+  restorePlanFlow,
+  type PlanFlow,
+} from "./lib/plan-flow";
 import { extractContextUsage, mergeContextUsage } from "../electron/shared";
 import type {
   AccountInfo,
@@ -63,6 +73,49 @@ function readWidth(key: string, fallback: number, min: number) {
 function fitSidebar(winW: number, sidebar: number) {
   const maxSidebar = Math.max(SIDEBAR_MIN, winW - HANDLE - MAIN_MIN);
   return clamp(sidebar, SIDEBAR_MIN, maxSidebar);
+}
+
+function newLocalId(prefix: string) {
+  const uuid = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${uuid}`;
+}
+
+function readStoredPlanFlows(): Record<string, PlanFlow> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PLAN_FLOW_STORAGE_KEY) || "{}");
+    if (!raw || typeof raw !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(raw).filter((entry): entry is [string, PlanFlow] => isPlanFlow(entry[1])),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function readStoredPlanFlow(sessionId: string): PlanFlow | null {
+  return readStoredPlanFlows()[sessionId] ?? null;
+}
+
+function writeStoredPlanFlow(flow: PlanFlow) {
+  try {
+    const rows = readStoredPlanFlows();
+    rows[flow.sessionId] = flow;
+    localStorage.setItem(PLAN_FLOW_STORAGE_KEY, JSON.stringify(rows));
+  } catch {
+    /* persistence is best effort */
+  }
+}
+
+function clearStoredPlanFlow(sessionId: string) {
+  try {
+    const rows = readStoredPlanFlows();
+    delete rows[sessionId];
+    localStorage.setItem(PLAN_FLOW_STORAGE_KEY, JSON.stringify(rows));
+  } catch {
+    /* persistence is best effort */
+  }
 }
 
 function ResizeHandle({
@@ -137,14 +190,12 @@ export function App() {
     readWidth("grok.sidebarWidth", 252, SIDEBAR_MIN),
   );
   const [winW, setWinW] = useState(() => (typeof window === "undefined" ? 1280 : window.innerWidth));
-  const [planPanel, setPlanPanel] = useState<{
-    open: boolean;
-    pendingPrompt: string;
-    pendingImages: { path: string; mimeType: string }[];
-    sessionId: string;
-  } | null>(null);
+  const [planPanel, setPlanPanel] = useState<PlanFlow | null>(null);
   const sendingRef = useRef(false);
+  const sendAttemptRef = useRef(0);
+  const planActionRef = useRef<string | null>(null);
   const pendingThreadRef = useRef<Promise<Active | null> | null>(null);
+  const failedPromptRef = useRef<{ sessionId: string; text: string; images: { path: string; mimeType: string }[] } | null>(null);
   const restoredRef = useRef(false);
   const [hydrated, setHydrated] = useState(false);
   const sidebarDragOrigin = useRef(sidebarWidth);
@@ -203,6 +254,10 @@ export function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    if (planPanel) writeStoredPlanFlow(planPanel);
+  }, [planPanel]);
+
+  useEffect(() => {
     const onResize = () => setWinW(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -244,12 +299,58 @@ export function App() {
         if (usage.used != null) setContextUsed(usage.used);
       }
       const kind = String(payload.update?.sessionUpdate ?? "");
+      if (kind === "plan") {
+        setPlanPanel((cur) =>
+          cur && cur.sessionId === payload.sessionId
+            ? { ...cur, hasPlan: true, error: undefined }
+            : cur,
+        );
+        const stored = readStoredPlanFlow(payload.sessionId);
+        if (stored) writeStoredPlanFlow({ ...stored, hasPlan: true, error: undefined });
+      }
       if (kind === "turn_completed") {
         setRunningIds((s) => {
           const n = new Set(s);
           n.delete(payload.sessionId);
           return n;
         });
+        setPlanPanel((cur) => {
+          if (cur?.sessionId === payload.sessionId) planActionRef.current = null;
+          if (cur?.sessionId === payload.sessionId && cur.phase === "executing") {
+            clearStoredPlanFlow(payload.sessionId);
+            return null;
+          }
+          if (
+            !cur ||
+            cur.sessionId !== payload.sessionId ||
+            (cur.phase !== "generating" && cur.phase !== "revising")
+          ) {
+            return cur;
+          }
+          return cur.hasPlan
+            ? { ...cur, open: true, phase: "awaiting_approval", error: undefined }
+            : {
+                ...cur,
+                open: true,
+                phase: "failed",
+                error: "智能体没有返回可审批的计划，请重试或拒绝。",
+              };
+        });
+        const stored = readStoredPlanFlow(payload.sessionId);
+        if (stored?.phase === "executing") {
+          clearStoredPlanFlow(payload.sessionId);
+        } else if (stored && (stored.phase === "generating" || stored.phase === "revising")) {
+          writeStoredPlanFlow(
+            stored.hasPlan
+              ? { ...stored, open: true, phase: "awaiting_approval", error: undefined }
+              : {
+                  ...stored,
+                  open: true,
+                  phase: "failed",
+                  error: "智能体没有返回可审批的计划，请重试或拒绝。",
+                },
+          );
+        }
         if (active?.sessionId === payload.sessionId) {
           setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
           if (!isUnattached(active)) void window.grok.gitStatus(active.cwd).then(setGit);
@@ -290,6 +391,9 @@ export function App() {
   }, [active, refresh]);
 
   const selectThread = useCallback(async (thread: ThreadInfo) => {
+    sendAttemptRef.current += 1;
+    sendingRef.current = false;
+    planActionRef.current = null;
     setError(null);
     const unattached = isUnattached(thread);
     setPage("chat");
@@ -305,6 +409,10 @@ export function App() {
     setItems(transcript.items);
     setContextUsed(transcript.contextUsed);
     setContextUsage(transcript.contextUsage);
+    const storedPlan = readStoredPlanFlow(thread.id);
+    const restoredPlan = storedPlan ? restorePlanFlow(storedPlan, transcript.items) : null;
+    setPlanPanel(restoredPlan);
+    if (restoredPlan) writeStoredPlanFlow(restoredPlan);
     try {
       await window.grok.resumeThread(thread.id, thread.cwd);
     } catch (err) {
@@ -368,6 +476,9 @@ export function App() {
 
   const beginComposer = useCallback(
     (cwd?: string | null, worktree = false, resetDraft = true) => {
+      sendAttemptRef.current += 1;
+      sendingRef.current = false;
+      planActionRef.current = null;
       pendingThreadRef.current = null;
       setError(null);
       setPage("chat");
@@ -383,6 +494,7 @@ export function App() {
       }
       setSelectedDiffFile(null);
       setReviewOpen(false);
+      setPlanPanel(null);
       if (unattached) setGit(null);
       else if (cwd) void window.grok.gitStatus(cwd).then(setGit);
       setActive({
@@ -439,6 +551,9 @@ export function App() {
 
   const forkThread = useCallback(
     async (thread: ThreadInfo) => {
+      sendAttemptRef.current += 1;
+      sendingRef.current = false;
+      planActionRef.current = null;
       if (!thread.id) {
         setError("会话还没创建完成");
         return;
@@ -457,6 +572,7 @@ export function App() {
           projectCwd: nextUnattached ? "" : created.projectCwd,
           unattached: nextUnattached,
         });
+        setPlanPanel(null);
         const transcript = await window.grok.loadTranscript(created.sessionId, created.cwd);
         setItems(transcript.items);
         setContextUsed(transcript.contextUsed);
@@ -485,6 +601,11 @@ export function App() {
 
   const send = useCallback(async () => {
     if (sendingRef.current) return;
+    if (planPanel && active?.sessionId === planPanel.sessionId) {
+      setError("当前计划仍在等待处理，请先接受、修订或拒绝它。");
+      return;
+    }
+    const sendAttempt = ++sendAttemptRef.current;
     if ((!draft.trim() && !attachments.length) || (active && runningIds.has(active.sessionId))) return;
     const text = draft.trim();
     sendingRef.current = true;
@@ -512,111 +633,78 @@ export function App() {
     if (otherFiles.length) {
       payload += `${payload ? "\n\n" : ""}请同时参考这些路径：\n` + otherFiles.map((p) => `- @${p}`).join("\n");
     }
-    const mediaCmd = payload.match(/^\/imagine(-video)?(?:\s+|$)([\s\S]*)/i);
-    if (mediaCmd && !mediaCmd[2].trim()) {
-      sendingRef.current = false;
-      setError(mediaCmd[1] ? "请先写视频描述，例如 /imagine-video 一只猫在弹钢琴" : "请先写图片描述，例如 /imagine 海边日落");
-      return;
-    }
     setDraft("");
     setAttachments([]);
     setRunningIds((s) => new Set(s).add(session.sessionId));
-    if (mediaCmd) {
-      const kind = mediaCmd[1] ? "video" : "image";
-      const prompt = mediaCmd[2].trim();
-      const startedAt = Date.now();
-      setItems((prev) => [
-        ...prev,
-        { kind: "user", text: payload, startedAt },
-        { kind: "media", mediaKind: kind, prompt, urls: [], status: "pending" },
-      ]);
-      try {
-        const result = await window.grok.generateMedia(kind, prompt);
-        setItems((prev) => {
-          const next = prev.slice();
-          for (let i = next.length - 1; i >= 0; i--) {
-            const item = next[i];
-            if (item.kind === "media" && item.status === "pending") {
-              next[i] = {
-                kind: "media",
-                mediaKind: result.kind,
-                prompt: result.prompt,
-                urls: result.urls,
-                via: result.via,
-                status: "done",
-              };
-              break;
-            }
-          }
-          return stampTurnDuration(next);
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (message === "OAUTH_VIA_ACP") {
-          setItems((prev) => prev.filter((item) => !(item.kind === "media" && item.status === "pending")));
-          try {
-            await window.grok.sendPrompt(session.sessionId, payload);
-          } catch (oauthErr) {
-            setError(oauthErr instanceof Error ? oauthErr.message : String(oauthErr));
-          }
-        } else {
-          setError(message);
-          setItems((prev) =>
-            prev.map((item) =>
-              item.kind === "media" && item.status === "pending"
-                ? { ...item, status: "error", error: message }
-                : item,
-            ),
-          );
-        }
-      } finally {
-        sendingRef.current = false;
-        setItems((prev) => stampTurnDuration(prev));
-        setRunningIds((s) => {
-          const n = new Set(s);
-          n.delete(session.sessionId);
-          return n;
-        });
-        void refresh();
-      }
-      return;
-    }
     if (planMode) {
       try {
         await window.grok.setMode(session.sessionId, "plan");
-      } catch {
-        /* fall through: agent should still respond in plan-like manner */
+      } catch (err) {
+        if (sendAttemptRef.current !== sendAttempt) {
+          setRunningIds((s) => {
+            const n = new Set(s);
+            n.delete(session.sessionId);
+            return n;
+          });
+          sendingRef.current = false;
+          return;
+        }
+        const message = `无法进入计划模式，任务没有发送：${err instanceof Error ? err.message : String(err)}`;
+        setError(message);
+        setDraft(text);
+        setAttachments(attached);
+        setRunningIds((s) => {
+          const n = new Set(s);
+          n.delete(session.sessionId);
+          return n;
+        });
+        sendingRef.current = false;
+        return;
+      }
+      if (sendAttemptRef.current !== sendAttempt) {
+        setRunningIds((s) => {
+          const n = new Set(s);
+          n.delete(session.sessionId);
+          return n;
+        });
+        sendingRef.current = false;
+        return;
       }
       const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
-      setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: Date.now() }]);
-      setPlanPanel({
-        open: true,
-        pendingPrompt: payload,
-        pendingImages: imageFiles.map((p) => ({
-          path: p,
-          mimeType: /\.jpe?g$/i.test(p)
-            ? "image/jpeg"
-            : /\.gif$/i.test(p)
-              ? "image/gif"
-              : /\.webp$/i.test(p)
-                ? "image/webp"
-                : "image/png",
-        })),
+      const userStartedAt = Date.now();
+      const pendingImages = imageFiles.map((p) => ({
+        path: p,
+        mimeType: /\.jpe?g$/i.test(p)
+          ? "image/jpeg"
+          : /\.gif$/i.test(p)
+            ? "image/gif"
+            : /\.webp$/i.test(p)
+              ? "image/webp"
+              : "image/png",
+      }));
+      const flow: PlanFlow = {
+        planId: newLocalId("plan"),
+        turnId: newLocalId("turn"),
         sessionId: session.sessionId,
-      });
-      setRunningIds((s) => new Set(s).add(session.sessionId));
+        open: true,
+        phase: "generating",
+        pendingPrompt: payload,
+        userText,
+        pendingImages,
+        userStartedAt,
+        hasPlan: false,
+      };
+      setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: userStartedAt }]);
+      setPlanPanel(flow);
+      writeStoredPlanFlow(flow);
       try {
-        await window.grok.sendPrompt(
-          session.sessionId,
-          payload,
-          imageFiles.map((p) => ({
-            path: p,
-            mimeType: /\.jpe?g$/i.test(p) ? "image/jpeg" : /\.gif$/i.test(p) ? "image/gif" : /\.webp$/i.test(p) ? "image/webp" : "image/png",
-          })),
-        );
+        await window.grok.sendPrompt(session.sessionId, payload, pendingImages);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        setPlanPanel(null);
+        const message = err instanceof Error ? err.message : String(err);
+        setError(message);
+        const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+        setPlanPanel((cur) => (cur?.planId === flow.planId ? failed : cur));
+        writeStoredPlanFlow(failed);
         setRunningIds((s) => {
           const n = new Set(s);
           n.delete(session.sessionId);
@@ -627,86 +715,238 @@ export function App() {
       }
       return;
     }
-  }, [active, attachments, draft, createThread, planMode, refresh, runningIds, selectedProjectCwd, worktreeMode]);
-
-  const approvePlan = useCallback(async () => {
-    if (!planPanel) return;
-    const { pendingPrompt, pendingImages, sessionId } = planPanel;
-    setPlanPanel(null);
-    setItems((prev) =>
-      prev.map((it) => {
-        if (it.kind !== "plan") return it;
-        return {
-          ...it,
-          entries: it.entries.map((e) => ({
-            content: e.content,
-            status: "done" as const,
-          })),
-        };
-      }),
-    );
+    const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
+    const promptImages = imageFiles.map((p) => ({
+      path: p,
+      mimeType: /\.jpe?g$/i.test(p) ? "image/jpeg" : /\.gif$/i.test(p) ? "image/gif" : /\.webp$/i.test(p) ? "image/webp" : "image/png",
+    }));
+    failedPromptRef.current = null;
+    setError(null);
+    setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: Date.now() }]);
     try {
-      await window.grok.setMode(sessionId, "act");
-    } catch {
-      /* best effort */
+      await window.grok.sendPrompt(session.sessionId, payload, promptImages);
+    } catch (err) {
+      failedPromptRef.current = { sessionId: session.sessionId, text: payload, images: promptImages };
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      // session/prompt resolves only after the turn has ended. Treat that
+      // request result as a fallback completion signal because some Grok CLI
+      // versions persist `_x.ai/session/update` without forwarding it live.
+      setRunningIds((s) => {
+        const n = new Set(s);
+        n.delete(session.sessionId);
+        return n;
+      });
+      setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
+      sendingRef.current = false;
+      void refresh();
     }
-    setRunningIds((s) => new Set(s).add(sessionId));
+  }, [active, attachments, draft, createThread, planMode, planPanel, refresh, runningIds, selectedProjectCwd, worktreeMode]);
+
+  const retryFailedPrompt = useCallback(async () => {
+    const failed = failedPromptRef.current;
+    if (!failed || sendingRef.current || runningIds.has(failed.sessionId)) return;
+    sendingRef.current = true;
+    setError(null);
+    setRunningIds((cur) => new Set(cur).add(failed.sessionId));
     try {
-      await window.grok.sendPrompt(sessionId, pendingPrompt, pendingImages);
+      await window.grok.sendPrompt(failed.sessionId, failed.text, failed.images);
+      failedPromptRef.current = null;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      sendingRef.current = false;
+      setRunningIds((cur) => {
+        const next = new Set(cur);
+        next.delete(failed.sessionId);
+        return next;
+      });
+      void refresh();
+    }
+  }, [refresh, runningIds]);
+
+  const approvePlan = useCallback(async (revision: PlanRevision) => {
+    if (!planPanel || planFlowBusy(planPanel.phase) || revision.entries.length === 0) return;
+    const flow = planPanel;
+    const actionId = `${flow.planId}:approve`;
+    if (planActionRef.current) return;
+    planActionRef.current = actionId;
+    const { pendingImages, sessionId } = flow;
+    setPlanPanel({ ...flow, phase: "approving", error: undefined });
+    try {
+      await window.grok.setMode(sessionId, "act");
+    } catch (err) {
+      const message = `无法进入执行模式，计划没有执行：${err instanceof Error ? err.message : String(err)}`;
+      setError(message);
+      const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+      setPlanPanel(failed);
+      writeStoredPlanFlow(failed);
+      planActionRef.current = null;
+      return;
+    }
+
+    const executionPrompt = buildPlanExecutionPrompt(flow.pendingPrompt, revision);
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user",
+        text: `[已批准计划] 执行第 ${revision.revision} 版计划`,
+        startedAt: Date.now(),
+      },
+    ]);
+    setRunningIds((s) => new Set(s).add(sessionId));
+    const executing: PlanFlow = { ...flow, open: false, phase: "executing", error: undefined };
+    setPlanPanel(executing);
+    writeStoredPlanFlow(executing);
+    try {
+      await window.grok.sendPrompt(sessionId, executionPrompt, pendingImages);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+      setPlanPanel(failed);
+      writeStoredPlanFlow(failed);
       setRunningIds((s) => {
         const n = new Set(s);
         n.delete(sessionId);
         return n;
       });
+    } finally {
+      if (planActionRef.current === actionId) planActionRef.current = null;
     }
   }, [planPanel]);
 
   const rejectPlan = useCallback(() => {
     if (!planPanel) return;
-    void window.grok.cancel(planPanel.sessionId);
+    const flow = planPanel;
+    planActionRef.current = null;
+    if (planFlowBusy(flow.phase)) void window.grok.cancel(flow.sessionId);
     setRunningIds((s) => {
       const n = new Set(s);
-      n.delete(planPanel.sessionId);
+      n.delete(flow.sessionId);
       return n;
     });
+    clearStoredPlanFlow(flow.sessionId);
     setPlanPanel(null);
-    setItems((prev) =>
-      prev.map((it) => {
-        if (it.kind !== "plan") return it;
-        return {
-          ...it,
-          entries: it.entries.map((e) => ({
-            content: e.content,
-            status: "cancelled" as const,
-          })),
-        };
-      }),
-    );
+    setItems((prev) => markFlowPlans(prev, flow.userStartedAt, "cancelled", flow.userText));
   }, [planPanel]);
 
   const revisePlan = useCallback(
-    (note: string) => {
-      if (!planPanel || !note.trim()) return;
-      const sid = planPanel.sessionId;
+    async (note: string, revision: PlanRevision) => {
+      if (!planPanel || planFlowBusy(planPanel.phase) || !note.trim() || !revision.entries.length) return;
+      const flow = planPanel;
+      const actionId = `${flow.planId}:revise`;
+      if (planActionRef.current) return;
+      planActionRef.current = actionId;
+      const sid = flow.sessionId;
+      try {
+        await window.grok.setMode(sid, "plan");
+      } catch (err) {
+        const message = `无法进入计划模式，修订没有发送：${err instanceof Error ? err.message : String(err)}`;
+        setError(message);
+        const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+        setPlanPanel(failed);
+        writeStoredPlanFlow(failed);
+        planActionRef.current = null;
+        return;
+      }
+      const revising: PlanFlow = { ...flow, open: true, phase: "revising", error: undefined };
+      setPlanPanel(revising);
+      writeStoredPlanFlow(revising);
+      setRunningIds((s) => new Set(s).add(sid));
       setItems((prev) => [
         ...prev,
         { kind: "user", text: `[计划修订] ${note.trim()}`, startedAt: Date.now() },
       ]);
-      void window.grok.sendPrompt(sid, `按以下调整重新计划：\n${note.trim()}`);
+      const base = revision.entries.map((entry, index) => `${index + 1}. ${entry.content}`).join("\n");
+      try {
+        await window.grok.sendPrompt(
+          sid,
+          `基于下面的第 ${revision.revision} 版计划，按调整意见生成一个新的完整计划。只重新规划，不要执行或修改文件。\n\n当前计划：\n${base}\n\n调整意见：\n${note.trim()}`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setError(message);
+        const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+        setPlanPanel(failed);
+        writeStoredPlanFlow(failed);
+        setRunningIds((s) => {
+          const n = new Set(s);
+          n.delete(sid);
+          return n;
+        });
+      } finally {
+        if (planActionRef.current === actionId) planActionRef.current = null;
+      }
     },
     [planPanel],
   );
 
+  const retryPlan = useCallback(async () => {
+    if (!planPanel || planFlowBusy(planPanel.phase)) return;
+    const flow = planPanel;
+    const actionId = `${flow.planId}:retry`;
+    if (planActionRef.current) return;
+    planActionRef.current = actionId;
+    try {
+      await window.grok.setMode(flow.sessionId, "plan");
+    } catch (err) {
+      const message = `无法进入计划模式，任务没有发送：${err instanceof Error ? err.message : String(err)}`;
+      setError(message);
+      const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+      setPlanPanel(failed);
+      writeStoredPlanFlow(failed);
+      planActionRef.current = null;
+      return;
+    }
+    const generating: PlanFlow = {
+      ...flow,
+      open: true,
+      phase: "generating",
+      hasPlan: false,
+      error: undefined,
+    };
+    setPlanPanel(generating);
+    writeStoredPlanFlow(generating);
+    setRunningIds((s) => new Set(s).add(flow.sessionId));
+    try {
+      await window.grok.sendPrompt(flow.sessionId, flow.pendingPrompt, flow.pendingImages);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      const failed: PlanFlow = { ...flow, open: true, phase: "failed", error: message };
+      setPlanPanel(failed);
+      writeStoredPlanFlow(failed);
+      setRunningIds((s) => {
+        const n = new Set(s);
+        n.delete(flow.sessionId);
+        return n;
+      });
+    } finally {
+      if (planActionRef.current === actionId) planActionRef.current = null;
+    }
+  }, [planPanel]);
+
   const stop = useCallback(() => {
     if (!active) return;
+    sendAttemptRef.current += 1;
+    sendingRef.current = false;
+    planActionRef.current = null;
     void window.grok.cancel(active.sessionId);
     setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
     setRunningIds((s) => {
       const n = new Set(s);
       n.delete(active.sessionId);
       return n;
+    });
+    setPlanPanel((cur) => {
+      if (!cur || cur.sessionId !== active.sessionId || !planFlowBusy(cur.phase)) return cur;
+      return {
+        ...cur,
+        open: true,
+        phase: "failed",
+        error: cur.hasPlan ? "计划操作已停止，可以重新修订或批准现有计划。" : "计划生成已停止，请重试或拒绝。",
+      };
     });
   }, [active]);
 
@@ -824,15 +1064,19 @@ export function App() {
   const selectedProject = projects.find((p) => selectedProjectCwd && samePath(p.cwd, selectedProjectCwd)) ?? null;
   const isWorktree = Boolean(active && !unattachedActive && /desktop-worktrees/i.test(active.cwd));
   const sessionBusy = Boolean(active && runningIds.has(active.sessionId));
+  const activePlan = planPanel && active?.sessionId === planPanel.sessionId ? planPanel : null;
+  const activePlanRevisions = activePlan
+    ? planRevisionsForFlow(items, activePlan.userStartedAt, activePlan.userText)
+    : [];
+  const planBlocksComposer = Boolean(activePlan && !planFlowBusy(activePlan.phase));
   const envIsWorktree = active ? isWorktree : Boolean(selectedProject) && worktreeMode;
   const showProjectChrome = Boolean(selectedProject && !unattachedActive);
   const sidebarCol = fitSidebar(winW, sidebarWidth);
   const hasRunning = runningIds.size > 0;
   const hasPermission = permission != null;
-  const hasError = error != null;
   const hasGitChanges = Boolean(!unattachedActive && git?.isRepo && git.files.length > 0);
   const statusCardVisible =
-    page === "chat" && (hasRunning || hasPermission || hasError || hasGitChanges);
+    page === "chat" && (hasRunning || hasPermission || hasGitChanges || activePlanRevisions.length > 0);
 
   return (
     <div className="app">
@@ -882,6 +1126,7 @@ export function App() {
             setError(null);
             setSelectedDiffFile(null);
             setReviewOpen(false);
+            setPlanPanel(null);
             void window.grok.gitStatus(p.cwd).then(setGit);
           }}
           onSelectThread={(t) => void selectThread(t)}
@@ -899,6 +1144,7 @@ export function App() {
                   setItems([]);
                   setContextUsed(null);
                   setContextUsage(null);
+                  setPlanPanel(null);
                 }
                 if (next) void window.grok.gitStatus(next).then(setGit);
                 else setGit(null);
@@ -921,11 +1167,13 @@ export function App() {
           onRemoveThread={(thread) => {
             if (!window.confirm(`移除会话「${thread.title}」？`)) return;
             void window.grok.removeThread(thread.id, thread.cwd).then(async () => {
+              clearStoredPlanFlow(thread.id);
               if (active?.sessionId === thread.id) {
                 setActive(null);
                 setItems([]);
                 setContextUsed(null);
                 setContextUsage(null);
+                setPlanPanel(null);
               }
               await refresh();
             });
@@ -951,15 +1199,12 @@ export function App() {
             <AutomationPage
               cwd={active?.cwd || selectedProjectCwd}
               projects={projects}
-              onCreateViaChat={(prompt) => {
-                beginComposer(selectedProjectCwd, Boolean(selectedProjectCwd) && worktreeMode);
-                setDraft(prompt);
-              }}
               onOpenSession={(sessionId, sessionCwd) => {
                 const thread = threads.find((item) => item.id === sessionId);
                 if (thread) void selectThread(thread);
                 else {
                   setPage("chat");
+                  setPlanPanel(null);
                   const unattached = !sessionCwd;
                   setActive({
                     sessionId,
@@ -974,6 +1219,10 @@ export function App() {
                     setItems(transcript.items);
                     setContextUsed(transcript.contextUsed);
                     setContextUsage(transcript.contextUsage);
+                    const storedPlan = readStoredPlanFlow(sessionId);
+                    const restoredPlan = storedPlan ? restorePlanFlow(storedPlan, transcript.items) : null;
+                    setPlanPanel(restoredPlan);
+                    if (restoredPlan) writeStoredPlanFlow(restoredPlan);
                   }).catch(() => undefined);
                 }
               }}
@@ -981,14 +1230,15 @@ export function App() {
           ) : null}
           {page === "chat" ? (
             <>
-          {error ? (
-            <div className="permission" style={{ margin: "10px 20px 0" }}>
-              <p>{error}</p>
-            </div>
-          ) : null}
           <MessageStream
             items={items}
             busy={sessionBusy}
+            error={error}
+            onRetryError={failedPromptRef.current ? () => void retryFailedPrompt() : undefined}
+            onDismissError={() => {
+              failedPromptRef.current = null;
+              setError(null);
+            }}
             onOpenFile={(filePath) => {
               setReviewOpen(true);
               setSelectedDiffFile(filePath.replace(/\\/g, "/"));
@@ -1005,7 +1255,7 @@ export function App() {
           <Composer
             value={draft}
             busy={sessionBusy}
-            disabled={false}
+            disabled={planBlocksComposer}
             worktree={envIsWorktree}
             canChooseEnv={!active && Boolean(selectedProject)}
             showWorktree={Boolean(selectedProject) && !unattachedActive}
@@ -1062,13 +1312,25 @@ export function App() {
             cwd={active?.cwd || selectedProjectCwd}
             onClose={() => setTerminalOpen(false)}
           />
+          {activePlan && !activePlan.open && activePlan.phase !== "executing" ? (
+            <button
+              className="plan-reopen"
+              type="button"
+              onClick={() => setPlanPanel((cur) => (cur ? { ...cur, open: true } : cur))}
+            >
+              查看待处理计划
+            </button>
+          ) : null}
           <PlanPanel
-            open={Boolean(planPanel?.open)}
-            revisions={planRevisions(items)}
-            busy={planPanel ? runningIds.has(planPanel.sessionId) : false}
-            onApprove={() => void approvePlan()}
+            open={Boolean(activePlan?.open)}
+            revisions={activePlanRevisions}
+            phase={activePlan?.phase ?? "awaiting_approval"}
+            error={activePlan?.error}
+            busy={Boolean(activePlan && planFlowBusy(activePlan.phase))}
+            onApprove={(revision) => void approvePlan(revision)}
             onReject={rejectPlan}
-            onRevise={revisePlan}
+            onRevise={(note, revision) => void revisePlan(note, revision)}
+            onRetry={() => void retryPlan()}
             onClose={() => setPlanPanel((p) => (p ? { ...p, open: false } : p))}
           />
             </>
@@ -1105,6 +1367,8 @@ export function App() {
                 }
               : undefined
           }
+          runningCount={runningIds.size}
+          permission={permission}
         />
       ) : null}
       {reviewOpen && showProjectChrome ? (

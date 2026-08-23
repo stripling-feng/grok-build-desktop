@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { normalizePlanStatus, type GitStatus, type StreamItem } from "../../electron/shared";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { normalizePlanStatus, type GitStatus, type PermissionRequest, type StreamItem } from "../../electron/shared";
 import { latestPlan, type PlanEntry } from "../lib/stream";
 type AgentItem = Extract<StreamItem, { kind: "subagent" }>;
 
@@ -32,6 +32,14 @@ function agentBusy(item: AgentItem) {
   return !/complet|success|fail|error|cancel|done/i.test(item.status);
 }
 
+function initialOpen() {
+  try {
+    return localStorage.getItem("grok.statusFloatOpen") === "1";
+  } catch {
+    return false;
+  }
+}
+
 export function StatusCard({
   git,
   cwd,
@@ -44,6 +52,8 @@ export function StatusCard({
   onOpenFolder,
   onApply,
   canApply,
+  runningCount,
+  permission,
 }: {
   git: GitStatus | null;
   cwd: string | null;
@@ -56,12 +66,15 @@ export function StatusCard({
   onOpenFolder: () => void;
   onApply?: () => void;
   canApply?: boolean;
+  runningCount: number;
+  permission: PermissionRequest | null;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(initialOpen);
   const [menuOpen, setMenuOpen] = useState(false);
   const [commitOpen, setCommitOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   const plan = useMemo(() => latestPlan(items), [items]);
   const agents = useMemo(() => agentsFrom(items), [items]);
@@ -73,12 +86,43 @@ export function StatusCard({
   const removed = git?.removed ?? 0;
   const workingAgents = agents.filter(agentBusy);
   const doneAgents = agents.filter((item) => !agentBusy(item));
+  const summary = permission
+    ? "等待授权"
+    : runningCount > 0
+        ? `${runningCount} 个会话运行中`
+        : dirty
+          ? `${git?.files.length || 0} 项更改`
+          : plan.length
+            ? `计划 ${todos.done}/${todos.total}`
+            : "会话状态";
+  const tone = permission ? "attention" : runningCount > 0 || workingAgents.length > 0 ? "working" : "ready";
 
   useEffect(() => {
+    try {
+      localStorage.setItem("grok.statusFloatOpen", open ? "1" : "0");
+    } catch {
+      /* persistence is best-effort */
+    }
     if (!open) {
       setMenuOpen(false);
       setCommitOpen(false);
     }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOnOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
   }, [open]);
 
   async function run(action: () => Promise<unknown>) {
@@ -94,9 +138,34 @@ export function StatusCard({
   }
 
   return (
-    <div className={`status-float${open ? " open" : ""}`}>
+    <div ref={rootRef} className={`status-float${open ? " open" : ""}`}>
       {open ? (
         <div className="status-card">
+          <button className="status-card-head" type="button" onClick={() => setOpen(false)} aria-label="收起状态悬浮窗" aria-expanded="true">
+            <span className={`status-mini-dot ${tone}`} aria-hidden />
+            <strong>{summary}</strong>
+            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
+              <path d="m3.5 8.5 3.5-3 3.5 3" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+
+          {permission || runningCount > 0 ? (
+            <section className="status-section status-attention">
+              {permission ? (
+                <div className="status-notice attention">
+                  <strong>等待授权</strong>
+                  <span>{permission.title || "智能体需要你的确认，请在输入区处理。"}</span>
+                </div>
+              ) : null}
+              {runningCount > 0 ? (
+                <div className="status-notice running">
+                  <strong>{runningCount} 个会话正在运行</strong>
+                  <span>{workingAgents.length ? `${workingAgents.length} 个子智能体仍在工作` : "任务完成后会自动更新状态"}</span>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+
           {showGit ? (
             <section className="status-section">
               <div className="status-kicker">Git 工具</div>
@@ -278,7 +347,15 @@ export function StatusCard({
             </section>
           ) : null}
         </div>
-      ) : null}
+      ) : (
+        <button className={`status-mini ${tone}`} type="button" onClick={() => setOpen(true)} aria-label={`展开状态悬浮窗：${summary}`} aria-expanded="false">
+          <span className={`status-mini-dot ${tone}`} aria-hidden />
+          <span className="status-mini-text">{summary}</span>
+          <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden>
+            <path d="m3.5 5.5 3.5 3 3.5-3" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

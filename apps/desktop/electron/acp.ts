@@ -48,6 +48,7 @@ export class GrokAcpClient extends EventEmitter {
     { resolve: (optionId: string) => void; reject: (err: Error) => void }
   >();
   private autoSessions = new Set<string>();
+  private stderrHistory: { at: number; text: string }[] = [];
 
   findGrok(): string | null {
     return grokBin();
@@ -104,6 +105,12 @@ export class GrokAcpClient extends EventEmitter {
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.proc.stderr.on("data", (chunk: string) => {
+      const at = Date.now();
+      for (const line of chunk.split(/\r?\n/)) {
+        const text = line.trim();
+        if (text) this.stderrHistory.push({ at, text });
+      }
+      this.stderrHistory = this.stderrHistory.slice(-120);
       this.emit("stderr", chunk);
     });
     this.proc.on("exit", (code) => {
@@ -205,6 +212,7 @@ export class GrokAcpClient extends EventEmitter {
     text: string,
     images?: { path: string; mimeType: string }[],
   ): Promise<unknown> {
+    const startedAt = Date.now();
     await this.ensureStarted();
     const prompt: Record<string, unknown>[] = [];
     if (text.trim()) prompt.push({ type: "text", text });
@@ -227,15 +235,38 @@ export class GrokAcpClient extends EventEmitter {
       return await this.request("session/prompt", { sessionId, prompt });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (!images?.length || !/invalid|unsupported|unknown|schema|type/i.test(message)) throw err;
+      if (!images?.length || !/invalid|unsupported|unknown|schema|type/i.test(message)) {
+        throw this.enrichPromptError(err, startedAt);
+      }
       const fallback = text.trim()
         ? `${text.trim()}\n\n请同时参考这些图片：\n${images.map((img) => `- @${img.path}`).join("\n")}`
         : `请查看这些图片：\n${images.map((img) => `- @${img.path}`).join("\n")}`;
-      return this.request("session/prompt", {
-        sessionId,
-        prompt: [{ type: "text", text: fallback }],
-      });
+      try {
+        return await this.request("session/prompt", {
+          sessionId,
+          prompt: [{ type: "text", text: fallback }],
+        });
+      } catch (fallbackErr) {
+        throw this.enrichPromptError(fallbackErr, startedAt);
+      }
     }
+  }
+
+  private enrichPromptError(err: unknown, startedAt: number): Error {
+    const original = err instanceof Error ? err.message : String(err);
+    const diagnosticLines = this.stderrHistory
+      .filter((row) => row.at >= startedAt - 1_000 && /error|failed|rate_limit|limit exceeded|serialization/i.test(row.text))
+      .map((row) => row.text)
+      .slice(-16);
+    const diagnostics = diagnosticLines.join("\n");
+    const rateLimited = /rate_limit_exceeded|concurrency limit exceeded/i.test(diagnostics);
+    const heading = rateLimited
+      ? "Grok 服务拒绝了请求：账户并发数已达到上限，请稍后重试。"
+      : original;
+    if (!diagnostics || diagnostics.includes(original) && diagnostics.trim() === original.trim()) {
+      return new Error(heading);
+    }
+    return new Error(`${heading}\n\n原始错误：${original}\n\nGrok CLI 诊断：\n${diagnostics}`);
   }
 
   cancel(sessionId: string) {

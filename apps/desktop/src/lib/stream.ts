@@ -37,7 +37,6 @@ function cloneItems(items: StreamItem[]): StreamItem[] {
   return items.map((item) => {
     if (item.kind === "tool" || item.kind === "subagent") return { ...item };
     if (item.kind === "plan") return { ...item, entries: [...item.entries] };
-    if (item.kind === "media") return { ...item, urls: [...item.urls] };
     if (item.kind === "user" || item.kind === "agent" || item.kind === "thought" || item.kind === "status") {
       return { ...item };
     }

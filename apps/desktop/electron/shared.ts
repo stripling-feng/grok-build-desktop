@@ -25,18 +25,7 @@ export type StreamItem =
       revision: number;
       entries: { content: string; status: PlanEntryStatus }[];
     }
-  | { kind: "status"; text: string }
-  | {
-      kind: "media";
-      mediaKind: MediaKind;
-      prompt: string;
-      urls: string[];
-      via?: "relay" | "oauth";
-      status?: "pending" | "done" | "error";
-      error?: string;
-    };
-
-export type MediaKind = "image" | "video";
+  | { kind: "status"; text: string };
 
 export type PlanEntryStatus =
   | "pending"
@@ -77,13 +66,6 @@ export function normalizePlanStatus(raw: unknown): PlanEntryStatus {
   return PLAN_STATUS_ALIASES[key] ?? "pending";
 }
 
-export type MediaResult = {
-  kind: MediaKind;
-  prompt: string;
-  urls: string[];
-  via: "relay" | "oauth";
-};
-
 export type ThreadInfo = {
   id: string;
   cwd: string;
@@ -97,6 +79,12 @@ export type ThreadInfo = {
   projectCwd: string;
   worktree?: boolean;
   unattached?: boolean;
+};
+
+export type ThreadSearchResult = {
+  thread: ThreadInfo;
+  snippet: string;
+  matchCount: number;
 };
 
 export type ProjectInfo = {
@@ -676,7 +664,7 @@ export function applyUpdateToItems(
       const merged = normalized.map((entry) => {
         const prev = byContent.get(entry.content);
         if (prev && prev !== "pending" && entry.status === "pending") {
-          return entry;
+          return { content: entry.content, status: prev };
         }
         return { content: entry.content, status: entry.status };
       });

@@ -22,6 +22,30 @@ function TerminalIcon() {
   );
 }
 
+function MinimizeIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+      <path d="M2 6.5h8" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function MaximizeIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+      <rect x="2.25" y="2.25" width="7.5" height="7.5" rx="0.7" fill="none" stroke="currentColor" strokeWidth="1.1" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+      <path d="m2.75 2.75 6.5 6.5m0-6.5-6.5 6.5" fill="none" stroke="currentColor" strokeWidth="1.15" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function TitleBar({
   subtitle,
   onTerminal,
@@ -55,10 +79,10 @@ export function TitleBar({
       )}
       <div className="win-controls">
         <button type="button" onClick={() => void window.grok.windowControl("min")} aria-label="最小化">
-          –
+          <MinimizeIcon />
         </button>
         <button type="button" onClick={() => void window.grok.windowControl("max")} aria-label="最大化">
-          □
+          <MaximizeIcon />
         </button>
         <button
           type="button"
@@ -66,7 +90,7 @@ export function TitleBar({
           onClick={() => void window.grok.windowControl("close")}
           aria-label="关闭"
         >
-          ×
+          <CloseIcon />
         </button>
       </div>
     </header>
