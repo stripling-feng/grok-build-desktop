@@ -95,6 +95,7 @@ const terminal = new ProjectTerminal();
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+let windowRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 let systemProxyPromise: Promise<string | null> | null = null;
 let accountLoginController: AbortController | null = null;
 
@@ -194,6 +195,16 @@ function showMainWindow() {
   mainWindow.focus();
 }
 
+function recoverMainWindow() {
+  if (isQuitting || mainWindow || windowRecoveryTimer) return;
+  windowRecoveryTimer = setTimeout(() => {
+    windowRecoveryTimer = null;
+    if (isQuitting || mainWindow) return;
+    log("recovering main window");
+    createWindow();
+  }, 250);
+}
+
 function createTray() {
   if (tray && !tray.isDestroyed()) return;
   tray = new Tray(appIconPath());
@@ -215,8 +226,9 @@ function createTray() {
 }
 
 function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return;
   const preload = path.join(__dirname, "preload.js");
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 1320,
     height: 860,
     minWidth: 980,
@@ -234,39 +246,44 @@ function createWindow() {
       sandbox: false,
     },
   });
+  mainWindow = win;
+  log("window created");
 
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
-  mainWindow.on("close", (event) => {
+  win.once("ready-to-show", () => {
+    log("window ready-to-show");
+    if (!isQuitting && mainWindow === win && !win.isDestroyed()) win.show();
+  });
+  win.on("close", (event) => {
+    log("window close requested", `quitting=${isQuitting}`);
     if (isQuitting) return;
     event.preventDefault();
-    mainWindow?.hide();
+    if (!win.isDestroyed()) win.hide();
   });
-  mainWindow.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     log("renderer", level, message, sourceId, line);
   });
-  mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
+  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
     log("did-fail-load", code, desc, url);
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) {
-    void mainWindow.loadURL(devUrl);
+    void win.loadURL(devUrl);
   } else {
-    void mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+    void win.loadFile(path.join(__dirname, "../dist/index.html"));
   }
 
-  mainWindow.on("closed", () => {
-    mainWindow = null;
+  win.on("closed", () => {
+    log("window closed", `quitting=${isQuitting}`);
+    if (mainWindow === win) mainWindow = null;
+    recoverMainWindow();
   });
-  mainWindow.webContents.on("unresponsive", () => log("window unresponsive"));
-  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+  win.webContents.on("unresponsive", () => log("window unresponsive"));
+  win.webContents.on("render-process-gone", (_e, details) => {
     log("webContents gone", details.reason);
     if (details.reason === "clean-exit") return;
-    const win = mainWindow;
-    if (win && !win.isDestroyed()) win.reload();
-    else setTimeout(() => {
-      if (!mainWindow) createWindow();
-    }, 400);
+    if (!win.isDestroyed()) win.reload();
+    else recoverMainWindow();
   });
 }
 
@@ -324,11 +341,21 @@ if (!gotLock) {
 }
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  log("window-all-closed", `quitting=${isQuitting}`);
+  if (isQuitting) return;
+  // This application is tray-based. Losing the last BrowserWindow must not
+  // terminate the main process; recreate it after an unexpected destruction.
+  if (!tray || tray.isDestroyed()) createTray();
+  recoverMainWindow();
 });
 
 app.on("before-quit", () => {
+  log("before-quit");
   isQuitting = true;
+  if (windowRecoveryTimer) {
+    clearTimeout(windowRecoveryTimer);
+    windowRecoveryTimer = null;
+  }
   tray?.destroy();
   tray = null;
   stopGrokInstall();
@@ -336,9 +363,12 @@ app.on("before-quit", () => {
   void acp.stop();
 });
 
+app.on("will-quit", () => log("will-quit"));
+app.on("quit", (_event, exitCode) => log("quit", exitCode));
+
 app.on("render-process-gone", (_event, _webContents, details) => {
   log("renderer gone", details.reason, details.exitCode);
-  if (details.reason !== "clean-exit" && !mainWindow) createWindow();
+  if (details.reason !== "clean-exit") recoverMainWindow();
 });
 
 process.on("uncaughtException", (err) => {

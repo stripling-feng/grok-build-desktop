@@ -78,14 +78,14 @@ grok --version
 
 从 [Releases](https://github.com/stripling-feng/grok-build-desktop/releases/latest) 下载最新版 Windows 安装程序：
 
-**[Grok-Build-Windows-x64-v0.1.0.exe](https://github.com/stripling-feng/grok-build-desktop/releases/download/v0.1.0/Grok-Build-Windows-x64-v0.1.0.exe)**
+**[Grok-Build-Windows-x64-v0.1.1.exe](https://github.com/stripling-feng/grok-build-desktop/releases/download/v0.1.1/Grok-Build-Windows-x64-v0.1.1.exe)**
 
 当前安装包尚未配置代码签名证书，Windows 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载安装包，并在安装前核对文件信息。
 
-`v0.1.0` 安装包 SHA-256：
+`v0.1.1` 安装包 SHA-256：
 
 ```text
-42B930EA64C9AF6A3A1942F441253A612374FFA058F3448E9DD2F1BE4B3EB20C
+D799D71B234448B3AF1361096173B2B12B4B0AA773A16B49606A45091D3E7259
 ```
 
 ### 3. 登录并开始使用
