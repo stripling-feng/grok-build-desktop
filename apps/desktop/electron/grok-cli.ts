@@ -3,6 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { grokBin } from "./grok-bin";
+import {
+  managedMarketplaceMetadata,
+  managedMarketplaceName,
+  managedMarketplacePath,
+  marketplaceSourceIdentity,
+  prepareMarketplaceSource,
+  removeManagedMarketplaceFiles,
+} from "./marketplace-mirror";
 import { grokHome } from "./sessions";
 import type {
   AvailablePluginInfo,
@@ -52,7 +60,7 @@ function extractJson(text: string): unknown {
 
 async function run(
   args: string[],
-  opts?: { cwd?: string | null; timeout?: number; json?: boolean },
+  opts?: { cwd?: string | null; timeout?: number; json?: boolean; failOnMarketplaceSyncError?: boolean },
 ): Promise<string> {
   const grok = bin();
   try {
@@ -64,13 +72,41 @@ async function run(
     });
     const out = `${stdout ?? ""}`;
     const err = `${stderr ?? ""}`.trim();
-    if (opts?.json) return out;
+    if (opts?.json) {
+      if (
+        opts.failOnMarketplaceSyncError &&
+        /^\s*\[\s*\]\s*$/.test(out) &&
+        /failed to sync marketplace/i.test(err)
+      ) {
+        throw marketplaceSyncError(err);
+      }
+      return out;
+    }
     return err ? `${out}${out ? "\n" : ""}${err}` : out;
   } catch (err) {
+    if (err instanceof GrokCliError) throw err;
     const e = err as { stdout?: string; stderr?: string; message?: string };
     const detail = `${e.stderr || ""} ${e.stdout || ""}`.trim() || e.message || String(err);
     throw new GrokCliError(detail.slice(0, 2000), detail);
   }
+}
+
+function marketplaceSyncError(stderr: string): GrokCliError {
+  const invalidPath = stderr.match(/invalid path '([^']+)'/i)?.[1];
+  if (invalidPath) {
+    return new GrokCliError(
+      `市场源与 Windows 不兼容：仓库包含 Windows 不允许的文件名（${invalidPath}）`,
+      stderr,
+    );
+  }
+  if (/git clone timed out/i.test(stderr)) {
+    return new GrokCliError("市场源同步超时。请检查 GitHub 连接或代理后重试。", stderr);
+  }
+  if (/failed to connect|couldn't connect|unable to access/i.test(stderr)) {
+    return new GrokCliError("无法连接市场源。请检查 GitHub 连接或代理后重试。", stderr);
+  }
+  const warning = stderr.match(/failed to sync marketplace[^\r\n]*/i)?.[0];
+  return new GrokCliError(`市场源同步失败${warning ? `：${warning}` : ""}`, stderr);
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
@@ -185,10 +221,13 @@ function mapMarketplace(raw: unknown): MarketplaceInfo | null {
   const name = str(o.name);
   if (!name) return null;
   const source = asRecord(o.source);
+  const registeredSource = str(source.url) || str(source.path) || str(o.url) || str(o.source);
+  const managed = managedMarketplaceMetadata(registeredSource);
   return {
-    name,
-    kind: str(o.kind, "git"),
-    url: str(source.url) || str(o.url) || str(o.source),
+    name: managed?.marketplaceName || name,
+    kind: managed ? "Windows 兼容镜像" : str(o.kind, "git"),
+    url: managed?.originalSource || registeredSource,
+    registeredSource,
   };
 }
 
@@ -200,7 +239,7 @@ function mapAvailable(raw: unknown): AvailablePluginInfo | null {
     name,
     version: str(o.version) || undefined,
     description: str(o.description),
-    marketplace: str(o.marketplace),
+    marketplace: managedMarketplaceName(str(o.marketplace)) || str(o.marketplace),
     status: str(o.status, "available"),
     skillCount: num(o.skill_count ?? o.skillCount),
     hasHooks: bool(o.has_hooks ?? o.hasHooks),
@@ -274,7 +313,11 @@ export async function listMarketplaces(): Promise<MarketplaceInfo[]> {
 }
 
 export async function listAvailablePlugins(): Promise<AvailablePluginInfo[]> {
-  const stdout = await run(["plugin", "list", "--json", "--available"], { json: true, timeout: 30_000 });
+  const stdout = await run(["plugin", "list", "--json", "--available"], {
+    json: true,
+    timeout: 30_000,
+    failOnMarketplaceSyncError: true,
+  });
   const data = extractJson(stdout);
   return Array.isArray(data)
     ? data.map(mapAvailable).filter((s): s is AvailablePluginInfo => Boolean(s))
@@ -344,11 +387,50 @@ export async function pluginUninstall(name: string, cwd?: string | null) {
 }
 
 export async function marketplaceAdd(url: string, cwd?: string | null) {
-  await run(["plugin", "marketplace", "add", url], { cwd, timeout: 60_000 });
+  const prepared = await prepareMarketplaceSource(url, cwd);
+  if (prepared.kind === "local") {
+    await run(["plugin", "marketplace", "add", prepared.path], { cwd, timeout: 60_000 });
+    return;
+  }
+
+  const current = await listMarketplaces();
+  const registered = current.find((item) => {
+    try {
+      return marketplaceSourceIdentity(item.url, cwd) === prepared.value.sourceIdentity;
+    } catch {
+      return item.url === url;
+    }
+  });
+
+  const mirrorAlreadyRegistered = current.some(
+    (item) => item.registeredSource && path.resolve(item.registeredSource) === path.resolve(prepared.value.localPath),
+  );
+  if (mirrorAlreadyRegistered) return;
+
+  let removedSource: string | null = null;
+  if (registered) {
+    removedSource = registered.registeredSource || registered.url;
+    await run(["plugin", "marketplace", "remove", removedSource], { cwd, timeout: 30_000 });
+  }
+  try {
+    await run(["plugin", "marketplace", "add", prepared.value.localPath], { cwd, timeout: 60_000 });
+  } catch (err) {
+    if (removedSource) {
+      try {
+        await run(["plugin", "marketplace", "add", removedSource], { cwd, timeout: 60_000 });
+      } catch {
+        /* preserve the original registration when possible; report the primary error */
+      }
+    }
+    throw err;
+  }
 }
 
 export async function marketplaceRemove(url: string, cwd?: string | null) {
-  await run(["plugin", "marketplace", "remove", url], { cwd, timeout: 30_000 });
+  const managed = managedMarketplacePath(url);
+  const source = managed || url;
+  await run(["plugin", "marketplace", "remove", source], { cwd, timeout: 30_000 });
+  if (managed) removeManagedMarketplaceFiles(managed);
 }
 
 export function skillsDir(): string {
@@ -423,4 +505,3 @@ export function writeUserHook(input: { name: string; event: string; matcher?: st
   fs.writeFileSync(file, JSON.stringify(body, null, 2) + "\n", "utf8");
   return file;
 }
-

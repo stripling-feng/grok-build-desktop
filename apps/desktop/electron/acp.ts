@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import type { GrokStatus, PermissionRequest } from "./shared";
 import { grokBin } from "./grok-bin";
 import { AcpTerminals } from "./acp-terminals";
-import { sessionMeta } from "./config";
+import { sessionMeta, ZH_SESSION_RULE } from "./config";
+import { encodeCwd, findSessionDir, grokHome } from "./sessions";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,6 +80,13 @@ export class GrokAcpClient extends EventEmitter {
     this.allowedRoots.add(path.resolve(dir));
   }
 
+  private allowSessionRoot(sessionId: string, cwd: string) {
+    const expected = path.join(grokHome(), "sessions", encodeCwd(cwd), sessionId);
+    this.allowRoot(expected);
+    const existing = findSessionDir(sessionId, cwd);
+    if (existing) this.allowRoot(existing);
+  }
+
   async ensureStarted(): Promise<void> {
     if (this.proc && this.initialized) return;
     if (this.starting) return this.starting;
@@ -96,7 +104,7 @@ export class GrokAcpClient extends EventEmitter {
       throw new Error("未找到 Grok CLI（~/.grok/bin 或 GROK_PATH）");
     }
     this.grokPath = grok;
-    this.proc = spawn(grok, ["agent", "stdio"], {
+    this.proc = spawn(grok, ["--rules", ZH_SESSION_RULE, "agent", "stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       env: { ...process.env },
@@ -164,6 +172,7 @@ export class GrokAcpClient extends EventEmitter {
     if (!result?.sessionId) throw new Error("创建会话失败：未返回 sessionId");
     this.sessionCwds.set(result.sessionId, path.resolve(cwd));
     this.allowRoot(cwd);
+    this.allowSessionRoot(result.sessionId, cwd);
     return result.sessionId;
   }
 
@@ -173,6 +182,7 @@ export class GrokAcpClient extends EventEmitter {
     await this.request("session/load", { sessionId, cwd, mcpServers: [], ...extra });
     this.sessionCwds.set(sessionId, path.resolve(cwd));
     this.allowRoot(cwd);
+    this.allowSessionRoot(sessionId, cwd);
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {
@@ -197,6 +207,7 @@ export class GrokAcpClient extends EventEmitter {
         if (id) {
           this.sessionCwds.set(id, path.resolve(cwd));
           this.allowRoot(cwd);
+          this.allowSessionRoot(id, cwd);
           return id;
         }
       } catch (err) {

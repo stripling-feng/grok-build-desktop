@@ -272,14 +272,44 @@ function UserIcon() {
   );
 }
 
+function UsageIcon() {
+  return (
+    <Icon>
+      <path
+        d="M3 11.8a5.3 5.3 0 1 1 10 0M8 8l2.5-2.1"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+      <circle cx="8" cy="8" r="1" fill="currentColor" />
+    </Icon>
+  );
+}
+
 function SwitchLoginIcon() {
   return (
-    <Icon className="login-switch-icon">
+    <Icon>
       <path
         d="M3 5.2h8.7M9.7 3.2l2 2-2 2M13 10.8H4.3M6.3 8.8l-2 2 2 2"
         fill="none"
         stroke="currentColor"
         strokeWidth="1.35"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Icon>
+  );
+}
+
+function LogoutIcon() {
+  return (
+    <Icon>
+      <path
+        d="M7 3H4.2A1.2 1.2 0 0 0 3 4.2v7.6A1.2 1.2 0 0 0 4.2 13H7M9.2 5.2 12 8l-2.8 2.8M6.2 8H12"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
@@ -528,6 +558,7 @@ export function Sidebar({
   const [update, setUpdate] = useState<AppUpdateInfo | null>(null);
   const [updateLoading, setUpdateLoading] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<ThreadSearchResult[]>([]);
@@ -536,6 +567,9 @@ export function Sidebar({
   const [rename, setRename] = useState<RenameState | null>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
+  const accountTriggerRef = useRef<HTMLDivElement>(null);
+  const usageRequestRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchRequestRef = useRef(0);
 
@@ -552,6 +586,7 @@ export function Sidebar({
   };
 
   const openLogin = () => {
+    setAccountMenuOpen(false);
     setLoginError("");
     setLoginView("choose");
     setApiKey("");
@@ -664,6 +699,29 @@ export function Sidebar({
     };
   }, [menu]);
 
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    const close = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (accountMenuRef.current?.contains(target) || accountTriggerRef.current?.contains(target)) return;
+      setAccountMenuOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAccountMenuOpen(false);
+    };
+    const onDismiss = () => setAccountMenuOpen(false);
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", onDismiss);
+    window.addEventListener("resize", onDismiss);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", onDismiss);
+      window.removeEventListener("resize", onDismiss);
+    };
+  }, [accountMenuOpen]);
+
   const commitRename = () => {
     if (!rename) return;
     const value = rename.value.trim();
@@ -710,6 +768,42 @@ export function Sidebar({
       ? "正在获取用量…"
       : usage?.text || "悬停查看用量"
     : grokLabel;
+  const usageSummary = usageLoading
+    ? "获取中…"
+    : usage?.percent != null
+      ? `剩余 ${Math.max(0, 100 - Math.round(usage.percent))}%`
+      : usage?.text.split(/\r?\n/, 1)[0] || "查看";
+  const refreshUsage = () => {
+    if (!canShowUsage || usageRequestRef.current) return;
+    usageRequestRef.current = true;
+    setUsageLoading(true);
+    void window.grok
+      .accountUsage()
+      .then(setUsage)
+      .catch(() => setUsage({ text: "无法获取用量" }))
+      .finally(() => {
+        usageRequestRef.current = false;
+        setUsageLoading(false);
+      });
+  };
+  const toggleAccountMenu = () => {
+    const next = !accountMenuOpen;
+    setAccountMenuOpen(next);
+    if (next) refreshUsage();
+  };
+  const logoutAccount = () => {
+    setAccountMenuOpen(false);
+    void window.grok
+      .logout()
+      .then((next) => {
+        setUsage(null);
+        onAccountChange?.(next);
+      })
+      .catch((error) => {
+        openLogin();
+        setLoginError(error instanceof Error ? error.message : String(error));
+      });
+  };
 
   return (
     <aside className="sidebar" onContextMenu={(e) => e.preventDefault()}>
@@ -835,9 +929,11 @@ export function Sidebar({
                   </button>
                 ),
               )}
+              {list.length === 0 ? <div className="sidebar-list-empty nested">暂无对话</div> : null}
             </div>
           );
         })}
+        {grouped.length === 0 ? <div className="sidebar-list-empty">暂无项目</div> : null}
         <div className="sidebar-title-row chats-label">
           <span className="sidebar-title">对话</span>
           <button className="icon-btn" type="button" title="新对话" onClick={onNewChat}>
@@ -885,41 +981,82 @@ export function Sidebar({
               </button>
             ),
           )}
+          {chatThreads.length === 0 ? <div className="sidebar-list-empty">暂无对话</div> : null}
         </div>
       </div>
       <div className="sidebar-foot">
-        <button
-          className="login-switch-button"
-          type="button"
-          title="切换账号登录或 API 登录"
-          onClick={openLogin}
-        >
-          <SwitchLoginIcon />
-          <span>切换登录方式</span>
-        </button>
+        {accountMenuOpen ? (
+          <div className="account-menu" ref={accountMenuRef} role="menu">
+            <div className="account-menu-head">
+              <span className="account-menu-avatar">
+                <UserIcon />
+              </span>
+              <span className="account-menu-identity">
+                <strong>{accountLabel(account)}</strong>
+                <small>
+                  {account?.method === "oauth"
+                    ? "xAI 账号"
+                    : account?.method === "api-key"
+                      ? "API 登录"
+                      : "尚未登录"}
+                </small>
+              </span>
+            </div>
+            <div className="account-menu-items">
+              {canShowUsage ? (
+                <button type="button" role="menuitem" disabled={usageLoading} onClick={refreshUsage}>
+                  <UsageIcon />
+                  <span>使用情况</span>
+                  <em>{usageSummary}</em>
+                </button>
+              ) : null}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  openLogin();
+                }}
+              >
+                <SwitchLoginIcon />
+                <span>{account?.method === "none" ? "登录" : "切换登录方式"}</span>
+              </button>
+              {onSettings ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    onSettings();
+                  }}
+                >
+                  <SettingsIcon />
+                  <span>设置</span>
+                </button>
+              ) : null}
+              {account?.method !== "none" ? (
+                <button className="danger" type="button" role="menuitem" onClick={logoutAccount}>
+                  <LogoutIcon />
+                  <span>退出登录</span>
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         <div className="sidebar-foot-actions">
           <div
-            className="account-pill"
+            ref={accountTriggerRef}
+            className={`account-pill${accountMenuOpen ? " open" : ""}`}
             role="button"
             tabIndex={0}
-            title={account?.method === "none" ? "点击登录" : usageTitle}
-            onClick={() => {
-              if (account?.method === "none") openLogin();
-            }}
+            aria-haspopup="menu"
+            aria-expanded={accountMenuOpen}
+            title={account?.method === "none" ? "点击登录" : `${usageTitle}；点击切换登录方式`}
+            onClick={toggleAccountMenu}
             onKeyDown={(e) => {
-              if (account?.method !== "none") return;
               if (e.key !== "Enter" && e.key !== " ") return;
               e.preventDefault();
-              openLogin();
-            }}
-            onMouseEnter={() => {
-              if (!canShowUsage || usageLoading) return;
-              setUsageLoading(true);
-              void window.grok
-                .accountUsage()
-                .then(setUsage)
-                .catch(() => setUsage({ text: "无法获取用量" }))
-                .finally(() => setUsageLoading(false));
+              toggleAccountMenu();
             }}
           >
             <UserIcon />
@@ -927,20 +1064,19 @@ export function Sidebar({
             {account?.method === "oauth" ? <span className="account-kind">OAuth</span> : null}
           </div>
           {onSettings ? (
-            <button className="update-btn" type="button" title="设置" onClick={onSettings}>
+            <button className="update-btn" type="button" title="设置" aria-label="设置" onClick={onSettings}>
               <SettingsIcon />
-              设置
             </button>
           ) : null}
           <button
             className={`update-btn${update?.hasUpdate ? " has-update" : ""}`}
             type="button"
             title="检查更新"
+            aria-label="检查更新"
             disabled={updateLoading}
             onClick={() => void checkUpdate()}
           >
             {updateLoading ? <SpinnerIcon /> : <UpdateIcon />}
-            更新
           </button>
         </div>
       </div>

@@ -15,7 +15,7 @@ import {
   threadBelongsToProject,
   unbindSession,
 } from "./projects";
-import { copySession, listThreads, loadTranscript, removeThread, renameThread, searchThreads, touchThreadActivity } from "./sessions";
+import { copySession, listThreads, loadTranscript, readChatImage, removeThread, renameThread, searchThreads, touchThreadActivity } from "./sessions";
 import {
   applyWorktree,
   createWorktree,
@@ -70,7 +70,7 @@ import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
 import { startGrokInstall, stopGrokInstall, type InstallLogLine } from "./install-cli";
 import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
-import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearApiKey } from "./account";
+import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearAccountCredentials } from "./account";
 import { checkAppUpdate, openUpdateUrl } from "./update";
 import {
   createAutomation,
@@ -90,6 +90,7 @@ app.setName("Grok Build");
 
 const acp = new GrokAcpClient();
 const loadedSessions = new Set<string>();
+const runningSessions = new Set<string>();
 const terminal = new ProjectTerminal();
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -164,6 +165,19 @@ async function ensureSystemProxyEnvironment(): Promise<string | null> {
 
 function send(channel: string, payload: unknown) {
   mainWindow?.webContents.send(channel, payload);
+}
+
+function setSessionRunning(sessionId: string, running: boolean) {
+  if (!sessionId) return;
+  const changed = running ? !runningSessions.has(sessionId) : runningSessions.has(sessionId);
+  if (!changed) return;
+  if (running) runningSessions.add(sessionId);
+  else runningSessions.delete(sessionId);
+  send("grok:run-state", { sessionId, running });
+}
+
+function clearRunningSessions() {
+  for (const sessionId of [...runningSessions]) setSessionRunning(sessionId, false);
 }
 
 function appIconPath() {
@@ -262,13 +276,20 @@ acp.on("update", (payload) => {
   // failure cannot leave the UI spinning forever.
   send("grok:update", payload);
   if (String(payload.update?.sessionUpdate ?? "") === "turn_completed") {
+    setSessionRunning(payload.sessionId, false);
     touchThreadActivity(payload.sessionId);
     invalidateWorkspace();
     send("grok:workspace", workspace());
   }
 });
 acp.on("permission", (payload) => send("grok:permission", payload));
-acp.on("status", (payload) => send("grok:agent-status", payload));
+acp.on("status", (payload) => {
+  if (!payload.connected) {
+    loadedSessions.clear();
+    clearRunningSessions();
+  }
+  send("grok:agent-status", payload);
+});
 acp.on("stderr", (chunk: string) => log("grok stderr", String(chunk).slice(0, 2000)));
 terminal.on("data", (chunk: string) => send("grok:terminal-data", chunk));
 
@@ -506,7 +527,11 @@ ipcMain.handle("grok:loginApiKey", (_e, input: { baseUrl?: string; apiKey?: stri
   }
 });
 ipcMain.handle("grok:listCcSwitchProviders", () => listCcSwitchProviders());
-ipcMain.handle("grok:logout", () => clearApiKey());
+ipcMain.handle("grok:logout", async () => {
+  const account = clearAccountCredentials();
+  await acp.stop();
+  return account;
+});
 ipcMain.handle("grok:checkUpdate", () => checkAppUpdate());
 ipcMain.handle("grok:openUpdate", (_e, url?: string) => openUpdateUrl(url));
 ipcMain.handle("grok:installInfo", () => ({
@@ -673,13 +698,19 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
 });
 
 ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: { path: string; mimeType: string }[]) => {
+  setSessionRunning(sessionId, true);
   try {
     return await acp.prompt(sessionId, text, images);
   } catch (err) {
     log("sendPrompt failed", sessionId, err);
     throw err;
+  } finally {
+    // Some Grok versions do not forward the persisted `turn_completed` event.
+    // The prompt request settling is the authoritative fallback completion.
+    setSessionRunning(sessionId, false);
   }
 });
+ipcMain.handle("grok:runningSessions", () => [...runningSessions]);
 ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeType?: string }) => {
   const mime = (payload?.mimeType || "image/png").toLowerCase();
   const ext = mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : mime.includes("webp") ? "webp" : mime.includes("gif") ? "gif" : "png";
@@ -725,6 +756,7 @@ ipcMain.handle("grok:setGoal", (_e, cwd: string, text: string) => setGoal(cwd, t
 
 ipcMain.handle("grok:cancel", (_e, sessionId: string) => {
   acp.cancel(sessionId);
+  setSessionRunning(sessionId, false);
 });
 
 ipcMain.handle("grok:respondPermission", (_e, requestId: string, optionId: string) => {
@@ -780,6 +812,11 @@ ipcMain.handle("grok:openInEditor", async (_e, cwd: string, filePath?: string) =
 ipcMain.handle("grok:openPath", async (_e, target: string) => {
   if (fs.existsSync(target)) await shell.openPath(target);
 });
+ipcMain.handle(
+  "grok:resolveImage",
+  (_e, input: { src: string; sessionId?: string; cwd?: string }) =>
+    readChatImage(input?.src || "", input?.sessionId, input?.cwd),
+);
 
 ipcMain.handle("grok:settings", (_e, cwd?: string | null) => loadSettings(cwd));
 ipcMain.handle("grok:setModel", async (_e, id: string) => {
@@ -925,6 +962,7 @@ ipcMain.handle("grok:pluginUninstall", async (_e, name: string, cwd?: string | n
 });
 ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, cwd?: string | null) => {
   try {
+    await ensureSystemProxyEnvironment();
     await marketplaceAdd(url, cwd);
     return await loadSettings(cwd);
   } catch (err) {
@@ -941,6 +979,7 @@ ipcMain.handle("grok:marketplaceRemove", async (_e, url: string, cwd?: string | 
 });
 ipcMain.handle("grok:availablePlugins", async () => {
   try {
+    await ensureSystemProxyEnvironment();
     return await listAvailablePlugins();
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));

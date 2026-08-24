@@ -62,7 +62,13 @@ declare global {
       loadTranscript: (
         sessionId: string,
         cwd: string,
-      ) => Promise<{ items: StreamItem[]; contextUsed: number | null; contextUsage: ContextUsage | null }>;
+      ) => Promise<{
+        items: StreamItem[];
+        contextUsed: number | null;
+        contextUsage: ContextUsage | null;
+        planAwaiting: boolean;
+        planModifiedAt: number | null;
+      }>;
       newThread: (cwd?: string | null, worktree?: boolean) => Promise<NewThreadResult>;
       resumeThread: (sessionId: string, cwd: string) => Promise<{ sessionId: string; cwd: string }>;
       forkThread: (sessionId: string, cwd: string) => Promise<NewThreadResult>;
@@ -71,6 +77,7 @@ declare global {
         text: string,
         images?: { path: string; mimeType: string }[],
       ) => Promise<unknown>;
+      runningSessions: () => Promise<string[]>;
       savePastedImage: (payload: { data: string; mimeType?: string }) => Promise<{ path: string; mimeType: string }>;
       saveClipboardImage: () => Promise<{ path: string; mimeType: string; dataUrl: string } | null>;
       setMode: (sessionId: string, modeId: string) => Promise<void>;
@@ -90,6 +97,11 @@ declare global {
       applyWorktree: (fromCwd: string, destCwd: string) => Promise<string>;
       openInEditor: (cwd: string, filePath?: string) => Promise<{ ok: boolean; editor: string }>;
       openPath: (target: string) => Promise<void>;
+      resolveImage: (input: {
+        src: string;
+        sessionId?: string;
+        cwd?: string;
+      }) => Promise<{ path: string; dataUrl: string } | null>;
       windowControl: (action: "min" | "max" | "close") => Promise<void>;
       settings: (cwd?: string | null) => Promise<AppSettings>;
       setModel: (id: string) => Promise<AppSettings>;
@@ -140,6 +152,7 @@ declare global {
       terminalKill: () => Promise<void>;
       onTerminalData: (cb: (chunk: string) => void) => () => void;
       onUpdate: (cb: (payload: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown> }) => void) => () => void;
+      onRunState: (cb: (payload: { sessionId: string; running: boolean }) => void) => () => void;
       onPermission: (cb: (payload: PermissionRequest) => void) => () => void;
       onAgentStatus: (cb: (payload: { connected: boolean; message?: string }) => void) => () => void;
       onAutomations: (cb: (rows: Automation[]) => void) => () => void;

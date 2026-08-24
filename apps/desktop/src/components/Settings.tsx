@@ -1,7 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
 import type {
-  AccountInfo,
-  AccountUsage,
   AppSettings,
   AppUpdateInfo,
   AvailablePluginInfo,
@@ -33,25 +31,12 @@ export const HOOK_EVENTS = [
 
 export type SettingsRun = <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 
-type SettingsPane = "general" | "controls" | "subagents" | "usage" | "update" | "logs";
+type SettingsPane = "general" | "features" | "about";
 
-const NAV: { group: string; items: { id: SettingsPane; label: string }[] }[] = [
-  { group: "基础设置", items: [{ id: "general", label: "常规" }] },
-  {
-    group: "Agent 能力",
-    items: [
-      { id: "controls", label: "浏览器与电脑控制" },
-      { id: "subagents", label: "子智能体" },
-    ],
-  },
-  {
-    group: "数据与统计",
-    items: [
-      { id: "usage", label: "用量" },
-      { id: "update", label: "更新" },
-      { id: "logs", label: "日志" },
-    ],
-  },
+const NAV: { id: SettingsPane; label: string; hint: string }[] = [
+  { id: "general", label: "常规", hint: "模型、推理与权限" },
+  { id: "features", label: "功能", hint: "浏览器、电脑与子智能体" },
+  { id: "about", label: "关于", hint: "版本更新与运行日志" },
 ];
 
 export function Settings({
@@ -77,40 +62,31 @@ export function Settings({
     <div className="settings-overlay" role="dialog" aria-label="设置">
       <header className="settings-top">
         <button className="btn small ghost" type="button" onClick={onClose}>
-          返回工作区
+          ← 返回
         </button>
+        <strong>设置</strong>
       </header>
       <div className="settings-shell">
         <nav className="settings-nav" aria-label="设置分类">
-          {NAV.map((group) => (
-            <div className="settings-nav-group" key={group.group}>
-              <div className="settings-nav-label">{group.group}</div>
-              {group.items.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={`settings-nav-item${pane === item.id ? " on" : ""}`}
-                  onClick={() => setPane(item.id)}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
+          {NAV.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={`settings-nav-item${pane === item.id ? " on" : ""}`}
+              onClick={() => setPane(item.id)}
+            >
+              <strong>{item.label}</strong>
+              <span>{item.hint}</span>
+            </button>
           ))}
         </nav>
         <div className="settings-body">
           {pane === "general" ? (
             settings ? <GeneralPane settings={settings} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
-          ) : pane === "controls" ? (
-            settings ? <ControlsPane settings={settings} cwd={cwd} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
-          ) : pane === "subagents" ? (
-            settings ? <SubagentsPane settings={settings} cwd={cwd} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
-          ) : pane === "usage" ? (
-            <UsagePane />
-          ) : pane === "update" ? (
-            <UpdatePane />
-          ) : pane === "logs" ? (
-            <LogsPane />
+          ) : pane === "features" ? (
+            settings ? <FeaturesPane settings={settings} cwd={cwd} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
+          ) : pane === "about" ? (
+            <AboutPane />
           ) : (
             <p className="settings-hint">未知设置页。</p>
           )}
@@ -129,9 +105,13 @@ function GeneralPane({
 }) {
   return (
     <>
+      <div className="settings-page-head">
+        <h1>常规</h1>
+        <p>设置新会话的默认行为。</p>
+      </div>
       <section className="settings-section">
-        <h3>模型</h3>
-        <p className="settings-hint">写入 ~/.grok/config.toml 的 [models] default，新会话生效。</p>
+        <h3>默认模型</h3>
+        <p className="settings-hint">选择新会话默认使用的模型。</p>
         <select
           value={settings.model}
           onChange={(e) => {
@@ -147,7 +127,7 @@ function GeneralPane({
       </section>
       <section className="settings-section">
         <h3>推理等级</h3>
-        <p className="settings-hint">写入 ~/.grok/config.toml 的 [models] default_reasoning_effort，新会话生效。</p>
+        <p className="settings-hint">等级越高，思考更充分，但响应也会更慢。</p>
         <div className="mode-list">
           {REASONING.map((item) => (
             <button
@@ -167,6 +147,7 @@ function GeneralPane({
       </section>
       <section className="settings-section">
         <h3>权限模式</h3>
+        <p className="settings-hint">控制执行命令和修改文件时是否需要先征得你的同意。</p>
         <div className="mode-list">
           {MODES.map((mode) => (
             <button
@@ -187,54 +168,7 @@ function GeneralPane({
   );
 }
 
-function ControlsPane({
-  settings,
-  cwd,
-  onChange,
-}: {
-  settings: AppSettings;
-  cwd?: string | null;
-  onChange: (next: AppSettings) => void;
-}) {
-  return (
-    <section className="settings-section">
-      <h3>浏览器与电脑控制</h3>
-      <p className="settings-hint">
-        打开后，Grok 可以通过 MCP 控制浏览器，或通过 Computer Use 操作本机窗口。新会话生效。
-      </p>
-      <div className="control-toggles">
-        <label className="toggle-row">
-          <span>
-            <strong>浏览器控制</strong>
-            <em>用 Playwright / browser MCP 打开网页、点击、输入、截图</em>
-          </span>
-          <input
-            type="checkbox"
-            checked={settings.browserControl}
-            onChange={(e) => {
-              void window.grok.setBrowserControl(e.target.checked, cwd).then(onChange);
-            }}
-          />
-        </label>
-        <label className="toggle-row">
-          <span>
-            <strong>控制本地电脑</strong>
-            <em>允许操作本机前台窗口，权限更重</em>
-          </span>
-          <input
-            type="checkbox"
-            checked={settings.computerControl}
-            onChange={(e) => {
-              void window.grok.setComputerControl(e.target.checked, cwd).then(onChange);
-            }}
-          />
-        </label>
-      </div>
-    </section>
-  );
-}
-
-function SubagentsPane({
+function FeaturesPane({
   settings,
   cwd,
   onChange,
@@ -245,16 +179,43 @@ function SubagentsPane({
 }) {
   return (
     <>
+      <div className="settings-page-head">
+        <h1>功能</h1>
+        <p>只开启你会使用的扩展能力，新会话生效。</p>
+      </div>
       <section className="settings-section">
-        <h3>子智能体</h3>
-        <p className="settings-hint">
-          主会话可以并行拉起独立子会话。默认开启。写入 ~/.grok/config.toml 的 [subagents]，新会话生效。
-        </p>
+        <h3>操作能力</h3>
         <div className="control-toggles">
           <label className="toggle-row">
             <span>
-              <strong>允许派生子智能体</strong>
-              <em>关闭后主会话不再调用 spawn_subagent，也不再出现探索 / 规划 / 通用子会话</em>
+              <strong>浏览器控制</strong>
+              <em>允许打开网页、点击、输入和截图</em>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.browserControl}
+              onChange={(e) => {
+                void window.grok.setBrowserControl(e.target.checked, cwd).then(onChange);
+              }}
+            />
+          </label>
+          <label className="toggle-row">
+            <span>
+              <strong>电脑控制</strong>
+              <em>允许操作本机前台窗口，使用时请留意屏幕内容</em>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.computerControl}
+              onChange={(e) => {
+                void window.grok.setComputerControl(e.target.checked, cwd).then(onChange);
+              }}
+            />
+          </label>
+          <label className="toggle-row">
+            <span>
+              <strong>子智能体</strong>
+              <em>允许为复杂任务并行处理独立子任务</em>
             </span>
             <input
               type="checkbox"
@@ -266,135 +227,11 @@ function SubagentsPane({
           </label>
         </div>
       </section>
-      <section className="settings-section">
-        <h3>类型</h3>
-        <p className="settings-hint">
-          这是角色模板，不是同时只能跑三个。同类型可以并行多个；子会话不能再派生子会话。自定义类型放在 ~/.grok/agents/ 或项目 .grok/agents/。
-        </p>
-        <div className="settings-actions">
-          <button className="btn" type="button" onClick={() => void window.grok.openAgentsDir()}>
-            打开 ~/.grok/agents
-          </button>
-        </div>
-        <ul className="skill-list">
-          {settings.subagentTypes.map((agent) => (
-            <li key={agent.id}>
-              <div>
-                <strong>{agent.name}</strong>
-                <span className="skill-src">{agent.id}</span>
-                {agent.builtin ? <span className="skill-src">内置</span> : null}
-                {agent.source ? <span className="skill-src">{agent.source}</span> : null}
-                {agent.description ? <p>{agent.description}</p> : null}
-                <label className="toggle">
-                  模型
-                  <select
-                    value={agent.model || ""}
-                    disabled={!settings.subagentsEnabled || !agent.enabled}
-                    onChange={(e) => {
-                      const next = e.target.value || null;
-                      void window.grok.setSubagentTypeModel(agent.id, next, cwd).then(onChange);
-                    }}
-                  >
-                    <option value="">跟随主会话</option>
-                    {settings.models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name === m.id ? m.id : `${m.name}（${m.id}）`}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={agent.enabled}
-                  disabled={!settings.subagentsEnabled}
-                  onChange={(e) => {
-                    void window.grok.setSubagentTypeEnabled(agent.id, e.target.checked, cwd).then(onChange);
-                  }}
-                />
-                启用
-              </label>
-            </li>
-          ))}
-        </ul>
-      </section>
     </>
   );
 }
 
-function UsagePane() {
-  const [account, setAccount] = useState<AccountInfo | null>(null);
-  const [usage, setUsage] = useState<AccountUsage | null>(null);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let alive = true;
-    void Promise.all([window.grok.account(), window.grok.accountUsage()])
-      .then(([nextAccount, nextUsage]) => {
-        if (!alive) return;
-        setAccount(nextAccount);
-        setUsage(nextUsage);
-      })
-      .catch((err) => {
-        if (!alive) return;
-        setError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  const methodLabel =
-    account?.method === "oauth" ? "xAI 登录" : account?.method === "api-key" ? "本地配置" : "未登录";
-
-  return (
-    <section className="settings-section">
-      <h3>用量</h3>
-      <p className="settings-hint">来自当前账号或本地 API 配置。Grok 没有独立的桌面额度面板，这里只展示 CLI 能读到的信息。</p>
-      {error ? <p className="settings-error">{error}</p> : null}
-      <div className="settings-kv">
-        <div>
-          <span>账号</span>
-          <strong>{account?.name || "—"}</strong>
-        </div>
-        {account?.email ? (
-          <div>
-            <span>邮箱</span>
-            <strong>{account.email}</strong>
-          </div>
-        ) : null}
-        <div>
-          <span>方式</span>
-          <strong>{methodLabel}</strong>
-        </div>
-        {usage?.tier ? (
-          <div>
-            <span>套餐</span>
-            <strong>{usage.tier}</strong>
-          </div>
-        ) : null}
-        {typeof usage?.percent === "number" ? (
-          <div>
-            <span>已用</span>
-            <strong>{Math.round(usage.percent)}%</strong>
-          </div>
-        ) : null}
-        {typeof usage?.used === "number" && typeof usage?.limit === "number" ? (
-          <div>
-            <span>额度</span>
-            <strong>
-              {usage.used} / {usage.limit}
-            </strong>
-          </div>
-        ) : null}
-      </div>
-      {usage?.text ? <p className="settings-hint">{usage.text}</p> : null}
-    </section>
-  );
-}
-
-function UpdatePane() {
+function AboutPane() {
   const [info, setInfo] = useState<AppUpdateInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -414,50 +251,50 @@ function UpdatePane() {
   }, []);
 
   return (
-    <section className="settings-section">
-      <h3>更新</h3>
-      <p className="settings-hint">对照 GitHub Releases 检查桌面端版本。不会自动下载安装。</p>
-      {error ? <p className="settings-error">{error}</p> : null}
-      {info ? (
-        <div className="settings-kv">
-          <div>
-            <span>当前版本</span>
-            <strong>{info.current}</strong>
-          </div>
-          <div>
-            <span>最新版本</span>
-            <strong>{info.latest || "—"}</strong>
-          </div>
-        </div>
-      ) : (
-        <p className="settings-hint">{busy ? "正在检查…" : "还没有检查结果。"}</p>
-      )}
-      {info?.hasUpdate ? <p className="settings-hint">有新版本可用。</p> : null}
-      {info?.notes ? <pre className="settings-pre">{info.notes}</pre> : null}
-      {info?.error ? <p className="settings-error">{info.error}</p> : null}
-      <div className="settings-actions">
-        <button className="btn" type="button" disabled={busy} onClick={refresh}>
-          {busy ? "检查中…" : "检查更新"}
-        </button>
-        {info?.hasUpdate ? (
-          <button className="btn primary" type="button" onClick={() => void window.grok.openUpdate(info.url)}>
-            打开发布页
-          </button>
-        ) : null}
+    <>
+      <div className="settings-page-head">
+        <h1>关于</h1>
+        <p>查看版本信息，或在遇到问题时打开运行日志。</p>
       </div>
-    </section>
-  );
-}
-
-function LogsPane() {
-  return (
-    <section className="settings-section">
-      <h3>日志</h3>
-      <p className="settings-hint">崩溃和主进程记录写在用户数据目录。单实例运行，重复打开会唤起现有窗口。</p>
-      <button className="btn" type="button" onClick={() => void window.grok.openLogs()}>
-        打开日志目录
-      </button>
-    </section>
+      <section className="settings-section">
+        <h3>版本更新</h3>
+        {error ? <p className="settings-error">{error}</p> : null}
+        {info ? (
+          <div className="settings-kv">
+            <div>
+              <span>当前版本</span>
+              <strong>{info.current}</strong>
+            </div>
+            <div>
+              <span>最新版本</span>
+              <strong>{info.latest || "—"}</strong>
+            </div>
+          </div>
+        ) : (
+          <p className="settings-hint">{busy ? "正在检查…" : "暂时无法读取版本信息。"}</p>
+        )}
+        {info?.hasUpdate ? <p className="settings-hint">有新版本可用。</p> : null}
+        {info?.notes ? <pre className="settings-pre">{info.notes}</pre> : null}
+        {info?.error ? <p className="settings-error">{info.error}</p> : null}
+        <div className="settings-actions">
+          <button className="btn" type="button" disabled={busy} onClick={refresh}>
+            {busy ? "检查中…" : "检查更新"}
+          </button>
+          {info?.hasUpdate ? (
+            <button className="btn primary" type="button" onClick={() => void window.grok.openUpdate(info.url)}>
+              打开下载页
+            </button>
+          ) : null}
+        </div>
+      </section>
+      <section className="settings-section">
+        <h3>运行日志</h3>
+        <p className="settings-hint">应用异常时，可打开日志目录查看记录或提供给开发者排查。</p>
+        <button className="btn" type="button" onClick={() => void window.grok.openLogs()}>
+          打开日志目录
+        </button>
+      </section>
+    </>
   );
 }
 
@@ -650,8 +487,8 @@ export function PluginsTab({
   settings,
   cwd,
   available,
-  onAvailable,
-  onInstall,
+  loading,
+  onRefresh,
   onMarket,
   onChange,
   run,
@@ -659,8 +496,8 @@ export function PluginsTab({
   settings: AppSettings;
   cwd?: string | null;
   available: AvailablePluginInfo[] | null;
-  onAvailable: (rows: AvailablePluginInfo[]) => void;
-  onInstall: () => void;
+  loading: boolean;
+  onRefresh: () => void | Promise<void>;
   onMarket: () => void;
   onChange: (next: AppSettings) => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
@@ -671,9 +508,6 @@ export function PluginsTab({
         <h3>已安装</h3>
         <p className="settings-hint">安装和开关走 grok plugin。项目插件需要信任文件夹后才会加载 MCP / Hooks。</p>
         <div className="settings-actions">
-          <button className="btn" type="button" onClick={onInstall}>
-            安装插件
-          </button>
           <button className="btn" type="button" onClick={onMarket}>
             添加市场源
           </button>
@@ -724,7 +558,7 @@ export function PluginsTab({
       <section className="settings-section">
         <h3>市场源</h3>
         {settings.marketplaces.length === 0 ? (
-          <p className="settings-hint">还没有市场源。粘贴 git URL 或 owner/repo。</p>
+          <p className="settings-hint">还没有市场源。可添加 GitHub 仓库、Git URL 或本地目录。</p>
         ) : (
           <ul className="skill-list">
             {settings.marketplaces.map((item) => (
@@ -739,7 +573,13 @@ export function PluginsTab({
                     className="btn small ghost"
                     type="button"
                     onClick={() =>
-                      void run("移除市场", () => window.grok.marketplaceRemove(item.url, cwd).then(onChange))
+                      void run("移除市场", () =>
+                        window.grok.marketplaceRemove(item.url, cwd).then(async (next) => {
+                          onChange(next);
+                          await onRefresh();
+                          return next;
+                        }),
+                      )
                     }
                   >
                     移除
@@ -750,44 +590,46 @@ export function PluginsTab({
           </ul>
         )}
       </section>
-      <section className="settings-section">
-        <h3>可安装</h3>
-        <div className="settings-actions">
-          <button
-            className="btn"
-            type="button"
-            onClick={() =>
-              void run("读取市场", async () => {
-                const rows = await window.grok.availablePlugins();
-                onAvailable(rows);
-                return rows;
-              })
-            }
-          >
-            刷新可安装列表
+      <section className="settings-section plugin-browser">
+        <div className="plugin-section-head">
+          <div>
+            <h3>可安装插件</h3>
+            <p className="settings-hint">从已添加的市场源中选择插件。</p>
+          </div>
+          <button className="btn small ghost" type="button" onClick={onRefresh}>
+            刷新
           </button>
         </div>
+        {available === null && loading ? <p className="settings-hint">正在读取市场…</p> : null}
         {available && available.length === 0 ? <p className="settings-hint">市场里暂时没有条目。</p> : null}
         {available && available.length ? (
-          <ul className="skill-list">
-            {available.slice(0, 40).map((item) => (
-              <li key={`${item.marketplace}:${item.name}`}>
-                <div>
-                  <strong>{item.name}</strong>
-                  <span className="skill-src">{item.marketplace}</span>
-                  {item.description ? <p>{item.description}</p> : null}
-                </div>
-                <button
-                  className="btn small"
-                  type="button"
-                  onClick={() =>
-                    void run("安装", () => window.grok.pluginInstall(item.name, true, cwd).then(onChange))
-                  }
-                >
-                  安装并信任
-                </button>
-              </li>
-            ))}
+          <ul className="plugin-card-grid">
+            {available.map((item) => {
+              const installed =
+                item.status === "installed" || settings.plugins.some((plugin) => plugin.name === item.name);
+              return (
+                <li className="plugin-card" key={`${item.marketplace}:${item.name}`}>
+                  <div className="plugin-card-body">
+                    <div className="plugin-card-title">
+                      <strong>{item.name}</strong>
+                      {item.version ? <span>{item.version}</span> : null}
+                    </div>
+                    <span className="plugin-card-market">{item.marketplace}</span>
+                    <p>{item.description || "暂无插件说明。"}</p>
+                  </div>
+                  <button
+                    className={`btn small plugin-card-install${installed ? "" : " primary"}`}
+                    type="button"
+                    disabled={installed}
+                    onClick={() =>
+                      void run("安装", () => window.grok.pluginInstall(item.name, true, cwd).then(onChange))
+                    }
+                  >
+                    {installed ? "已安装" : "安装并信任"}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         ) : null}
       </section>
@@ -1051,46 +893,6 @@ export function HookForm({
   );
 }
 
-export function InstallForm({
-  cwd,
-  onClose,
-  onChange,
-  run,
-}: {
-  cwd?: string | null;
-  onClose: () => void;
-  onChange: (next: AppSettings) => void;
-  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
-}) {
-  const [source, setSource] = useState("");
-  const [trust, setTrust] = useState(true);
-  return (
-    <NestedModal title="安装插件" onClose={onClose}>
-      <p className="settings-hint">Git URL、GitHub shorthand（user/repo）或本地路径。安装会执行第三方代码。</p>
-      <label className="field">
-        <span>来源</span>
-        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder="owner/repo" />
-      </label>
-      <label className="toggle">
-        <input type="checkbox" checked={trust} onChange={(e) => setTrust(e.target.checked)} />
-        立即信任（--trust）
-      </label>
-      <div className="permission-actions">
-        <button
-          className="btn primary"
-          type="button"
-          disabled={!source.trim()}
-          onClick={() => {
-            void run("安装插件", () => window.grok.pluginInstall(source.trim(), trust, cwd).then(onChange));
-          }}
-        >
-          安装
-        </button>
-      </div>
-    </NestedModal>
-  );
-}
-
 export function MarketForm({
   cwd,
   onClose,
@@ -1099,15 +901,23 @@ export function MarketForm({
 }: {
   cwd?: string | null;
   onClose: () => void;
-  onChange: (next: AppSettings) => void;
+  onChange: (next: AppSettings) => void | Promise<void>;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [url, setUrl] = useState("");
   return (
     <NestedModal title="添加市场源" onClose={onClose}>
+      <p className="settings-hint">
+        支持 GitHub 仓库页面、owner/repo、Git URL、marketplace.json 地址或本地目录。远程仓库会自动生成 Windows 兼容副本。
+      </p>
       <label className="field">
-        <span>git URL 或 owner/repo</span>
-        <input value={url} onChange={(e) => setUrl(e.target.value)} />
+        <span>市场源地址</span>
+        <input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://github.com/owner/plugins"
+          autoFocus
+        />
       </label>
       <div className="permission-actions">
         <button

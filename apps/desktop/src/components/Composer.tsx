@@ -25,6 +25,7 @@ type Props = {
   contextUsed?: number | null;
   contextUsage?: ContextUsage | null;
   permission: PermissionRequest | null;
+  awaitingAnswer?: boolean;
   onChange: (v: string) => void;
   onEnvChange: (worktree: boolean) => void;
   onPlanMode: (on: boolean) => void;
@@ -58,10 +59,6 @@ const REASONING: { id: ReasoningEffort; label: string; hint: string }[] = [
   { id: "high", label: "高", hint: "更充分的推理" },
   { id: "xhigh", label: "极高", hint: "最深推理，耗时更长" },
 ];
-
-function samePath(a: string, b: string) {
-  return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
-}
 
 function shortRemote(url: string) {
   return url
@@ -394,6 +391,7 @@ export function Composer({
   contextUsed,
   contextUsage,
   permission,
+  awaitingAnswer = false,
   onChange,
   onEnvChange,
   onPlanMode,
@@ -407,10 +405,8 @@ export function Composer({
   onPermission,
   onNewChat,
   onOpenSettings,
-  projects = [],
   selectedProject = null,
   git = null,
-  onSelectProject,
   onPickProject,
   showProjectPicker = false,
 }: Props) {
@@ -419,7 +415,6 @@ export function Composer({
   const [menuOpen, setMenuOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
-  const [projectOpen, setProjectOpen] = useState(false);
   const [goalOpen, setGoalOpen] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
   const [goalDraft, setGoalDraft] = useState(goal);
@@ -446,13 +441,21 @@ export function Composer({
   }, [value]);
 
   useEffect(() => {
+    if (!awaitingAnswer || disabled || busy) return;
+    const id = window.requestAnimationFrame(() => {
+      ref.current?.focus();
+      ref.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [awaitingAnswer, busy, disabled]);
+
+  useEffect(() => {
     const onDoc = (e: MouseEvent) => {
       if (!box.current?.contains(e.target as Node)) {
         setMenuOpen(false);
         setPickOpen(false);
         setPermOpen(false);
         setModelOpen(false);
-        setProjectOpen(false);
       }
     };
     const onKey = (e: KeyboardEvent) => {
@@ -461,7 +464,6 @@ export function Composer({
         setPickOpen(false);
         setPermOpen(false);
         setModelOpen(false);
-        setProjectOpen(false);
       }
     };
     document.addEventListener("mousedown", onDoc);
@@ -510,7 +512,6 @@ export function Composer({
     setPickOpen(false);
     setPermOpen(false);
     setModelOpen(false);
-    setProjectOpen(false);
   }
 
   function addPaths(paths: string[]) {
@@ -649,7 +650,7 @@ export function Composer({
         ) : null}
 
         <div
-          className={`composer${dragOver ? " drag" : ""}`}
+          className={`composer${dragOver ? " drag" : ""}${awaitingAnswer ? " awaiting-answer" : ""}`}
           onDragOver={(e) => {
             e.preventDefault();
             setDragOver(true);
@@ -666,59 +667,18 @@ export function Composer({
             <div className="context-chip-wrap">
               <button
                 type="button"
-                className={`context-chip${projectOpen ? " open" : ""}`}
+                className="context-chip"
                 onClick={() => {
                   setMenuOpen(false);
                   setPickOpen(false);
                   setPermOpen(false);
                   setModelOpen(false);
-                  setProjectOpen((v) => !v);
+                  onPickProject?.();
                 }}
               >
                 <IconFolderChip />
-                <span>{selectedProject?.name || "普通对话"}</span>
-                <span className="context-caret">▾</span>
+                <span>{selectedProject?.name || "选择文件夹"}</span>
               </button>
-              {projectOpen ? (
-                <div className="context-menu">
-                  <button
-                    type="button"
-                    className={!selectedProject ? "on" : ""}
-                    onClick={() => {
-                      onSelectProject?.(null);
-                      setProjectOpen(false);
-                    }}
-                  >
-                    普通对话
-                    <em>不绑定项目目录</em>
-                  </button>
-                  {projects.map((project) => (
-                    <button
-                      key={project.cwd}
-                      type="button"
-                      className={selectedProject && samePath(selectedProject.cwd, project.cwd) ? "on" : ""}
-                      title={project.cwd}
-                      onClick={() => {
-                        onSelectProject?.(project);
-                        setProjectOpen(false);
-                      }}
-                    >
-                      {project.name}
-                      <em>{project.cwd}</em>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setProjectOpen(false);
-                      onPickProject?.();
-                    }}
-                  >
-                    选择文件夹…
-                    <em>选中后会作为项目</em>
-                  </button>
-                </div>
-              ) : null}
             </div>
             {selectedProject && git?.isRepo ? (
               <span className="context-chip static" title={git.remote || git.branch || ""}>
@@ -729,16 +689,8 @@ export function Composer({
             ) : null}
           </div>
           ) : null}
-          {attachments.length || goal || planMode ? (
+          {attachments.length || goal ? (
             <div className="composer-chips">
-              {planMode ? (
-                <span className="chip">
-                  计划模式
-                  <button type="button" onClick={() => onPlanMode(false)}>
-                    ×
-                  </button>
-                </span>
-              ) : null}
               {goal ? (
                 <span className="chip" title={goal}>
                   目标：{goal}
@@ -776,11 +728,18 @@ export function Composer({
               ))}
             </div>
           ) : null}
+          {awaitingAnswer ? (
+            <div className="composer-answer-hint" aria-live="polite">
+              <strong>回答 Grok</strong>
+              <span>在这里输入答案，按 Enter 发送并继续生成计划</span>
+            </div>
+          ) : null}
           <textarea
             ref={ref}
             value={value}
             disabled={disabled}
-            placeholder="随心输入，输入 / 可调用技能"
+            placeholder={awaitingAnswer ? "请在这里回答上方的问题…" : "随心输入，输入 / 可调用技能"}
+            aria-label={awaitingAnswer ? "回答 Grok 的问题" : "消息输入框"}
             onChange={(e) => onChange(e.target.value)}
             onPaste={(e) => {
               const hasImage = [...e.clipboardData.items].some(
@@ -825,7 +784,6 @@ export function Composer({
                   setPermOpen(false);
                   setModelOpen(false);
                   setPickOpen(false);
-                  setProjectOpen(false);
                   setMenuOpen((v) => !v);
                 }}
               >
@@ -839,7 +797,6 @@ export function Composer({
                     setMenuOpen(false);
                     setPickOpen(false);
                     setModelOpen(false);
-                    setProjectOpen(false);
                     setPermOpen((v) => !v);
                   }}
                 >
@@ -874,6 +831,21 @@ export function Composer({
                   </div>
                 ) : null}
               </div>
+              {planMode ? (
+                <button
+                  className="plan-mode-indicator"
+                  type="button"
+                  title="计划模式已开启，点击关闭"
+                  aria-label="关闭计划模式"
+                  onClick={() => onPlanMode(false)}
+                >
+                  <IconPlan />
+                  <span>计划模式</span>
+                  <span className="plan-mode-indicator-close" aria-hidden>
+                    ×
+                  </span>
+                </button>
+              ) : null}
               {showWorktree && (canChooseEnv || worktree) ? (
                 <button
                   type="button"
@@ -899,7 +871,6 @@ export function Composer({
                     setMenuOpen(false);
                     setPickOpen(false);
                     setPermOpen(false);
-                    setProjectOpen(false);
                     setModelOpen((v) => !v);
                   }}
                 >
