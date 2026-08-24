@@ -3,10 +3,25 @@ import type { StreamItem } from "../../electron/shared";
 import grokLogo from "../assets/grok-logo.jpg";
 import { Markdown } from "../lib/markdown";
 import { toolStatusLabel } from "../lib/i18n";
+import { planFlowLabel, type PlanActivity, type PlanFlowPhase } from "../lib/plan-flow";
+import type { PlanRevision } from "../lib/stream";
 
 type UserItem = Extract<StreamItem, { kind: "user" }>;
 type ThoughtItem = Extract<StreamItem, { kind: "thought" }>;
 type ToolItem = Extract<StreamItem, { kind: "tool" }>;
+
+type PlanConsole = {
+  activity: PlanActivity;
+  phase: PlanFlowPhase;
+  revision: PlanRevision | null;
+  question?: string | null;
+  error?: string;
+  busy: boolean;
+  onApprove: (revision: PlanRevision) => void;
+  onReject: () => void;
+  onRetry: () => void;
+  onReload: () => void;
+};
 
 type Turn = {
   user?: UserItem;
@@ -117,25 +132,142 @@ function ToolCard({
   );
 }
 
+function PlanDocumentCard({
+  plan,
+  planConsole,
+  sessionId,
+  cwd,
+  onOpenPlan,
+}: {
+  plan: PlanRevision;
+  planConsole?: PlanConsole;
+  sessionId?: string;
+  cwd?: string;
+  onOpenPlan?: (plan: PlanRevision) => void;
+}) {
+  const actionable = Boolean(planConsole && planConsole.phase !== "executing");
+  return (
+    <section
+      className={`plan-document-card${onOpenPlan ? " clickable" : ""}`}
+      aria-label="计划文档，点击查看完整计划"
+      role={onOpenPlan ? "button" : undefined}
+      tabIndex={onOpenPlan ? 0 : undefined}
+      onClick={() => onOpenPlan?.(plan)}
+      onKeyDown={(event) => {
+        if (!onOpenPlan || event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenPlan(plan);
+        }
+      }}
+    >
+      <div className="plan-document-head">
+        <strong>计划文档</strong>
+        <span>
+          第 {plan.revision} 份
+          {planConsole ? ` · ${planFlowLabel(planConsole.phase)}` : ""}
+        </span>
+      </div>
+      <div className="plan-document-preview">
+        <div className="plan-document-body">
+          <Markdown text={plan.markdown ?? ""} sessionId={sessionId} cwd={cwd} />
+        </div>
+      </div>
+      {planConsole?.error ? <div className="plan-document-error">{planConsole.error}</div> : null}
+      {actionable ? (
+        <div className="plan-document-foot">
+          <span>点击计划，在右侧查看完整内容</span>
+          <div>
+            <button
+              className="btn primary small"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                if (planConsole!.revision) planConsole!.onApprove(planConsole!.revision);
+              }}
+              disabled={planConsole!.busy || !planConsole!.revision}
+            >
+              开始执行
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function PlanConsoleStatus({ planConsole }: { planConsole: PlanConsole }) {
+  const loadingDocument = planConsole.phase === "awaiting_approval" && !planConsole.revision?.markdown;
+  return (
+    <section className={`plan-console-status ${planConsole.activity.stage}`} aria-live="polite">
+      <span className="plan-console-dot" aria-hidden="true" />
+      <div className="plan-console-copy">
+        <strong>{loadingDocument ? "计划已完成" : planConsole.activity.label}</strong>
+        <span>{loadingDocument ? "正在读取 plan.md 并放入对话区。" : planConsole.activity.detail}</span>
+        {planConsole.phase === "discussing" && planConsole.question ? (
+          <div className="plan-console-question">
+            <b>Grok 想确认：</b>
+            <span>{planConsole.question}</span>
+          </div>
+        ) : null}
+        {planConsole.error ? <em>{planConsole.error}</em> : null}
+      </div>
+      {!planConsole.busy && (planConsole.phase === "failed" || loadingDocument) ? (
+        <div className="plan-console-actions">
+          <button className="btn small reject" type="button" onClick={planConsole.onReject}>放弃计划</button>
+          <button
+            className="btn primary small"
+            type="button"
+            onClick={loadingDocument ? planConsole.onReload : planConsole.onRetry}
+          >
+            {loadingDocument ? "重新读取" : "重试生成"}
+          </button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function RestItem({
   item,
   onOpenFile,
+  sessionId,
+  cwd,
+  planConsole,
+  onOpenPlan,
+  planNumber,
 }: {
   item: StreamItem;
   onOpenFile?: (path: string) => void;
+  sessionId?: string;
+  cwd?: string;
+  planConsole?: PlanConsole;
+  onOpenPlan?: (plan: PlanRevision) => void;
+  planNumber?: number;
 }) {
   if (item.kind === "agent") {
     return (
       <div className="msg agent">
         <div className="msg-role">Grok</div>
         <div className="body">
-          <Markdown text={item.text} />
+          <Markdown text={item.text} sessionId={sessionId} cwd={cwd} />
         </div>
       </div>
     );
   }
   if (item.kind === "plan") {
-    return null;
+    if (!item.markdown && item.entries.length === 0) return null;
+    const markdown =
+      item.markdown ?? item.entries.map((entry, index) => `${index + 1}. ${entry.content}`).join("\n");
+    return (
+      <PlanDocumentCard
+        plan={{ revision: planNumber ?? item.revision, entries: item.entries, markdown }}
+        planConsole={planConsole}
+        sessionId={sessionId}
+        cwd={cwd}
+        onOpenPlan={onOpenPlan}
+      />
+    );
   }
   if (item.kind === "tool") {
     return <ToolCard item={item} onOpenFile={onOpenFile} />;
@@ -180,6 +312,10 @@ export function MessageStream({
   onDismissError,
   emptyTitle,
   onOpenFile,
+  sessionId,
+  cwd,
+  planConsole,
+  onOpenPlan,
 }: {
   items: StreamItem[];
   busy?: boolean;
@@ -188,6 +324,10 @@ export function MessageStream({
   onDismissError?: () => void;
   emptyTitle: string;
   onOpenFile?: (path: string) => void;
+  sessionId?: string;
+  cwd?: string;
+  planConsole?: PlanConsole;
+  onOpenPlan?: (plan: PlanRevision) => void;
 }) {
   const streamRef = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
@@ -196,13 +336,30 @@ export function MessageStream({
   const [active, setActive] = useState(0);
   const [hover, setHover] = useState<number | null>(null);
   const turns = groupTurns(items);
+  const latestPlanDocument = [...items]
+    .reverse()
+    .find((item): item is Extract<StreamItem, { kind: "plan" }> => item.kind === "plan" && Boolean(item.markdown));
+  const planNumbers = new Map<StreamItem, number>();
+  for (const item of items) {
+    if (item.kind === "plan" && (item.markdown || item.entries.length > 0)) {
+      planNumbers.set(item, planNumbers.size + 1);
+    }
+  }
+  const showPlanStatus = Boolean(
+    planConsole &&
+      (planConsole.phase === "generating" ||
+        planConsole.phase === "revising" ||
+        planConsole.phase === "discussing" ||
+        (planConsole.phase === "awaiting_approval" && !planConsole.revision?.markdown) ||
+        (planConsole.phase === "failed" && !planConsole.revision?.markdown)),
+  );
   const railTurns = turns
     .map((turn, index) => ({ turn, index }))
     .filter((row) => Boolean(row.turn.user?.text.trim()));
 
   useEffect(() => {
     if (followRef.current) end.current?.scrollIntoView({ block: "end" });
-  }, [items, error]);
+  }, [items, error, planConsole?.phase]);
 
   useEffect(() => {
     const root = streamRef.current;
@@ -325,12 +482,26 @@ export function MessageStream({
                   </div>
                 ) : null}
                 {turn.rest.map((item, i) => (
-                  <RestItem key={`${ti}-${item.kind}-${i}`} item={item} onOpenFile={onOpenFile} />
+                  <RestItem
+                    key={`${ti}-${item.kind}-${i}`}
+                    item={item}
+                    onOpenFile={onOpenFile}
+                    sessionId={sessionId}
+                    cwd={cwd}
+                    planConsole={
+                      item === latestPlanDocument && planConsole?.revision?.markdown
+                        ? planConsole
+                        : undefined
+                    }
+                    onOpenPlan={onOpenPlan}
+                    planNumber={planNumbers.get(item)}
+                  />
                 ))}
               </div>
             );
           })}
-          {busy ? (
+          {showPlanStatus && planConsole ? <PlanConsoleStatus planConsole={planConsole} /> : null}
+          {busy && !showPlanStatus ? (
             <div className="run-status">
               <svg className="spinner" width="14" height="14" viewBox="0 0 16 16" aria-hidden>
                 <circle cx="8" cy="8" r="5.4" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.22" />

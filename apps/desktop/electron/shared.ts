@@ -24,6 +24,7 @@ export type StreamItem =
       kind: "plan";
       revision: number;
       entries: { content: string; status: PlanEntryStatus }[];
+      markdown?: string;
     }
   | { kind: "status"; text: string };
 
@@ -179,6 +180,7 @@ export type MarketplaceInfo = {
   name: string;
   kind: string;
   url: string;
+  registeredSource?: string;
 };
 
 export type AvailablePluginInfo = {
@@ -440,6 +442,19 @@ export function extractUpdateTimestamp(
     }
   }
   return undefined;
+}
+
+export function planDocumentWasUpdatedForTurn(
+  modifiedAt: number | null | undefined,
+  turnStartedAt: number | null | undefined,
+): boolean {
+  return Boolean(
+    typeof modifiedAt === "number" &&
+      Number.isFinite(modifiedAt) &&
+      typeof turnStartedAt === "number" &&
+      Number.isFinite(turnStartedAt) &&
+      modifiedAt >= turnStartedAt,
+  );
 }
 
 export function isSpawnSubagentUpdate(update: Record<string, unknown>): boolean {

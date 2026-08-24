@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld("grok", {
     ipcRenderer.invoke("grok:forkThread", sessionId, cwd),
   sendPrompt: (sessionId: string, text: string, images?: { path: string; mimeType: string }[]) =>
     ipcRenderer.invoke("grok:sendPrompt", sessionId, text, images),
+  runningSessions: () => ipcRenderer.invoke("grok:runningSessions"),
   savePastedImage: (payload: { data: string; mimeType?: string }) =>
     ipcRenderer.invoke("grok:savePastedImage", payload),
   saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
@@ -72,6 +73,8 @@ contextBridge.exposeInMainWorld("grok", {
   openInEditor: (cwd: string, filePath?: string) =>
     ipcRenderer.invoke("grok:openInEditor", cwd, filePath),
   openPath: (target: string) => ipcRenderer.invoke("grok:openPath", target),
+  resolveImage: (input: { src: string; sessionId?: string; cwd?: string }) =>
+    ipcRenderer.invoke("grok:resolveImage", input),
   windowControl: (action: "min" | "max" | "close") =>
     ipcRenderer.invoke("grok:window", action),
   settings: (cwd?: string | null) => ipcRenderer.invoke("grok:settings", cwd),
@@ -128,6 +131,11 @@ contextBridge.exposeInMainWorld("grok", {
     const listener = (_event: unknown, payload: unknown) => cb(payload);
     ipcRenderer.on("grok:update", listener);
     return () => ipcRenderer.removeListener("grok:update", listener);
+  },
+  onRunState: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:run-state", listener);
+    return () => ipcRenderer.removeListener("grok:run-state", listener);
   },
   onPermission: (cb: (payload: unknown) => void) => {
     const listener = (_event: unknown, payload: unknown) => cb(payload);

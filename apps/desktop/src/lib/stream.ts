@@ -9,7 +9,7 @@ export type PlanEntryStatus =
 
 export type PlanEntry = { content: string; status: PlanEntryStatus };
 
-export type PlanRevision = { revision: number; entries: PlanEntry[] };
+export type PlanRevision = { revision: number; entries: PlanEntry[]; markdown?: string };
 
 export function latestPlan(items: StreamItem[]): PlanEntry[] {
   for (let i = items.length - 1; i >= 0; i--) {
@@ -26,8 +26,9 @@ export function planRevisions(items: StreamItem[]): PlanRevision[] {
     const last = revisions[revisions.length - 1];
     if (last && last.revision === item.revision) {
       last.entries = item.entries;
+      if (item.markdown) last.markdown = item.markdown;
     } else {
-      revisions.push({ revision: item.revision, entries: item.entries });
+      revisions.push({ revision: item.revision, entries: item.entries, markdown: item.markdown });
     }
   }
   return revisions;

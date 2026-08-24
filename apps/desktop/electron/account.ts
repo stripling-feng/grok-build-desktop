@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { net } from "electron";
 import { configPath, getDefaultModelDisplayName, setTableKey } from "./config";
 import { grokBin } from "./grok-bin";
 import { grokHome } from "./sessions";
@@ -215,7 +216,9 @@ function parseAuthFile(): {
   const oauth =
     asRecord(raw[OAUTH_SCOPE]) ||
     Object.entries(raw)
-      .filter(([k]) => /accounts\.x\.ai|sign-in|oauth/i.test(k))
+      // Grok CLI 1.0.5 stores OAuth credentials under
+      // `https://auth.x.ai::<principal-id>` instead of the legacy sign-in scope.
+      .filter(([k]) => /accounts\.x\.ai|auth\.x\.ai|sign-in|oauth/i.test(k))
       .map(([, v]) => asRecord(v))
       .find(Boolean);
 
@@ -265,6 +268,14 @@ function pickNumber(...values: unknown[]): number | undefined {
     if (typeof value === "number" && Number.isFinite(value)) return value;
     if (typeof value === "string" && value.trim() && !Number.isNaN(Number(value))) {
       return Number(value);
+    }
+    const object = asRecord(value);
+    if (object) {
+      const nested = object.val ?? object.value ?? object.amount;
+      if (typeof nested === "number" && Number.isFinite(nested)) return nested;
+      if (typeof nested === "string" && nested.trim() && !Number.isNaN(Number(nested))) {
+        return Number(nested);
+      }
     }
   }
   return undefined;
@@ -354,7 +365,7 @@ export function saveApiKey(input: ApiProviderInput): AccountInfo {
   return loadAccount();
 }
 
-export function clearApiKey(): AccountInfo {
+export function clearAccountCredentials(): AccountInfo {
   const file = configPath();
   if (fs.existsSync(file)) {
     let text = fs.readFileSync(file, "utf8");
@@ -372,8 +383,18 @@ export function clearApiKey(): AccountInfo {
   if (fs.existsSync(authFile)) {
     try {
       const prev = JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, unknown>;
-      if (prev[API_KEY_SCOPE]) {
-        prev[API_KEY_SCOPE] = { key: "" };
+      let changed = false;
+      for (const key of Object.keys(prev)) {
+        if (
+          key === API_KEY_SCOPE ||
+          key === OAUTH_SCOPE ||
+          /accounts\.x\.ai|auth\.x\.ai|sign-in|oauth/i.test(key)
+        ) {
+          delete prev[key];
+          changed = true;
+        }
+      }
+      if (changed) {
         fs.writeFileSync(authFile, `${JSON.stringify(prev, null, 2)}\n`, "utf8");
       }
     } catch {
@@ -612,27 +633,59 @@ function oauthToken(): string | null {
 }
 
 function usageFromPayload(payload: Record<string, unknown>): AccountUsage {
-  const current = asRecord(payload.currentPeriod) || payload;
+  // Grok CLI 1.0.5 wraps billing fields in `config`; older responses expose
+  // the same fields at the top level.
+  const config = asRecord(payload.config) || payload;
+  const current = asRecord(config.currentPeriod) || config;
   const percent = pickNumber(
     current.creditUsagePercent,
+    config.creditUsagePercent,
     payload.creditUsagePercent,
     current.usagePercent,
+    config.usagePercent,
   );
   const used = pickNumber(
     current.used,
     current.includedUsed,
     current.totalUsed,
+    config.used,
+    config.includedUsed,
+    config.totalUsed,
     payload.used,
   );
-  const limit = pickNumber(current.monthlyLimit, payload.monthlyLimit, current.limit);
-  const prepaid = pickNumber(current.prepaidBalance, payload.prepaidBalance);
-  const onDemandUsed = pickNumber(current.onDemandUsed, payload.onDemandUsed);
-  const onDemandCap = pickNumber(current.onDemandCap, payload.onDemandCap);
-  const tier = pickString(current.subscriptionTier, payload.subscriptionTier, payload.tier);
-  const start = formatDate(
-    pickString(current.billingPeriodStart, payload.billingPeriodStart),
+  const limit = pickNumber(
+    current.monthlyLimit,
+    config.monthlyLimit,
+    payload.monthlyLimit,
+    current.limit,
+    config.limit,
   );
-  const end = formatDate(pickString(current.billingPeriodEnd, payload.billingPeriodEnd));
+  const prepaid = pickNumber(current.prepaidBalance, config.prepaidBalance, payload.prepaidBalance);
+  const onDemandUsed = pickNumber(current.onDemandUsed, config.onDemandUsed, payload.onDemandUsed);
+  const onDemandCap = pickNumber(current.onDemandCap, config.onDemandCap, payload.onDemandCap);
+  const tier = pickString(
+    current.subscriptionTier,
+    config.subscriptionTier,
+    payload.subscriptionTier,
+    config.tier,
+    payload.tier,
+  );
+  const start = formatDate(
+    pickString(
+      current.billingPeriodStart,
+      current.start,
+      config.billingPeriodStart,
+      payload.billingPeriodStart,
+    ),
+  );
+  const end = formatDate(
+    pickString(
+      current.billingPeriodEnd,
+      current.end,
+      config.billingPeriodEnd,
+      payload.billingPeriodEnd,
+    ),
+  );
   const lines: string[] = [];
   if (tier) lines.push(`套餐：${tier}`);
   if (percent != null) lines.push(`本周期用量：${Math.round(percent)}%`);
@@ -674,7 +727,9 @@ export async function loadAccountUsage(): Promise<AccountUsage> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 8000);
   try {
-    const res = await fetch(url, {
+    // Electron's network stack follows the same system proxy as the renderer.
+    // Node's global fetch bypasses that proxy and hangs on restricted networks.
+    const res = await net.fetch(url, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${token}`,

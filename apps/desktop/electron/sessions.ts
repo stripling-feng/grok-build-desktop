@@ -4,11 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { inferProjectRoot, isScratchPath, isUnattachedThread } from "./projects";
 import { isDesktopWorktree } from "./paths";
+import { planEntriesFromMarkdown } from "./plan-document";
 import {
   applyUpdateToItems,
   extractContextUsage,
   extractUpdateTimestamp,
   mergeContextUsage,
+  planDocumentWasUpdatedForTurn,
   type ContextPart,
   type ContextUsage,
   type StreamItem,
@@ -285,6 +287,82 @@ export function removeThread(sessionId: string, cwd?: string): boolean {
   return true;
 }
 
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif"]);
+
+const IMAGE_MIME: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp",
+  ".svg": "image/svg+xml",
+  ".avif": "image/avif",
+};
+
+function isInside(root: string, target: string) {
+  const from = path.resolve(root);
+  const to = path.resolve(target);
+  const rel = path.relative(from, to);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function stripImageSrc(src: string) {
+  let raw = src.trim().replace(/[?#].*$/, "");
+  if (!raw.startsWith("file:")) {
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+  try {
+    raw = decodeURIComponent(new URL(raw).pathname);
+    if (process.platform === "win32" && /^\/[A-Za-z]:/.test(raw)) raw = raw.slice(1);
+  } catch {
+    raw = raw.replace(/^file:\/\//i, "");
+  }
+  return raw;
+}
+
+export function resolveChatImagePath(src: string, sessionId?: string, cwd?: string): string | null {
+  const raw = stripImageSrc(src);
+  if (!raw || /^(data:|https?:|blob:)/i.test(raw)) return null;
+  const session = sessionId ? findSessionDir(sessionId, cwd) : null;
+  const abs = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : session
+      ? path.resolve(session, raw)
+      : null;
+  if (!abs) return null;
+  if (!IMAGE_EXTS.has(path.extname(abs).toLowerCase())) return null;
+  const roots = [session, sessionsRoot(), path.join(os.tmpdir(), "grok-pasted")].filter(Boolean) as string[];
+  if (!roots.some((root) => isInside(root, abs))) return null;
+  try {
+    if (!fs.statSync(abs).isFile()) return null;
+  } catch {
+    return null;
+  }
+  return abs;
+}
+
+export function readChatImage(
+  src: string,
+  sessionId?: string,
+  cwd?: string,
+): { path: string; dataUrl: string } | null {
+  const file = resolveChatImagePath(src, sessionId, cwd);
+  if (!file) return null;
+  try {
+    const buf = fs.readFileSync(file);
+    if (buf.length > 16 * 1024 * 1024) return null;
+    const mime = IMAGE_MIME[path.extname(file).toLowerCase()] || "application/octet-stream";
+    return { path: file, dataUrl: `data:${mime};base64,${buf.toString("base64")}` };
+  } catch {
+    return null;
+  }
+}
+
 export function findSessionDir(sessionId: string, cwd?: string): string | null {
   const root = sessionsRoot();
   if (cwd) {
@@ -307,6 +385,37 @@ export function findSessionDir(sessionId: string, cwd?: string): string | null {
     }
   }
   return null;
+}
+
+export function readSessionPlanDocument(
+  sessionId: string,
+  cwd?: string,
+): { markdown: string; entries: { content: string; status: "pending" }[]; modifiedAt: number } | null {
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return null;
+  const file = path.join(dir, "plan.md");
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 512 * 1024) return null;
+    const markdown = fs.readFileSync(file, "utf8").trim();
+    if (!markdown) return null;
+    return { markdown, entries: planEntriesFromMarkdown(markdown), modifiedAt: stat.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+export function readSessionPlanEntries(
+  sessionId: string,
+  cwd?: string,
+): { content: string; status: "pending" }[] {
+  return readSessionPlanDocument(sessionId, cwd)?.entries ?? [];
+}
+
+function isAwaitingPlanApproval(dir: string | null): boolean {
+  if (!dir) return false;
+  const state = readJson(path.join(dir, "plan_mode.json"));
+  return state?.awaiting_plan_approval === true;
 }
 
 function searchTextFromValue(value: unknown): string {
@@ -520,10 +629,19 @@ function classifyHistoryChars(dir: string): ContextPart[] | undefined {
 export function loadTranscript(
   sessionId: string,
   cwd: string,
-): { items: StreamItem[]; contextUsed: number | null; contextUsage: ContextUsage | null } {
+): {
+  items: StreamItem[];
+  contextUsed: number | null;
+  contextUsage: ContextUsage | null;
+  planAwaiting: boolean;
+  planModifiedAt: number | null;
+} {
   const dir = findSessionDir(sessionId, cwd);
   const file = dir ? path.join(dir, "updates.jsonl") : "";
-  if (!file || !fs.existsSync(file)) return { items: [], contextUsed: null, contextUsage: null };
+  const planAwaiting = isAwaitingPlanApproval(dir);
+  if (!file || !fs.existsSync(file)) {
+    return { items: [], contextUsed: null, contextUsage: null, planAwaiting, planModifiedAt: null };
+  }
 
   const items: StreamItem[] = [];
   const tools = new Map<string, Extract<StreamItem, { kind: "tool" }>>();
@@ -531,7 +649,7 @@ export function loadTranscript(
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch {
-    return { items: [], contextUsed: null, contextUsage: null };
+    return { items: [], contextUsed: null, contextUsage: null, planAwaiting, planModifiedAt: null };
   }
 
   let contextUsage: ContextUsage | null = null;
@@ -558,9 +676,56 @@ export function loadTranscript(
   const parts = dir ? classifyHistoryChars(dir) : undefined;
   if (contextUsage && parts) contextUsage = { ...contextUsage, parts };
   else if (!contextUsage && parts) contextUsage = { used: null, parts };
+  const planDocument = readSessionPlanDocument(sessionId, cwd);
+  if (planDocument) {
+    let planIndex = -1;
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      if (items[i]?.kind === "plan") {
+        planIndex = i;
+        break;
+      }
+    }
+    if (planIndex >= 0) {
+      const previous = items[planIndex] as Extract<StreamItem, { kind: "plan" }>;
+      const enriched: Extract<StreamItem, { kind: "plan" }> = {
+        ...previous,
+        entries: planDocument.entries,
+        markdown: planDocument.markdown,
+      };
+      const hasNewerUserTurn = items
+        .slice(planIndex + 1)
+        .some((item) => item.kind === "user");
+      const latestNewerUserStartedAt = [...items]
+        .slice(planIndex + 1)
+        .reverse()
+        .find((item): item is Extract<StreamItem, { kind: "user" }> => item.kind === "user")
+        ?.startedAt;
+      if (
+        planAwaiting &&
+        hasNewerUserTurn &&
+        planDocumentWasUpdatedForTurn(planDocument.modifiedAt, latestNewerUserStartedAt)
+      ) {
+        items.push({
+          ...enriched,
+          revision: items.filter((item) => item.kind === "plan").length + 1,
+        });
+      } else {
+        items[planIndex] = enriched;
+      }
+    } else if (planAwaiting) {
+      items.push({
+        kind: "plan",
+        revision: 1,
+        entries: planDocument.entries,
+        markdown: planDocument.markdown,
+      });
+    }
+  }
   return {
     items: items.filter((item) => item.kind !== "thought" && item.kind !== "tool"),
     contextUsed: contextUsage?.used ?? null,
     contextUsage,
+    planAwaiting,
+    planModifiedAt: planDocument?.modifiedAt ?? null,
   };
 }

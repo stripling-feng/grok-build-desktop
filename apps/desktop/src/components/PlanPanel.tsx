@@ -1,17 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { normalizePlanStatus, type PlanEntryStatus } from "../../electron/shared";
 import type { PlanEntry, PlanRevision } from "../lib/stream";
-import { planFlowLabel, type PlanFlowPhase } from "../lib/plan-flow";
+import { planFlowLabel, type PlanActivity, type PlanFlowPhase } from "../lib/plan-flow";
 
 type Props = {
   open: boolean;
   revisions: PlanRevision[];
   phase: PlanFlowPhase;
+  activity: PlanActivity;
   error?: string;
   busy: boolean;
   onApprove: (revision: PlanRevision) => void;
   onReject: () => void;
-  onRevise: (note: string, revision: PlanRevision) => void;
   onRetry: () => void;
   onClose: () => void;
 };
@@ -27,15 +27,14 @@ export function PlanPanel({
   open,
   revisions,
   phase,
+  activity,
   error,
   busy,
   onApprove,
   onReject,
-  onRevise,
   onRetry,
   onClose,
 }: Props) {
-  const [note, setNote] = useState("");
   const [activeRevision, setActiveRevision] = useState<number | null>(null);
   const userPickedRef = useRef(false);
   const lastSeenRevisionRef = useRef<number | null>(null);
@@ -86,7 +85,7 @@ export function PlanPanel({
     <div className="plan-panel">
       <div className="plan-head">
         <span>
-          计划{latestRevision != null ? ` · 第 ${latestRevision} 版` : ""}
+          计划{latestRevision != null ? ` · 第 ${latestRevision} 份` : ""}
           <em className={`plan-phase ${phase}`}>{planFlowLabel(phase)}</em>
         </span>
         <div className="plan-actions">
@@ -115,15 +114,28 @@ export function PlanPanel({
                 }}
               >
                 <span className="dot" aria-hidden="true" />
-                第 {r.revision} 版
+                第 {r.revision} 份
               </button>
             );
           })}
         </div>
       ) : null}
+      <div className={`plan-progress ${activity.stage}`}>
+        <span className="plan-progress-dot" aria-hidden="true" />
+        <span className="plan-progress-copy">
+          <strong>{activity.label}</strong>
+          <small>{activity.detail}</small>
+        </span>
+      </div>
       <ol className="plan-list">
         {currentEntries.length === 0 ? (
-          <li className="plan-empty">正在生成计划…</li>
+          <li className="plan-empty">
+            {phase === "discussing"
+              ? "请在对话输入框中回答问题或继续补充要求。"
+              : phase === "failed"
+                ? "这次计划对话没有完成。"
+                : "正在分析需求；如有关键疑问，智能体会先在对话中提问。"}
+          </li>
         ) : (
           currentEntries.map((entry, i) => {
             const status: PlanEntryStatus = normalizePlanStatus(entry.status);
@@ -138,33 +150,14 @@ export function PlanPanel({
       </ol>
       {error ? <div className="plan-error">{error}</div> : null}
       <div className="plan-foot">
-        <form
-          className="plan-revise"
-          onSubmit={(e) => {
-            e.preventDefault();
-            const value = note.trim();
-            if (!value || !currentRevision) return;
-            onRevise(value, currentRevision);
-            setNote("");
-          }}
-        >
-          <input
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            placeholder="调整意见，例如：先别动 package.json"
-            disabled={busy || currentEntries.length === 0}
-          />
-          <button
-            className="btn small"
-            type="submit"
-            disabled={busy || currentEntries.length === 0 || !note.trim()}
-          >
-            重新计划
-          </button>
-        </form>
+        <div className="plan-chat-hint">
+          {currentEntries.length > 0
+            ? "要调整计划，直接在对话输入框中说明；确认后再开始执行。"
+            : "计划模式保持可对话，你可以继续回答或补充。"}
+        </div>
         <div className="plan-decide">
           <button className="btn small reject" type="button" onClick={onReject} disabled={busy}>
-            拒绝
+            放弃计划
           </button>
           {phase === "failed" && currentEntries.length === 0 ? (
             <button className="btn primary small" type="button" onClick={onRetry} disabled={busy}>
@@ -177,7 +170,7 @@ export function PlanPanel({
               onClick={() => currentRevision && onApprove(currentRevision)}
               disabled={busy || !currentRevision || currentEntries.length === 0}
             >
-              接受第 {currentRevision?.revision ?? "—"} 版并执行
+              开始执行第 {currentRevision?.revision ?? "—"} 份
             </button>
           )}
         </div>

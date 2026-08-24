@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppSettings,
   Automation,
@@ -9,7 +9,6 @@ import type {
   ProjectInfo,
 } from "../../electron/shared";
 import {
-  InstallForm,
   MarketForm,
   McpForm,
   McpTab,
@@ -58,11 +57,22 @@ export function MarketplacePage({
 }) {
   const [tab, setTab] = useState<MarketplaceTab>("market");
   const [mcpOpen, setMcpOpen] = useState(false);
-  const [installOpen, setInstallOpen] = useState(false);
   const [marketOpen, setMarketOpen] = useState(false);
   const [doctor, setDoctor] = useState("");
   const [available, setAvailable] = useState<AvailablePluginInfo[] | null>(null);
+  const marketLoadStarted = useRef(false);
   const { busy, error, run } = useWorkspaceActions();
+
+  async function refreshAvailable() {
+    const rows = await run("读取市场", () => window.grok.availablePlugins());
+    if (rows) setAvailable(rows);
+  }
+
+  useEffect(() => {
+    if (!settings || marketLoadStarted.current) return;
+    marketLoadStarted.current = true;
+    void refreshAvailable();
+  }, [settings]);
 
   if (!settings) {
     return (
@@ -100,8 +110,8 @@ export function MarketplacePage({
             settings={settings}
             cwd={cwd}
             available={available}
-            onAvailable={setAvailable}
-            onInstall={() => setInstallOpen(true)}
+            loading={busy === "读取市场"}
+            onRefresh={refreshAvailable}
             onMarket={() => setMarketOpen(true)}
             onChange={onChange}
             run={run}
@@ -133,24 +143,14 @@ export function MarketplacePage({
           run={run}
         />
       ) : null}
-      {installOpen ? (
-        <InstallForm
-          cwd={cwd}
-          onClose={() => setInstallOpen(false)}
-          onChange={(next) => {
-            onChange(next);
-            setInstallOpen(false);
-          }}
-          run={run}
-        />
-      ) : null}
       {marketOpen ? (
         <MarketForm
           cwd={cwd}
           onClose={() => setMarketOpen(false)}
-          onChange={(next) => {
+          onChange={async (next) => {
             onChange(next);
             setMarketOpen(false);
+            await refreshAvailable();
           }}
           run={run}
         />
