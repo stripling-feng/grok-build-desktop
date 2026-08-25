@@ -1,3 +1,9 @@
+<div align="center">
+  <a href="https://tcboys.de/">
+    <img src="docs/tcboys-banner.png" alt="天才少年中转站" width="100%">
+  </a>
+</div>
+
 > [!IMPORTANT]
 > ### 📣 广告推荐｜天才少年中转站
 > AI 服务中转站访问入口：**[https://tcboys.de/](https://tcboys.de/)**
