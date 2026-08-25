@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session as electronSession, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, session as electronSession, shell, Tray } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -15,11 +15,12 @@ import {
   threadBelongsToProject,
   unbindSession,
 } from "./projects";
-import { copySession, listThreads, loadTranscript, readChatImage, removeThread, renameThread, searchThreads, touchThreadActivity } from "./sessions";
+import { copySession, initializeThreadTitle, listThreads, loadTranscript, readChatImage, removeThread, renameThread, saveTurnFiles, searchThreads, touchThreadActivity } from "./sessions";
 import {
   applyWorktree,
   createWorktree,
   findGitRoot,
+  gitFilesChangedSince,
   gitCommit,
   gitDiscard,
   gitFileDiff,
@@ -27,6 +28,8 @@ import {
   gitStage,
   gitStatus,
   gitUnstage,
+  gitWorktreeSnapshot,
+  type GitWorktreeSnapshot,
 } from "./git";
 import {
   loadSettings,
@@ -65,7 +68,13 @@ import {
   type McpAddInput,
 } from "./grok-cli";
 import { ProjectTerminal } from "./terminal";
-import type { PermissionMode, ReasoningEffort } from "./shared";
+import { extractModifiedFilePaths, type PermissionMode, type ReasoningEffort } from "./shared";
+import {
+  FollowUpQueue,
+  type FollowUpImage,
+  type QueuedFollowUp,
+} from "./follow-ups";
+import { TurnCompletionTracker } from "./turn-completion";
 import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
 import { startGrokInstall, stopGrokInstall, type InstallLogLine } from "./install-cli";
 import { initLog, log, logsDir, pruneLogs } from "./log";
@@ -91,6 +100,15 @@ app.setName("Grok Build");
 const acp = new GrokAcpClient();
 const loadedSessions = new Set<string>();
 const runningSessions = new Set<string>();
+const followUps = new FollowUpQueue();
+const activePromptSessions = new Set<string>();
+const drainingFollowUps = new Set<string>();
+const steeredSessions = new Set<string>();
+const turnCompletions = new TurnCompletionTracker();
+const activeTurnFiles = new Map<
+  string,
+  { cwd: string; startedAt: number; reported: Set<string>; baseline: GitWorktreeSnapshot | null }
+>();
 const terminal = new ProjectTerminal();
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -181,6 +199,119 @@ function clearRunningSessions() {
   for (const sessionId of [...runningSessions]) setSessionRunning(sessionId, false);
 }
 
+function relativeTurnPath(cwd: string, candidate: string): string | null {
+  if (!cwd || !candidate.trim()) return null;
+  const root = path.resolve(cwd);
+  const full = path.resolve(root, candidate);
+  const relative = path.relative(root, full).replace(/\\/g, "/");
+  if (!relative || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) return null;
+  if (relative === ".git" || relative.startsWith(".git/")) return null;
+  return relative;
+}
+
+function recordTurnFile(sessionId: string, candidate: string) {
+  const turn = activeTurnFiles.get(sessionId);
+  if (!turn) return;
+  const relative = relativeTurnPath(turn.cwd, candidate);
+  if (relative) turn.reported.add(relative);
+}
+
+async function finishTurnFiles(sessionId: string, succeeded: boolean) {
+  const turn = activeTurnFiles.get(sessionId);
+  activeTurnFiles.delete(sessionId);
+  if (!turn || !succeeded) return;
+  let gitFiles: string[] = [];
+  try {
+    gitFiles = await gitFilesChangedSince(turn.cwd, turn.baseline);
+  } catch (err) {
+    log("turn file comparison failed", sessionId, err);
+  }
+  const files = [...new Set([...turn.reported, ...gitFiles])].sort((a, b) => a.localeCompare(b));
+  if (!files.length) return;
+  const payload = { sessionId, files };
+  saveTurnFiles(sessionId, turn.cwd, {
+    startedAt: turn.startedAt,
+    completedAt: Date.now(),
+    files,
+  });
+  send("grok:turn-files", payload);
+}
+
+function publishFollowUps(sessionId: string) {
+  send("grok:follow-up-state", { sessionId, entries: followUps.list(sessionId) });
+}
+
+async function executePromptTurn(
+  sessionId: string,
+  text: string,
+  images?: FollowUpImage[],
+): Promise<unknown> {
+  activePromptSessions.add(sessionId);
+  turnCompletions.start(sessionId);
+  const cwd =
+    acp.cwdForSession(sessionId) ||
+    listThreads().find((thread) => thread.id === sessionId)?.cwd ||
+    "";
+  let baseline: GitWorktreeSnapshot | null = null;
+  if (cwd) {
+    try {
+      baseline = await gitWorktreeSnapshot(cwd);
+    } catch (err) {
+      log("turn file baseline failed", sessionId, err);
+    }
+  }
+  activeTurnFiles.set(sessionId, {
+    cwd,
+    startedAt: Date.now(),
+    reported: new Set<string>(),
+    baseline,
+  });
+  let succeeded = false;
+  try {
+    const result = await acp.prompt(sessionId, text, images);
+    succeeded = true;
+    return result;
+  } finally {
+    await finishTurnFiles(sessionId, succeeded);
+    activePromptSessions.delete(sessionId);
+    steeredSessions.delete(sessionId);
+    if (succeeded) {
+      if (turnCompletions.settle(sessionId)) {
+        publishSessionTurnCompleted(sessionId, followUps.has(sessionId));
+      }
+    } else {
+      turnCompletions.abort(sessionId);
+    }
+  }
+}
+
+async function drainFollowUps(sessionId: string) {
+  if (activePromptSessions.has(sessionId) || drainingFollowUps.has(sessionId)) return;
+  drainingFollowUps.add(sessionId);
+  setSessionRunning(sessionId, true);
+  try {
+    while (!activePromptSessions.has(sessionId)) {
+      const entry = followUps.take(sessionId);
+      if (!entry) break;
+      publishFollowUps(sessionId);
+      send("grok:follow-up-started", { entry, delivery: "queued" });
+      try {
+        await executePromptTurn(sessionId, entry.text, entry.images);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log("queued follow-up failed", sessionId, err);
+        send("grok:follow-up-error", { entry, message });
+        break;
+      }
+    }
+  } finally {
+    drainingFollowUps.delete(sessionId);
+    if (!activePromptSessions.has(sessionId) && !steeredSessions.has(sessionId)) {
+      setSessionRunning(sessionId, false);
+    }
+  }
+}
+
 function appIconPath() {
   return path.join(__dirname, "..", "build", "icon-rounded.ico");
 }
@@ -193,6 +324,41 @@ function showMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+}
+
+function notifySessionCompleted(sessionId: string, title?: string) {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({
+    title: "会话已完成",
+    body: title ? `“${title}”已完成` : `会话 ${sessionId.slice(0, 8)} 已完成`,
+    icon: appIconPath(),
+  });
+  notification.on("click", showMainWindow);
+  notification.show();
+}
+
+function publishSessionTurnCompleted(
+  sessionId: string,
+  runContinues: boolean,
+  payload: {
+    sessionId: string;
+    update: Record<string, unknown>;
+    method?: string;
+    meta?: Record<string, unknown>;
+  } = { sessionId, update: { sessionUpdate: "turn_completed" } },
+) {
+  send("grok:update", runContinues ? { ...payload, runContinues: true } : payload);
+  if (!runContinues) setSessionRunning(sessionId, false);
+  touchThreadActivity(sessionId);
+  invalidateWorkspace();
+  const completedWorkspace = workspace();
+  send("grok:workspace", completedWorkspace);
+  if (!runContinues) {
+    notifySessionCompleted(
+      sessionId,
+      completedWorkspace.threads.find((thread) => thread.id === sessionId)?.title,
+    );
+  }
 }
 
 function recoverMainWindow() {
@@ -288,21 +454,27 @@ function createWindow() {
 }
 
 acp.on("update", (payload) => {
-  // Completion is the renderer's authoritative signal to stop showing a busy
-  // session. Deliver it before best-effort workspace bookkeeping so a refresh
-  // failure cannot leave the UI spinning forever.
-  send("grok:update", payload);
-  if (String(payload.update?.sessionUpdate ?? "") === "turn_completed") {
-    setSessionRunning(payload.sessionId, false);
-    touchThreadActivity(payload.sessionId);
-    invalidateWorkspace();
-    send("grok:workspace", workspace());
+  for (const filePath of extractModifiedFilePaths(payload.update)) {
+    recordTurnFile(payload.sessionId, filePath);
   }
+  const turnCompleted = String(payload.update?.sessionUpdate ?? "") === "turn_completed";
+  if (turnCompleted) {
+    if (!turnCompletions.acceptLive(payload.sessionId)) return;
+    steeredSessions.delete(payload.sessionId);
+    publishSessionTurnCompleted(payload.sessionId, followUps.has(payload.sessionId), payload);
+    return;
+  }
+  send("grok:update", payload);
+});
+acp.on("fileWrite", (payload: { sessionId: string; path: string }) => {
+  recordTurnFile(payload.sessionId, payload.path);
 });
 acp.on("permission", (payload) => send("grok:permission", payload));
 acp.on("status", (payload) => {
   if (!payload.connected) {
     loadedSessions.clear();
+    steeredSessions.clear();
+    turnCompletions.clear();
     clearRunningSessions();
   }
   send("grok:agent-status", payload);
@@ -627,7 +799,7 @@ ipcMain.handle("grok:addProject", async () => {
   return addProject(gitRoot || cwd, gitRoot);
 });
 
-ipcMain.handle("grok:newThread", async (_e, cwd?: string | null, worktree?: boolean) => {
+ipcMain.handle("grok:newThread", async (_e, cwd?: string | null, worktree?: boolean, initialPrompt?: string) => {
   const unattached = !cwd;
   const projectCwd = unattached ? scratchCwd() : cwd;
   const gitRoot = unattached ? null : await findGitRoot(projectCwd);
@@ -646,12 +818,13 @@ ipcMain.handle("grok:newThread", async (_e, cwd?: string | null, worktree?: bool
   loadedSessions.add(sessionId);
   if (unattached) bindSessionToProject(sessionId, "");
   else bindSessionToProject(sessionId, projectCwd);
+  const title = initializeThreadTitle(sessionId, threadCwd, initialPrompt || "");
   invalidateWorkspace();
   return {
     sessionId,
     cwd: threadCwd,
     projectCwd: unattached ? "" : projectCwd,
-    title: "新会话",
+    title,
     worktree: worktreeMeta,
     projectName: unattached ? "对话" : projectName(projectCwd),
     unattached,
@@ -727,20 +900,65 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
   return { sessionId, cwd };
 });
 
-ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: { path: string; mimeType: string }[]) => {
+ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: FollowUpImage[]) => {
   setSessionRunning(sessionId, true);
   try {
-    return await acp.prompt(sessionId, text, images);
+    return await executePromptTurn(sessionId, text, images);
   } catch (err) {
     log("sendPrompt failed", sessionId, err);
     throw err;
   } finally {
-    // Some Grok versions do not forward the persisted `turn_completed` event.
-    // The prompt request settling is the authoritative fallback completion.
-    setSessionRunning(sessionId, false);
+    if (followUps.has(sessionId)) void drainFollowUps(sessionId);
+    else if (!steeredSessions.has(sessionId)) {
+      // Some Grok versions do not forward the persisted `turn_completed` event.
+      // The prompt request settling is the authoritative fallback completion.
+      setSessionRunning(sessionId, false);
+    }
   }
 });
 ipcMain.handle("grok:runningSessions", () => [...runningSessions]);
+ipcMain.handle(
+  "grok:queueFollowUp",
+  (_e, sessionId: string, text: string, images?: FollowUpImage[]) => {
+    if (!sessionId || (!text.trim() && !images?.length)) throw new Error("没有可排队的内容");
+    const entry = followUps.create(sessionId, text, images);
+    followUps.enqueue(entry);
+    publishFollowUps(sessionId);
+    return { delivery: "queued", entry };
+  },
+);
+ipcMain.handle("grok:promoteFollowUp", async (_e, sessionId: string) => {
+  const entry = followUps.take(sessionId);
+  if (!entry) return null;
+  if (!activePromptSessions.has(sessionId)) {
+    followUps.prepend(entry);
+    publishFollowUps(sessionId);
+    return { delivery: "queued", entry, fallback: true };
+  }
+  publishFollowUps(sessionId);
+  try {
+    const result = await acp.interject(sessionId, entry.text, entry.images);
+    if (result === "unsupported") {
+      followUps.prepend(entry);
+      publishFollowUps(sessionId);
+      return { delivery: "queued", entry, fallback: true };
+    }
+    steeredSessions.add(sessionId);
+    setSessionRunning(sessionId, true);
+    send("grok:follow-up-started", { entry, delivery: "steered" });
+    return { delivery: "steered", entry };
+  } catch (err) {
+    followUps.prepend(entry);
+    publishFollowUps(sessionId);
+    throw err;
+  }
+});
+ipcMain.handle("grok:removeFollowUp", (_e, sessionId: string, entryId: string) => {
+  const removed = followUps.remove(sessionId, entryId);
+  if (removed) publishFollowUps(sessionId);
+  return removed;
+});
+ipcMain.handle("grok:queuedFollowUps", (_e, sessionId?: string) => followUps.list(sessionId));
 ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeType?: string }) => {
   const mime = (payload?.mimeType || "image/png").toLowerCase();
   const ext = mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : mime.includes("webp") ? "webp" : mime.includes("gif") ? "gif" : "png";
@@ -785,8 +1003,12 @@ ipcMain.handle("grok:getGoal", (_e, cwd: string) => getGoal(cwd));
 ipcMain.handle("grok:setGoal", (_e, cwd: string, text: string) => setGoal(cwd, text));
 
 ipcMain.handle("grok:cancel", (_e, sessionId: string) => {
+  const cleared = followUps.clear(sessionId);
+  if (cleared.length) publishFollowUps(sessionId);
+  steeredSessions.delete(sessionId);
   acp.cancel(sessionId);
   setSessionRunning(sessionId, false);
+  return cleared;
 });
 
 ipcMain.handle("grok:respondPermission", (_e, requestId: string, optionId: string) => {

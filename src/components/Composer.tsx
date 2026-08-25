@@ -8,6 +8,7 @@ import type {
   ProjectInfo,
   ReasoningEffort,
 } from "../../electron/shared";
+import type { QueuedFollowUp } from "../../electron/follow-ups";
 import { permissionOptionLabel } from "../lib/i18n";
 
 type Props = {
@@ -21,6 +22,7 @@ type Props = {
   planMode: boolean;
   goal: string;
   attachments: string[];
+  queuedFollowUps: QueuedFollowUp[];
   settings: AppSettings | null;
   contextUsed?: number | null;
   contextUsage?: ContextUsage | null;
@@ -31,6 +33,7 @@ type Props = {
   onPlanMode: (on: boolean) => void;
   onGoal: (text: string) => void;
   onAttachments: (paths: string[]) => void;
+  onRemoveFollowUp: (entryId: string) => void;
   onPermissionMode: (mode: PermissionMode) => void;
   onModel: (id: string) => void;
   onReasoningEffort: (effort: ReasoningEffort) => void;
@@ -387,6 +390,7 @@ export function Composer({
   planMode,
   goal,
   attachments,
+  queuedFollowUps,
   settings,
   contextUsed,
   contextUsage,
@@ -397,6 +401,7 @@ export function Composer({
   onPlanMode,
   onGoal,
   onAttachments,
+  onRemoveFollowUp,
   onPermissionMode,
   onModel,
   onReasoningEffort,
@@ -593,6 +598,24 @@ export function Composer({
           </div>
         </div>
       ) : null}
+      {queuedFollowUps.length ? (
+        <div className="follow-up-queue" aria-live="polite">
+          <div className="follow-up-queue-head">
+            <span>已排队 {queuedFollowUps.length} 条</span>
+            {busy ? <em>再次点发送，立即调整当前任务</em> : <em>等待当前任务继续</em>}
+          </div>
+          {queuedFollowUps.map((entry) => (
+            <div className="follow-up-row" key={entry.id}>
+              <span title={entry.text || `图片 ×${entry.images.length}`}>
+                {entry.text.trim() || `图片 ×${entry.images.length}`}
+              </span>
+              <button type="button" onClick={() => onRemoveFollowUp(entry.id)} aria-label="移除排队消息">
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className="composer-stack" ref={box}>
         {menuOpen ? (
           <div className="add-menu">
@@ -738,7 +761,15 @@ export function Composer({
             ref={ref}
             value={value}
             disabled={disabled}
-            placeholder={awaitingAnswer ? "请在这里回答上方的问题…" : "随心输入，输入 / 可调用技能"}
+            placeholder={
+              awaitingAnswer
+                ? "请在这里回答上方的问题…"
+                : busy && queuedFollowUps.length
+                  ? "再次点发送，立即调整当前任务"
+                  : busy
+                    ? "输入后续要求，发送后先排队"
+                    : "随心输入，输入 / 可调用技能"
+            }
             aria-label={awaitingAnswer ? "回答 Grok 的问题" : "消息输入框"}
             onChange={(e) => onChange(e.target.value)}
             onPaste={(e) => {
@@ -768,8 +799,7 @@ export function Composer({
               }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                if (busy) onStop();
-                else onSend();
+                onSend();
               }
             }}
           />
@@ -925,9 +955,21 @@ export function Composer({
                 ) : null}
               </div>
               {busy ? (
-                <button className="send-round stop" type="button" onClick={onStop} aria-label="停止">
-                  ■
-                </button>
+                <>
+                  <button className="send-round stop" type="button" onClick={onStop} aria-label="停止">
+                    ■
+                  </button>
+                  <button
+                    className="send-round follow-up-send"
+                    type="button"
+                    disabled={disabled || (!value.trim() && !attachments.length && !queuedFollowUps.length)}
+                    onClick={onSend}
+                    aria-label={value.trim() || attachments.length ? "加入队列" : "调整当前任务"}
+                    title={value.trim() || attachments.length ? "先加入队列" : "立即调整当前任务"}
+                  >
+                    <IconSend />
+                  </button>
+                </>
               ) : (
                 <button
                   className="send-round"

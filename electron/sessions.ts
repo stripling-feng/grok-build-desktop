@@ -6,6 +6,11 @@ import { inferProjectRoot, isScratchPath, isUnattachedThread } from "./projects"
 import { isDesktopWorktree } from "./paths";
 import { planEntriesFromMarkdown } from "./plan-document";
 import {
+  isPlaceholderThreadTitle,
+  threadTitleForDisplay,
+  threadTitleFromPrompt,
+} from "../src/lib/thread-title";
+import {
   applyUpdateToItems,
   extractContextUsage,
   extractUpdateTimestamp,
@@ -52,6 +57,35 @@ function titleFromSummary(raw: Record<string, unknown>): string {
     (raw.session_summary as string) ||
     "未命名会话"
   );
+}
+
+function initialTitlePath(dir: string): string {
+  return path.join(dir, ".desktop-title");
+}
+
+function readInitialTitle(dir: string): string {
+  try {
+    return fs.readFileSync(initialTitlePath(dir), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+export function initializeThreadTitle(sessionId: string, cwd: string, prompt: string): string {
+  const suggested = threadTitleFromPrompt(prompt);
+  if (!suggested) return "新会话";
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return suggested;
+  const summaryPath = path.join(dir, "summary.json");
+  const raw = readJson(summaryPath);
+  const current = raw ? titleFromSummary(raw) : "新会话";
+  if (raw && (raw.title_is_manual || !isPlaceholderThreadTitle(current))) return current;
+  try {
+    fs.writeFileSync(initialTitlePath(dir), suggested, "utf8");
+    return suggested;
+  } catch {
+    return current;
+  }
 }
 
 function isLatinTitle(title: string): boolean {
@@ -120,7 +154,8 @@ function chineseTitleFromPrompt(prompt: string): string {
 }
 
 function localizeTitle(dir: string, raw: Record<string, unknown>): string {
-  const current = titleFromSummary(raw);
+  const summaryTitle = titleFromSummary(raw);
+  const current = threadTitleForDisplay(summaryTitle, readInitialTitle(dir));
   if (raw.title_is_manual) return current;
   if (!isLatinTitle(current)) return current;
   const next = chineseTitleFromPrompt(firstUserQuery(dir));
@@ -385,6 +420,110 @@ export function findSessionDir(sessionId: string, cwd?: string): string | null {
     }
   }
   return null;
+}
+
+export type TurnFilesRecord = {
+  startedAt: number;
+  completedAt: number;
+  files: string[];
+};
+
+function turnFilesPath(dir: string): string {
+  return path.join(dir, ".desktop-turn-files.json");
+}
+
+function readTurnFiles(sessionId: string, cwd?: string): TurnFilesRecord[] {
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(turnFilesPath(dir), "utf8"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((row): row is TurnFilesRecord =>
+        Boolean(
+          row &&
+          typeof row.startedAt === "number" &&
+          typeof row.completedAt === "number" &&
+          Array.isArray(row.files),
+        ),
+      )
+      .map((row) => ({
+        startedAt: row.startedAt,
+        completedAt: row.completedAt,
+        files: [...new Set(row.files.filter((file): file is string => typeof file === "string" && Boolean(file)))],
+      }))
+      .filter((row) => row.files.length > 0)
+      .sort((a, b) => a.startedAt - b.startedAt);
+  } catch {
+    return [];
+  }
+}
+
+export function saveTurnFiles(sessionId: string, cwd: string, record: TurnFilesRecord): void {
+  if (!record.files.length) return;
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return;
+  const records = readTurnFiles(sessionId, cwd).filter((row) => row.startedAt !== record.startedAt);
+  records.push({
+    ...record,
+    files: [...new Set(record.files.map((file) => file.replace(/\\/g, "/")))].sort((a, b) => a.localeCompare(b)),
+  });
+  records.sort((a, b) => a.startedAt - b.startedAt);
+  const target = turnFilesPath(dir);
+  const temporary = `${target}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(records.slice(-200), null, 2), "utf8");
+    fs.renameSync(temporary, target);
+  } catch {
+    try {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    } catch {
+      /* persistence is best effort */
+    }
+  }
+}
+
+function attachTurnFiles(items: StreamItem[], records: TurnFilesRecord[]): StreamItem[] {
+  if (!records.length) return items;
+  const userIndexes = items
+    .map((item, index) => ({ item, index }))
+    .filter((row): row is { item: Extract<StreamItem, { kind: "user" }>; index: number } => row.item.kind === "user");
+  if (!userIndexes.length) return items;
+
+  const assigned = new Set<number>();
+  const filesByUser = new Map<number, Set<string>>();
+  const fallback = userIndexes.slice(-records.length);
+  records.forEach((record, recordIndex) => {
+    let best: { index: number; distance: number } | null = null;
+    for (const user of userIndexes) {
+      if (assigned.has(user.index) || typeof user.item.startedAt !== "number") continue;
+      const distance = Math.abs(user.item.startedAt - record.startedAt);
+      if (distance <= 5 * 60_000 && (!best || distance < best.distance)) {
+        best = { index: user.index, distance };
+      }
+    }
+    const userIndex = best?.index ?? fallback[recordIndex]?.index;
+    if (userIndex == null || assigned.has(userIndex)) return;
+    assigned.add(userIndex);
+    filesByUser.set(userIndex, new Set(record.files));
+  });
+  if (!filesByUser.size) return items;
+
+  const result: StreamItem[] = [];
+  let currentUser = -1;
+  const flushFiles = () => {
+    const files = filesByUser.get(currentUser);
+    if (files?.size) result.push({ kind: "changes", files: [...files] });
+  };
+  items.forEach((item, index) => {
+    if (item.kind === "user") {
+      flushFiles();
+      currentUser = index;
+    }
+    result.push(item);
+  });
+  flushFiles();
+  return result;
 }
 
 export function readSessionPlanDocument(
@@ -721,8 +860,9 @@ export function loadTranscript(
       });
     }
   }
+  const restoredItems = attachTurnFiles(items, readTurnFiles(sessionId, cwd));
   return {
-    items: items.filter((item) => item.kind !== "thought" && item.kind !== "tool"),
+    items: restoredItems.filter((item) => item.kind !== "thought" && item.kind !== "tool"),
     contextUsed: contextUsage?.used ?? null,
     contextUsage,
     planAwaiting,

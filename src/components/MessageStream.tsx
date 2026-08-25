@@ -4,7 +4,7 @@ import grokLogo from "../assets/grok-logo.jpg";
 import { Markdown } from "../lib/markdown";
 import { toolStatusLabel } from "../lib/i18n";
 import { planFlowLabel, type PlanActivity, type PlanFlowPhase } from "../lib/plan-flow";
-import type { PlanRevision } from "../lib/stream";
+import { isPlanDocument, type PlanRevision } from "../lib/stream";
 
 type UserItem = Extract<StreamItem, { kind: "user" }>;
 type ThoughtItem = Extract<StreamItem, { kind: "thought" }>;
@@ -228,6 +228,40 @@ function PlanConsoleStatus({ planConsole }: { planConsole: PlanConsole }) {
   );
 }
 
+function TurnChangesCard({
+  files,
+  onOpenFile,
+}: {
+  files: string[];
+  onOpenFile?: (path: string) => void;
+}) {
+  return (
+    <section className="turn-changes" aria-label={`本次修改 ${files.length} 个文件`}>
+      <div className="turn-changes-head">
+        <span>本次修改</span>
+        <span>{files.length} 个文件</span>
+      </div>
+      <div className="turn-changes-list">
+        {files.map((filePath) => (
+          <button
+            key={filePath}
+            type="button"
+            title={filePath}
+            disabled={!onOpenFile}
+            onClick={() => onOpenFile?.(filePath)}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3.5 1.75h5l4 4v8.5h-9z" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              <path d="M8.5 1.75v4h4" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+            </svg>
+            <span>{filePath}</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function RestItem({
   item,
   onOpenFile,
@@ -256,18 +290,19 @@ function RestItem({
     );
   }
   if (item.kind === "plan") {
-    if (!item.markdown && item.entries.length === 0) return null;
-    const markdown =
-      item.markdown ?? item.entries.map((entry, index) => `${index + 1}. ${entry.content}`).join("\n");
+    if (!isPlanDocument(item)) return null;
     return (
       <PlanDocumentCard
-        plan={{ revision: planNumber ?? item.revision, entries: item.entries, markdown }}
+        plan={{ revision: planNumber ?? item.revision, entries: item.entries, markdown: item.markdown }}
         planConsole={planConsole}
         sessionId={sessionId}
         cwd={cwd}
         onOpenPlan={onOpenPlan}
       />
     );
+  }
+  if (item.kind === "changes") {
+    return <TurnChangesCard files={item.files} onOpenFile={onOpenFile} />;
   }
   if (item.kind === "tool") {
     return <ToolCard item={item} onOpenFile={onOpenFile} />;
@@ -338,10 +373,10 @@ export function MessageStream({
   const turns = groupTurns(items);
   const latestPlanDocument = [...items]
     .reverse()
-    .find((item): item is Extract<StreamItem, { kind: "plan" }> => item.kind === "plan" && Boolean(item.markdown));
+    .find(isPlanDocument);
   const planNumbers = new Map<StreamItem, number>();
   for (const item of items) {
-    if (item.kind === "plan" && (item.markdown || item.entries.length > 0)) {
+    if (isPlanDocument(item)) {
       planNumbers.set(item, planNumbers.size + 1);
     }
   }

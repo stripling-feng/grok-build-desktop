@@ -1,4 +1,5 @@
 export type SessionRunState = { sessionId: string; running: boolean };
+export type SessionUnreadState = { sessionId: string; unread: boolean };
 
 export function updateRunningSessionIds(
   current: ReadonlySet<string>,
@@ -7,6 +8,17 @@ export function updateRunningSessionIds(
   const next = new Set(current);
   if (!state.sessionId) return next;
   if (state.running) next.add(state.sessionId);
+  else next.delete(state.sessionId);
+  return next;
+}
+
+export function updateUnreadSessionIds(
+  current: ReadonlySet<string>,
+  state: SessionUnreadState,
+): Set<string> {
+  const next = new Set(current);
+  if (!state.sessionId) return next;
+  if (state.unread) next.add(state.sessionId);
   else next.delete(state.sessionId);
   return next;
 }

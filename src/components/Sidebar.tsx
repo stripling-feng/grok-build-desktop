@@ -7,6 +7,7 @@ import type {
   ThreadInfo,
   ThreadSearchResult,
 } from "../../electron/shared";
+import { relativeTime } from "../lib/i18n";
 
 type Props = {
   projects: ProjectInfo[];
@@ -14,6 +15,7 @@ type Props = {
   selectedProjectCwd: string | null;
   activeId: string | null;
   runningIds: Set<string>;
+  unreadIds: Set<string>;
   grokLabel: string;
   account: AccountInfo | null;
   onOpenProject: () => void;
@@ -46,6 +48,20 @@ function same(a: string, b: string) {
   return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
 }
 
+function ThreadActivityTime({ updatedAt }: { updatedAt: string }) {
+  const label = relativeTime(updatedAt);
+  if (!label) return null;
+  const timestamp = new Date(updatedAt);
+  const title = Number.isNaN(timestamp.getTime())
+    ? undefined
+    : `最近对话：${timestamp.toLocaleString("zh-CN", { hour12: false })}`;
+  return (
+    <time className="thread-time" dateTime={updatedAt} title={title}>
+      {label}
+    </time>
+  );
+}
+
 function Icon({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
     <svg className={className} width="16" height="16" viewBox="0 0 16 16" aria-hidden>
@@ -63,20 +79,6 @@ function FolderIcon() {
         strokeWidth="1.3"
         strokeLinejoin="round"
         d="M2.2 4.2A1.4 1.4 0 0 1 3.6 2.8h2.6c.3 0 .6.12.8.34l.7.76c.2.22.5.34.8.34h3.9A1.4 1.4 0 0 1 14 5.64v6.76A1.4 1.4 0 0 1 12.6 13.8h-9A1.4 1.4 0 0 1 2.2 12.4V4.2z"
-      />
-    </Icon>
-  );
-}
-
-function ChatIcon() {
-  return (
-    <Icon className="row-icon chat-icon">
-      <path
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.3"
-        strokeLinejoin="round"
-        d="M3.2 3.4h9.6A1.4 1.4 0 0 1 14.2 4.8v5.2A1.4 1.4 0 0 1 12.8 11.4H8.2L4.4 13.8V11.4H3.2A1.4 1.4 0 0 1 1.8 10V4.8A1.4 1.4 0 0 1 3.2 3.4z"
       />
     </Icon>
   );
@@ -522,6 +524,7 @@ export function Sidebar({
   selectedProjectCwd,
   activeId,
   runningIds,
+  unreadIds,
   grokLabel,
   account,
   onOpenProject,
@@ -565,9 +568,15 @@ export function Sidebar({
   const [searchLoading, setSearchLoading] = useState(false);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [rename, setRename] = useState<RenameState | null>(null);
+  const [, setTimeTick] = useState(0);
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTimeTick((tick) => tick + 1), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const accountTriggerRef = useRef<HTMLDivElement>(null);
   const usageRequestRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -892,7 +901,6 @@ export function Sidebar({
               {list.map((t) =>
                 rename?.kind === "thread" && rename.id === t.id ? (
                   <div key={t.id} className="thread renaming">
-                    <ChatIcon />
                     <input
                       ref={renameRef}
                       className="rename-input"
@@ -914,8 +922,9 @@ export function Sidebar({
                   <button
                     key={t.id}
                     type="button"
-                    className={`thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}`}
+                    className={`thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
                     title={t.title}
+                    aria-label={`${t.title}${unreadIds.has(t.id) ? "，未读" : ""}`}
                     onClick={() => onSelectThread(t)}
                     onContextMenu={(e) => {
                       e.preventDefault();
@@ -924,8 +933,9 @@ export function Sidebar({
                       openMenu({ kind: "thread", thread: t, x: e.clientX, y: e.clientY }, 128);
                     }}
                   >
-                    {runningIds.has(t.id) ? <SpinnerIcon className="thread-spinner" /> : <ChatIcon />}
                     <span className="thread-name">{t.title}</span>
+                    {unreadIds.has(t.id) ? <span className="thread-unread" title="未读" aria-label="未读" /> : null}
+                    <ThreadActivityTime updatedAt={t.updatedAt} />
                   </button>
                 ),
               )}
@@ -944,7 +954,6 @@ export function Sidebar({
           {chatThreads.map((t) =>
             rename?.kind === "thread" && rename.id === t.id ? (
               <div key={t.id} className="thread chat-thread renaming">
-                <ChatIcon />
                 <input
                   ref={renameRef}
                   className="rename-input"
@@ -966,8 +975,9 @@ export function Sidebar({
               <button
                 key={t.id}
                 type="button"
-                className={`thread chat-thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}`}
+                className={`thread chat-thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
                 title={t.title}
+                aria-label={`${t.title}${unreadIds.has(t.id) ? "，未读" : ""}`}
                 onClick={() => onSelectThread(t)}
                 onContextMenu={(e) => {
                   e.preventDefault();
@@ -976,8 +986,9 @@ export function Sidebar({
                   openMenu({ kind: "thread", thread: t, x: e.clientX, y: e.clientY }, 88);
                 }}
               >
-                <ChatIcon />
                 <span className="thread-name">{t.title}</span>
+                {unreadIds.has(t.id) ? <span className="thread-unread" title="未读" aria-label="未读" /> : null}
+                <ThreadActivityTime updatedAt={t.updatedAt} />
               </button>
             ),
           )}

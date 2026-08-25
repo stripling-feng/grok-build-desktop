@@ -3,11 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { GitFile, GitStatus } from "./shared";
 import { grokHome } from "./sessions";
 
 const execFileAsync = promisify(execFile);
+
+export type GitWorktreeSnapshot = {
+  root: string | null;
+  head: string | null;
+  files: Record<string, string>;
+};
 
 async function git(
   args: string[],
@@ -84,6 +90,68 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
     removed: counts.removed,
     files,
   };
+}
+
+function snapshotFingerprint(root: string, file: GitFile): string {
+  const full = assertInside(root, file.path);
+  const prefix = `${file.status}:${file.staged ? "staged" : "unstaged"}`;
+  try {
+    const stat = fs.lstatSync(full);
+    if (stat.isSymbolicLink()) {
+      return `${prefix}:link:${fs.readlinkSync(full)}`;
+    }
+    if (!stat.isFile()) return `${prefix}:other:${stat.size}:${stat.mtimeMs}`;
+    if (stat.size > 16 * 1024 * 1024) {
+      return `${prefix}:large:${stat.size}:${stat.mtimeMs}`;
+    }
+    const digest = createHash("sha256").update(fs.readFileSync(full)).digest("hex");
+    return `${prefix}:file:${digest}`;
+  } catch {
+    return `${prefix}:missing`;
+  }
+}
+
+/** Capture the net Git-visible workspace state so one prompt can be compared
+ * with the next state without confusing pre-existing dirty files for new work. */
+export async function gitWorktreeSnapshot(cwd: string): Promise<GitWorktreeSnapshot> {
+  const root = await findGitRoot(cwd);
+  if (!root) return { root: null, head: null, files: {} };
+  const [headResult, statusResult] = await Promise.all([
+    git(["rev-parse", "HEAD"], root),
+    git(["status", "--porcelain=v1", "-uall"], root),
+  ]);
+  const files: Record<string, string> = {};
+  for (const file of parsePorcelain(statusResult.stdout)) {
+    files[file.path] = snapshotFingerprint(root, file);
+  }
+  return {
+    root,
+    head: headResult.ok ? headResult.stdout.trim() || null : null,
+    files,
+  };
+}
+
+export async function gitFilesChangedSince(
+  cwd: string,
+  before: GitWorktreeSnapshot | null,
+): Promise<string[]> {
+  if (!before?.root) return [];
+  const after = await gitWorktreeSnapshot(cwd);
+  if (!after.root || path.resolve(after.root) !== path.resolve(before.root)) return [];
+
+  const changed = new Set<string>();
+  for (const filePath of new Set([...Object.keys(before.files), ...Object.keys(after.files)])) {
+    if (before.files[filePath] !== after.files[filePath]) changed.add(filePath);
+  }
+  if (before.head && after.head && before.head !== after.head) {
+    const committed = await git(["diff", "--name-only", "-z", before.head, after.head], after.root);
+    if (committed.ok) {
+      for (const filePath of committed.stdout.split("\0")) {
+        if (filePath) changed.add(filePath.replace(/\\/g, "/"));
+      }
+    }
+  }
+  return [...changed].sort((a, b) => a.localeCompare(b));
 }
 
 function parseNumstat(

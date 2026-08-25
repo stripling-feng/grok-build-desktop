@@ -1,6 +1,6 @@
 {
   "name": "grok-build-desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Grok Build 桌面端：通过 ACP 调用本机 grok CLI 的 Electron 界面",
   "author": "Grok Build Desktop",
@@ -18,6 +18,7 @@
   "build": {
     "appId": "ai.x.grok.build.desktop",
     "productName": "Grok Build",
+    "afterPack": "scripts/after-pack.cjs",
     "directories": {
       "output": "release"
     },
@@ -70,6 +71,7 @@
     "electron": "^36.2.1",
     "electron-builder": "^26.0.12",
     "esbuild": "^0.25.3",
+    "resedit": "^3.0.2",
     "typescript": "^5.8.3",
     "vite": "^6.3.4",
     "wait-on": "^8.0.3"

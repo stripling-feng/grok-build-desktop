@@ -35,8 +35,8 @@ contextBridge.exposeInMainWorld("grok", {
   searchThreads: (query: string) => ipcRenderer.invoke("grok:searchThreads", query),
   loadTranscript: (sessionId: string, cwd: string) =>
     ipcRenderer.invoke("grok:loadTranscript", sessionId, cwd),
-  newThread: (cwd?: string | null, worktree?: boolean) =>
-    ipcRenderer.invoke("grok:newThread", cwd ?? null, Boolean(worktree)),
+  newThread: (cwd?: string | null, worktree?: boolean, initialPrompt?: string) =>
+    ipcRenderer.invoke("grok:newThread", cwd ?? null, Boolean(worktree), initialPrompt || ""),
   resumeThread: (sessionId: string, cwd: string) =>
     ipcRenderer.invoke("grok:resumeThread", sessionId, cwd),
   forkThread: (sessionId: string, cwd: string) =>
@@ -44,6 +44,12 @@ contextBridge.exposeInMainWorld("grok", {
   sendPrompt: (sessionId: string, text: string, images?: { path: string; mimeType: string }[]) =>
     ipcRenderer.invoke("grok:sendPrompt", sessionId, text, images),
   runningSessions: () => ipcRenderer.invoke("grok:runningSessions"),
+  queueFollowUp: (sessionId: string, text: string, images?: { path: string; mimeType: string }[]) =>
+    ipcRenderer.invoke("grok:queueFollowUp", sessionId, text, images),
+  promoteFollowUp: (sessionId: string) => ipcRenderer.invoke("grok:promoteFollowUp", sessionId),
+  removeFollowUp: (sessionId: string, entryId: string) =>
+    ipcRenderer.invoke("grok:removeFollowUp", sessionId, entryId),
+  queuedFollowUps: (sessionId?: string) => ipcRenderer.invoke("grok:queuedFollowUps", sessionId),
   savePastedImage: (payload: { data: string; mimeType?: string }) =>
     ipcRenderer.invoke("grok:savePastedImage", payload),
   saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
@@ -132,10 +138,30 @@ contextBridge.exposeInMainWorld("grok", {
     ipcRenderer.on("grok:update", listener);
     return () => ipcRenderer.removeListener("grok:update", listener);
   },
+  onTurnFiles: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:turn-files", listener);
+    return () => ipcRenderer.removeListener("grok:turn-files", listener);
+  },
   onRunState: (cb: (payload: unknown) => void) => {
     const listener = (_event: unknown, payload: unknown) => cb(payload);
     ipcRenderer.on("grok:run-state", listener);
     return () => ipcRenderer.removeListener("grok:run-state", listener);
+  },
+  onFollowUpState: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:follow-up-state", listener);
+    return () => ipcRenderer.removeListener("grok:follow-up-state", listener);
+  },
+  onFollowUpStarted: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:follow-up-started", listener);
+    return () => ipcRenderer.removeListener("grok:follow-up-started", listener);
+  },
+  onFollowUpError: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:follow-up-error", listener);
+    return () => ipcRenderer.removeListener("grok:follow-up-error", listener);
   },
   onPermission: (cb: (payload: unknown) => void) => {
     const listener = (_event: unknown, payload: unknown) => cb(payload);

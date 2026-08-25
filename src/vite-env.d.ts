@@ -19,6 +19,7 @@ import type {
   ThreadInfo,
   ThreadSearchResult,
 } from "../electron/shared";
+import type { FollowUpReceipt, QueuedFollowUp } from "../electron/follow-ups";
 
 export type NewThreadResult = {
   sessionId: string;
@@ -69,7 +70,7 @@ declare global {
         planAwaiting: boolean;
         planModifiedAt: number | null;
       }>;
-      newThread: (cwd?: string | null, worktree?: boolean) => Promise<NewThreadResult>;
+      newThread: (cwd?: string | null, worktree?: boolean, initialPrompt?: string) => Promise<NewThreadResult>;
       resumeThread: (sessionId: string, cwd: string) => Promise<{ sessionId: string; cwd: string }>;
       forkThread: (sessionId: string, cwd: string) => Promise<NewThreadResult>;
       sendPrompt: (
@@ -78,6 +79,14 @@ declare global {
         images?: { path: string; mimeType: string }[],
       ) => Promise<unknown>;
       runningSessions: () => Promise<string[]>;
+      queueFollowUp: (
+        sessionId: string,
+        text: string,
+        images?: { path: string; mimeType: string }[],
+      ) => Promise<FollowUpReceipt>;
+      promoteFollowUp: (sessionId: string) => Promise<FollowUpReceipt | null>;
+      removeFollowUp: (sessionId: string, entryId: string) => Promise<QueuedFollowUp | null>;
+      queuedFollowUps: (sessionId?: string) => Promise<QueuedFollowUp[]>;
       savePastedImage: (payload: { data: string; mimeType?: string }) => Promise<{ path: string; mimeType: string }>;
       saveClipboardImage: () => Promise<{ path: string; mimeType: string; dataUrl: string } | null>;
       setMode: (sessionId: string, modeId: string) => Promise<void>;
@@ -85,7 +94,7 @@ declare global {
       pickFolder: () => Promise<string[]>;
       getGoal: (cwd: string) => Promise<string>;
       setGoal: (cwd: string, text: string) => Promise<string>;
-      cancel: (sessionId: string) => Promise<void>;
+      cancel: (sessionId: string) => Promise<QueuedFollowUp[]>;
       respondPermission: (requestId: string, optionId: string) => Promise<boolean>;
       gitStatus: (cwd: string) => Promise<GitStatus>;
       gitFileDiff: (cwd: string, filePath: string) => Promise<string>;
@@ -151,8 +160,12 @@ declare global {
       terminalWrite: (text: string) => Promise<boolean>;
       terminalKill: () => Promise<void>;
       onTerminalData: (cb: (chunk: string) => void) => () => void;
-      onUpdate: (cb: (payload: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown> }) => void) => () => void;
+      onUpdate: (cb: (payload: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown>; runContinues?: boolean }) => void) => () => void;
+      onTurnFiles: (cb: (payload: { sessionId: string; files: string[] }) => void) => () => void;
       onRunState: (cb: (payload: { sessionId: string; running: boolean }) => void) => () => void;
+      onFollowUpState: (cb: (payload: { sessionId: string; entries: QueuedFollowUp[] }) => void) => () => void;
+      onFollowUpStarted: (cb: (payload: { entry: QueuedFollowUp; delivery: "queued" | "steered" }) => void) => () => void;
+      onFollowUpError: (cb: (payload: { entry: QueuedFollowUp; message: string }) => void) => () => void;
       onPermission: (cb: (payload: PermissionRequest) => void) => () => void;
       onAgentStatus: (cb: (payload: { connected: boolean; message?: string }) => void) => () => void;
       onAutomations: (cb: (rows: Automation[]) => void) => () => void;

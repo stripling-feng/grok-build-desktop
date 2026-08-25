@@ -10,7 +10,7 @@ import { AutomationPage, MarketplacePage, type WorkspacePage } from "./component
 import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
 import grokLogo from "./assets/grok-logo.jpg";
-import { applyLiveUpdate, stampTurnDuration, stripEphemeral, type PlanRevision } from "./lib/stream";
+import { appendTurnChanges, applyLiveUpdate, stampTurnDuration, stripEphemeral, type PlanRevision } from "./lib/stream";
 import {
   PLAN_FLOW_STORAGE_KEY,
   buildPlanConversationPrompt,
@@ -30,7 +30,12 @@ import {
   type PlanFlow,
 } from "./lib/plan-flow";
 import { extractContextUsage, mergeContextUsage } from "../electron/shared";
-import { agentModeForComposer, isSessionViewCurrent, updateRunningSessionIds } from "./lib/session-state";
+import {
+  agentModeForComposer,
+  isSessionViewCurrent,
+  updateRunningSessionIds,
+  updateUnreadSessionIds,
+} from "./lib/session-state";
 import type {
   AccountInfo,
   AppSettings,
@@ -43,6 +48,7 @@ import type {
   StreamItem,
   ThreadInfo,
 } from "../electron/shared";
+import type { QueuedFollowUp } from "../electron/follow-ups";
 
 type Active = {
   sessionId: string;
@@ -66,6 +72,43 @@ const EMPTY_COMPOSER_STATE: ConversationComposerState = {
 };
 
 const COMPOSER_STATES_STORAGE_KEY = "grok.composerStates.v1";
+const UNREAD_SESSIONS_STORAGE_KEY = "grok.unreadSessions.v1";
+const IMAGE_ATTACHMENT_RE = /\.(png|jpe?g|gif|webp|bmp|avif)$/i;
+
+function imageMimeType(filePath: string): string {
+  if (/\.jpe?g$/i.test(filePath)) return "image/jpeg";
+  if (/\.gif$/i.test(filePath)) return "image/gif";
+  if (/\.webp$/i.test(filePath)) return "image/webp";
+  return "image/png";
+}
+
+function followUpDisplayText(entry: Pick<QueuedFollowUp, "text" | "images">): string {
+  return entry.text.trim() || (entry.images.length ? `图片 ×${entry.images.length}` : "后续消息");
+}
+
+function followUpPayload(text: string, attached: string[]) {
+  const imageFiles = attached.filter((filePath) => IMAGE_ATTACHMENT_RE.test(filePath));
+  const otherFiles = attached.filter((filePath) => !IMAGE_ATTACHMENT_RE.test(filePath));
+  let payload = text.trim();
+  if (otherFiles.length) {
+    payload += `${payload ? "\n\n" : ""}请同时参考这些路径：\n` +
+      otherFiles.map((filePath) => `- @${filePath}`).join("\n");
+  }
+  return {
+    payload,
+    images: imageFiles.map((filePath) => ({ path: filePath, mimeType: imageMimeType(filePath) })),
+  };
+}
+
+function readUnreadSessionIds(): Set<string> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(UNREAD_SESSIONS_STORAGE_KEY) || "[]");
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((id): id is string => typeof id === "string" && Boolean(id)));
+  } catch {
+    return new Set();
+  }
+}
 
 function readComposerStates(): Record<string, ConversationComposerState> {
   try {
@@ -257,6 +300,8 @@ export function App() {
     readComposerStates,
   );
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
+  const [followUpsBySession, setFollowUpsBySession] = useState<Record<string, QueuedFollowUp[]>>({});
+  const [unreadIds, setUnreadIds] = useState<Set<string>>(readUnreadSessionIds);
   const [permissionsBySession, setPermissionsBySession] = useState<Record<string, PermissionRequest>>({});
   const [git, setGit] = useState<GitStatus | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -287,6 +332,8 @@ export function App() {
   const [winW, setWinW] = useState(() => (typeof window === "undefined" ? 1280 : window.innerWidth));
   const [planPanel, setPlanPanel] = useState<PlanFlow | null>(null);
   const sendingRef = useRef<Set<string>>(new Set());
+  const followUpSendingRef = useRef<Set<string>>(new Set());
+  const renderedFollowUpIdsRef = useRef<Set<string>>(new Set());
   // Vite Fast Refresh can retain the old boolean ref from earlier builds.
   // Normalize it during render so a hot-updated window can send immediately.
   if (!(sendingRef.current instanceof Set)) sendingRef.current = new Set<string>();
@@ -303,6 +350,7 @@ export function App() {
   const composerKey = conversationComposerKey(active, selectedProjectCwd, worktreeMode);
   const composerState = composerStates[composerKey] ?? EMPTY_COMPOSER_STATE;
   const { draft, attachments, planMode } = composerState;
+  const activeFollowUps = active?.sessionId ? followUpsBySession[active.sessionId] ?? [] : [];
   const setDraft = useCallback((value: string) => {
     setComposerStates((cur) => ({
       ...cur,
@@ -321,6 +369,13 @@ export function App() {
       [composerKey]: { ...(cur[composerKey] ?? EMPTY_COMPOSER_STATE), planMode: value },
     }));
   }, [composerKey]);
+  const syncRunningSession = useCallback((sessionId: string) => {
+    void window.grok.runningSessions().then((ids) => {
+      setRunningIds((current) =>
+        updateRunningSessionIds(current, { sessionId, running: ids.includes(sessionId) }),
+      );
+    }).catch(() => undefined);
+  }, []);
   const changePlanMode = useCallback((value: boolean) => {
     setPlanModeState(value);
     if (value) return;
@@ -421,6 +476,14 @@ export function App() {
   }, [composerStates]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(UNREAD_SESSIONS_STORAGE_KEY, JSON.stringify([...unreadIds]));
+    } catch {
+      /* persistence is best effort */
+    }
+  }, [unreadIds]);
+
+  useEffect(() => {
     const onResize = () => setWinW(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -465,6 +528,43 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const sessionsUpdatedAfterSnapshot = new Set<string>();
+    const offState = window.grok.onFollowUpState(({ sessionId, entries }) => {
+      sessionsUpdatedAfterSnapshot.add(sessionId);
+      setFollowUpsBySession((current) => ({ ...current, [sessionId]: entries }));
+    });
+    const offStarted = window.grok.onFollowUpStarted(({ entry }) => {
+      if (renderedFollowUpIdsRef.current.has(entry.id)) return;
+      renderedFollowUpIdsRef.current.add(entry.id);
+      if (activeRef.current?.sessionId === entry.sessionId) {
+        setItems((current) => [
+          ...stampTurnDuration(stripEphemeral(current)),
+          { kind: "user", text: followUpDisplayText(entry), startedAt: Date.now() },
+        ]);
+      }
+    });
+    const offError = window.grok.onFollowUpError(({ entry, message }) => {
+      if (activeRef.current?.sessionId === entry.sessionId) setError(message);
+    });
+    void window.grok.queuedFollowUps().then((entries) => {
+      const grouped: Record<string, QueuedFollowUp[]> = {};
+      for (const entry of entries) (grouped[entry.sessionId] ??= []).push(entry);
+      setFollowUpsBySession((current) => {
+        const next = { ...current };
+        for (const [sessionId, queued] of Object.entries(grouped)) {
+          if (!sessionsUpdatedAfterSnapshot.has(sessionId)) next[sessionId] = queued;
+        }
+        return next;
+      });
+    }).catch(() => undefined);
+    return () => {
+      offState();
+      offStarted();
+      offError();
+    };
+  }, []);
+
+  useEffect(() => {
     const offUpdate = window.grok.onUpdate((payload) => {
       const currentActive = activeRef.current;
       const usage = extractContextUsage(payload.update, payload.meta);
@@ -483,6 +583,26 @@ export function App() {
         if (stored) writeStoredPlanFlow({ ...stored, open: true, hasPlan: true, error: undefined });
       }
       if (kind === "turn_completed") {
+        if (payload.runContinues) {
+          if (currentActive && isSessionViewCurrent(currentActive.sessionId, payload.sessionId)) {
+            setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
+          }
+          void refresh();
+          return;
+        }
+        const visibleSessionCompleted = Boolean(
+          currentActive &&
+            isSessionViewCurrent(currentActive.sessionId, payload.sessionId) &&
+            page === "chat" &&
+            document.visibilityState === "visible" &&
+            document.hasFocus(),
+        );
+        setUnreadIds((current) =>
+          updateUnreadSessionIds(current, {
+            sessionId: payload.sessionId,
+            unread: !visibleSessionCompleted,
+          }),
+        );
         setRunningIds((s) => {
           const n = new Set(s);
           n.delete(payload.sessionId);
@@ -549,6 +669,11 @@ export function App() {
         }
       }
     });
+    const offTurnFiles = window.grok.onTurnFiles((payload) => {
+      if (!payload?.files?.length) return;
+      if (!isSessionViewCurrent(activeRef.current?.sessionId, payload.sessionId)) return;
+      setItems((prev) => appendTurnChanges(prev, payload.files));
+    });
     const offPerm = window.grok.onPermission((p) => {
       setPermissionsBySession((current) => ({ ...current, [p.sessionId]: p }));
     });
@@ -557,12 +682,18 @@ export function App() {
     });
     return () => {
       offUpdate();
+      offTurnFiles();
       offPerm();
       offStatus();
     };
-  }, [refresh]);
+  }, [page, refresh]);
 
-  const selectThread = useCallback(async (thread: ThreadInfo) => {
+  const selectThread = useCallback(async (thread: ThreadInfo, markRead = true) => {
+    if (markRead) {
+      setUnreadIds((current) =>
+        updateUnreadSessionIds(current, { sessionId: thread.id, unread: false }),
+      );
+    }
     sendAttemptRef.current += 1;
     planActionRef.current = null;
     setError(null);
@@ -647,7 +778,7 @@ export function App() {
       ]);
       const thread = sessionId ? threadList.find((item) => item.id === sessionId) : undefined;
       if (thread) {
-        await selectThread(thread);
+        await selectThread(thread, false);
       } else if (projectCwd && projectList.some((p) => samePath(p.cwd, projectCwd))) {
         setSelectedProjectCwd(projectCwd);
         void window.grok.gitStatus(projectCwd).then(setGit);
@@ -723,10 +854,14 @@ export function App() {
   }, [beginComposer, refresh, worktreeMode]);
 
   const createThread = useCallback(
-    async (cwd?: string | null, worktree = false) => {
+    async (cwd?: string | null, worktree = false, initialPrompt = "") => {
       const createAttempt = sendAttemptRef.current;
       const task = (async (): Promise<Active | null> => {
-        const created = await window.grok.newThread(cwd || null, Boolean(cwd) && worktree);
+        const created = await window.grok.newThread(
+          cwd || null,
+          Boolean(cwd) && worktree,
+          initialPrompt,
+        );
         if (sendAttemptRef.current !== createAttempt) return null;
         const nextUnattached = Boolean(created.unattached || !created.projectCwd);
         const next: Active = {
@@ -826,6 +961,51 @@ export function App() {
 
   const send = useCallback(async () => {
     const sourceComposerKey = composerKey;
+    const runningSessionId = active?.sessionId && runningIds.has(active.sessionId)
+      ? active.sessionId
+      : null;
+    if (runningSessionId) {
+      if (followUpSendingRef.current.has(runningSessionId)) return;
+      if (!draft.trim() && !attachments.length) {
+        if (!activeFollowUps.length) return;
+        followUpSendingRef.current.add(runningSessionId);
+        try {
+          await window.grok.promoteFollowUp(runningSessionId);
+          setError(null);
+        } catch (err) {
+          setError(`调整方向失败，消息仍在队列中：${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          followUpSendingRef.current.delete(runningSessionId);
+        }
+        return;
+      }
+
+      const queuedDraft = draft;
+      const queuedAttachments = [...attachments];
+      const { payload, images } = followUpPayload(queuedDraft, queuedAttachments);
+      followUpSendingRef.current.add(runningSessionId);
+      try {
+        await window.grok.queueFollowUp(runningSessionId, payload, images);
+        setComposerStates((current) => {
+          const source = current[sourceComposerKey] ?? EMPTY_COMPOSER_STATE;
+          const unchanged =
+            source.draft === queuedDraft &&
+            source.attachments.length === queuedAttachments.length &&
+            source.attachments.every((filePath, index) => filePath === queuedAttachments[index]);
+          if (!unchanged) return current;
+          return {
+            ...current,
+            [sourceComposerKey]: { ...source, draft: "", attachments: [] },
+          };
+        });
+        setError(null);
+      } catch (err) {
+        setError(`加入队列失败：${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        followUpSendingRef.current.delete(runningSessionId);
+      }
+      return;
+    }
     if (sendingRef.current.has(sourceComposerKey)) {
       const requestStillRunning = Boolean(
         pendingThreadRef.current || (active?.sessionId && runningIds.has(active.sessionId)),
@@ -834,7 +1014,7 @@ export function App() {
       sendingRef.current.delete(sourceComposerKey);
     }
     const sendAttempt = ++sendAttemptRef.current;
-    if ((!draft.trim() && !attachments.length) || (active && runningIds.has(active.sessionId))) return;
+    if (!draft.trim() && !attachments.length) return;
     const text = draft.trim();
     sendingRef.current.add(sourceComposerKey);
     const attached = attachments;
@@ -843,7 +1023,10 @@ export function App() {
       const cwd = selectedProjectCwd;
       setError(null);
       try {
-        session = await createThread(cwd, Boolean(cwd) && worktreeMode);
+        const initialPrompt = text || (attachments.length
+          ? `${attachments.some((path) => /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(path)) ? "图片" : "附件"}任务 ×${attachments.length}`
+          : "");
+        session = await createThread(cwd, Boolean(cwd) && worktreeMode, initialPrompt);
       } catch (err) {
         sendingRef.current.delete(sourceComposerKey);
         setError(err instanceof Error ? err.message : String(err));
@@ -912,11 +1095,7 @@ export function App() {
         }
       }
       if (sendAttemptRef.current !== sendAttempt) {
-        setRunningIds((s) => {
-          const n = new Set(s);
-          n.delete(session.sessionId);
-          return n;
-        });
+        syncRunningSession(session.sessionId);
         releaseSendLocks();
         return;
       }
@@ -1022,11 +1201,7 @@ export function App() {
             cur?.sessionId === session.sessionId ? settlePlanTurn(cur) : cur,
           );
         }
-        setRunningIds((s) => {
-          const n = new Set(s);
-          n.delete(session.sessionId);
-          return n;
-        });
+        syncRunningSession(session.sessionId);
         if (activeRef.current?.sessionId === session.sessionId) {
           setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
         }
@@ -1072,18 +1247,14 @@ export function App() {
       // session/prompt resolves only after the turn has ended. Treat that
       // request result as a fallback completion signal because some Grok CLI
       // versions persist `_x.ai/session/update` without forwarding it live.
-      setRunningIds((s) => {
-        const n = new Set(s);
-        n.delete(session.sessionId);
-        return n;
-      });
+      syncRunningSession(session.sessionId);
       if (activeRef.current?.sessionId === session.sessionId) {
         setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
       }
       releaseSendLocks();
       void refresh();
     }
-  }, [active, attachments, composerKey, draft, createThread, planMode, planPanel, refresh, runningIds, selectedProjectCwd, worktreeMode]);
+  }, [active, activeFollowUps, attachments, composerKey, draft, createThread, planMode, planPanel, refresh, runningIds, selectedProjectCwd, syncRunningSession, worktreeMode]);
 
   const retryFailedPrompt = useCallback(async () => {
     const failed = failedPromptRef.current;
@@ -1101,14 +1272,10 @@ export function App() {
       }
     } finally {
       sendingRef.current.delete(retryKey);
-      setRunningIds((cur) => {
-        const next = new Set(cur);
-        next.delete(failed.sessionId);
-        return next;
-      });
+      syncRunningSession(failed.sessionId);
       void refresh();
     }
-  }, [refresh, runningIds]);
+  }, [refresh, runningIds, syncRunningSession]);
 
   const approvePlan = useCallback(async (revision: PlanRevision) => {
     if (!planPanel || planFlowBusy(planPanel.phase) || revision.entries.length === 0) return;
@@ -1157,15 +1324,11 @@ export function App() {
         current?.sessionId === sessionId && current.planId === flow.planId ? failed : current,
       );
       writeStoredPlanFlow(failed);
-      setRunningIds((s) => {
-        const n = new Set(s);
-        n.delete(sessionId);
-        return n;
-      });
+      syncRunningSession(sessionId);
     } finally {
       if (planActionRef.current === actionId) planActionRef.current = null;
     }
-  }, [planPanel, setPlanModeState]);
+  }, [planPanel, setPlanModeState, syncRunningSession]);
 
   const rejectPlan = useCallback(() => {
     if (!planPanel) return;
@@ -1225,11 +1388,7 @@ export function App() {
       );
       writeStoredPlanFlow(failed);
     } finally {
-      setRunningIds((s) => {
-        const n = new Set(s);
-        n.delete(flow.sessionId);
-        return n;
-      });
+      syncRunningSession(flow.sessionId);
       if (activeRef.current?.sessionId === flow.sessionId) {
         setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
       }
@@ -1239,7 +1398,7 @@ export function App() {
       if (planActionRef.current === actionId) planActionRef.current = null;
       void refresh();
     }
-  }, [planPanel, refresh]);
+  }, [planPanel, refresh, syncRunningSession]);
 
   const reloadPlanDocument = useCallback(async () => {
     if (!planPanel) return;
@@ -1295,7 +1454,22 @@ export function App() {
     sendingRef.current.delete(`session:${active.sessionId}`);
     sendingRef.current.delete(composerKey);
     planActionRef.current = null;
-    void window.grok.cancel(active.sessionId);
+    void window.grok.cancel(active.sessionId).then((cleared) => {
+      if (!cleared.length || activeRef.current?.sessionId !== active.sessionId) return;
+      const queuedText = cleared.map((entry) => entry.text.trim()).filter(Boolean).join("\n\n");
+      const queuedImages = cleared.flatMap((entry) => entry.images.map((image) => image.path));
+      setComposerStates((current) => {
+        const source = current[composerKey] ?? EMPTY_COMPOSER_STATE;
+        return {
+          ...current,
+          [composerKey]: {
+            ...source,
+            draft: [queuedText, source.draft].filter(Boolean).join("\n\n"),
+            attachments: [...new Set([...queuedImages, ...source.attachments])],
+          },
+        };
+      });
+    }).catch(() => undefined);
     setItems((prev) => stampTurnDuration(stripEphemeral(prev)));
     setRunningIds((s) => {
       const n = new Set(s);
@@ -1498,6 +1672,7 @@ export function App() {
           selectedProjectCwd={selectedProjectCwd}
           activeId={active?.sessionId ?? null}
           runningIds={runningIds}
+          unreadIds={unreadIds}
           grokLabel={grokLabel}
           account={account}
           onAccountChange={setAccount}
@@ -1574,6 +1749,9 @@ export function App() {
           onRemoveThread={(thread) => {
             if (!window.confirm(`移除会话「${thread.title}」？`)) return;
             void window.grok.removeThread(thread.id, thread.cwd).then(async () => {
+              setUnreadIds((current) =>
+                updateUnreadSessionIds(current, { sessionId: thread.id, unread: false }),
+              );
               clearStoredPlanFlow(thread.id);
               if (active?.sessionId === thread.id) {
                 setActive(null);
@@ -1724,6 +1902,7 @@ export function App() {
             planMode={planMode}
             goal={goal}
             attachments={attachments}
+            queuedFollowUps={activeFollowUps}
             settings={settings}
             contextUsed={contextUsed}
             contextUsage={contextUsage}
@@ -1738,6 +1917,10 @@ export function App() {
               if (cwd) void window.grok.setGoal(cwd, text);
             }}
             onAttachments={setAttachments}
+            onRemoveFollowUp={(entryId) => {
+              if (!active?.sessionId) return;
+              void window.grok.removeFollowUp(active.sessionId, entryId);
+            }}
             onPermissionMode={(mode: PermissionMode) => {
               void window.grok.setPermission(mode).then(setSettings);
             }}

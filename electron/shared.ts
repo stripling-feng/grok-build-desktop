@@ -26,6 +26,7 @@ export type StreamItem =
       entries: { content: string; status: PlanEntryStatus }[];
       markdown?: string;
     }
+  | { kind: "changes"; files: string[] }
   | { kind: "status"; text: string };
 
 export type PlanEntryStatus =
@@ -322,7 +323,52 @@ export type AcpUpdatePayload = {
   update: Record<string, unknown>;
   method?: string;
   meta?: Record<string, unknown>;
+  runContinues?: boolean;
 };
+
+function addPathValue(paths: Set<string>, value: unknown) {
+  if (typeof value === "string" && value.trim()) paths.add(value.trim());
+}
+
+/** Extract paths that an ACP tool reports as modifications. Diff content is
+ * authoritative; locations/raw input are considered only for mutating tools. */
+export function extractModifiedFilePaths(update: Record<string, unknown>): string[] {
+  const paths = new Set<string>();
+  const content = Array.isArray(update.content) ? update.content : [];
+  for (const entry of content) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    if (item.type === "diff") addPathValue(paths, item.path);
+  }
+
+  const toolKind = String(update.kind ?? update.toolKind ?? "").toLowerCase();
+  if (!/^(edit|write|delete|move)$/.test(toolKind)) return [...paths];
+
+  if (Array.isArray(update.locations)) {
+    for (const location of update.locations) {
+      if (location && typeof location === "object") {
+        addPathValue(paths, (location as Record<string, unknown>).path);
+      }
+    }
+  }
+  if (update.rawInput && typeof update.rawInput === "object") {
+    const raw = update.rawInput as Record<string, unknown>;
+    for (const key of [
+      "path",
+      "file_path",
+      "filePath",
+      "target_file",
+      "targetFile",
+      "old_path",
+      "oldPath",
+      "new_path",
+      "newPath",
+    ]) {
+      addPathValue(paths, raw[key]);
+    }
+  }
+  return [...paths];
+}
 
 function asTokenCount(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;

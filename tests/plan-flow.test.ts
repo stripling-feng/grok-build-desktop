@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { StreamItem } from "../electron/shared";
-import { applyUpdateToItems, planDocumentWasUpdatedForTurn } from "../electron/shared";
+import { applyUpdateToItems, extractModifiedFilePaths, planDocumentWasUpdatedForTurn } from "../electron/shared";
 import { planEntriesFromMarkdown } from "../electron/plan-document";
 import {
   buildPlanConversationPrompt,
@@ -18,10 +18,112 @@ import {
   settlePlanTurn,
   type PlanFlow,
 } from "../src/lib/plan-flow";
-import { agentModeForComposer, isSessionViewCurrent, updateRunningSessionIds } from "../src/lib/session-state";
+import {
+  agentModeForComposer,
+  isSessionViewCurrent,
+  updateRunningSessionIds,
+  updateUnreadSessionIds,
+} from "../src/lib/session-state";
+import { appendTurnChanges, isPlanDocument, latestPlan, planRevisions } from "../src/lib/stream";
+import { threadTitleForDisplay, threadTitleFromPrompt } from "../src/lib/thread-title";
+import { FollowUpQueue, followUpDisplayText } from "../electron/follow-ups";
+import { TurnCompletionTracker } from "../electron/turn-completion";
 
 const firstTurn = 100;
 const currentTurn = 200;
+
+test("live and fallback turn completion publish exactly once", () => {
+  const tracker = new TurnCompletionTracker();
+
+  tracker.start("session-live");
+  assert.equal(tracker.acceptLive("session-live", 100), true);
+  assert.equal(tracker.settle("session-live", 101), false);
+
+  tracker.start("session-fallback");
+  assert.equal(tracker.settle("session-fallback", 200), true);
+  assert.equal(tracker.acceptLive("session-fallback", 201), false);
+});
+
+test("a suppressed late live completion still lets the next turn fall back", () => {
+  const tracker = new TurnCompletionTracker(2_000);
+  tracker.start("session-sequential");
+  assert.equal(tracker.settle("session-sequential", 100), true);
+
+  tracker.start("session-sequential");
+  assert.equal(tracker.acceptLive("session-sequential", 101), false);
+  assert.equal(tracker.settle("session-sequential", 102), true);
+});
+
+test("follow-up messages stay FIFO and a failed steer can be restored to the front", () => {
+  const queue = new FollowUpQueue();
+  const first = queue.create("session-queue", "先调整接口");
+  const second = queue.create("session-queue", "再补测试");
+  queue.enqueue(first);
+  queue.enqueue(second);
+
+  assert.equal(queue.take("session-queue")?.id, first.id);
+  queue.prepend(first);
+  assert.deepEqual(queue.list("session-queue").map((entry) => entry.id), [first.id, second.id]);
+  assert.equal(queue.remove("session-queue", first.id)?.id, first.id);
+  assert.equal(queue.take("session-queue")?.id, second.id);
+  assert.equal(queue.has("session-queue"), false);
+});
+
+test("image-only follow-ups have a visible queue label", () => {
+  const queue = new FollowUpQueue();
+  const entry = queue.create("session-images", "", [
+    { path: "C:\\tmp\\one.png", mimeType: "image/png" },
+    { path: "C:\\tmp\\two.jpg", mimeType: "image/jpeg" },
+  ]);
+  assert.equal(followUpDisplayText(entry), "图片 ×2");
+});
+
+test("a thread title is available from the first prompt before the turn completes", () => {
+  assert.equal(
+    threadTitleFromPrompt("请帮我修复新建任务后侧栏一直显示未命名会话的问题，并补充测试"),
+    "修复新建任务后侧栏一直显示未命名会话的问题，并补充测试",
+  );
+  assert.equal(
+    threadTitleFromPrompt("新建任务时先显示会话名称，现在需要等回复完成后才会变，这个体验需要优化"),
+    "新建任务时先显示会话名称，现在需要等回复完成后才会变，这…",
+  );
+  assert.equal(threadTitleFromPrompt("token=secret-value https://example.com"), "新任务");
+  assert.equal(threadTitleForDisplay("未命名会话", "立即显示侧栏名称"), "立即显示侧栏名称");
+  assert.equal(threadTitleForDisplay("正式生成的会话名称", "立即显示侧栏名称"), "正式生成的会话名称");
+});
+
+test("ACP modification updates expose diff and mutating tool paths", () => {
+  assert.deepEqual(
+    extractModifiedFilePaths({
+      kind: "edit",
+      locations: [{ path: "C:\\repo\\src\\App.tsx" }],
+      rawInput: { filePath: "C:\\repo\\src\\App.tsx" },
+      content: [
+        { type: "diff", path: "C:\\repo\\src\\App.tsx", oldText: "a", newText: "b" },
+        { type: "diff", path: "C:\\repo\\src\\index.css", oldText: "", newText: ".x {}" },
+      ],
+    }).sort(),
+    ["C:\\repo\\src\\App.tsx", "C:\\repo\\src\\index.css"],
+  );
+  assert.deepEqual(
+    extractModifiedFilePaths({ kind: "read", locations: [{ path: "C:\\repo\\README.md" }] }),
+    [],
+  );
+});
+
+test("turn changes are appended once below the current answer", () => {
+  const items: StreamItem[] = [
+    { kind: "user", text: "修改界面" },
+    { kind: "agent", text: "已经完成。" },
+  ];
+  const first = appendTurnChanges(items, ["src\\App.tsx", "src/index.css", "src/App.tsx"]);
+  const second = appendTurnChanges(first, ["electron/main.ts", "src/App.tsx"]);
+  assert.deepEqual(second.at(-1), {
+    kind: "changes",
+    files: ["electron/main.ts", "src/App.tsx", "src/index.css"],
+  });
+  assert.equal(second.filter((item) => item.kind === "changes").length, 1);
+});
 
 test("background completion only clears its own session", () => {
   const running = new Set(["session-a", "session-b"]);
@@ -86,7 +188,12 @@ test("a clarification turn cannot reuse a plan from before the question", () => 
 function fixture(): StreamItem[] {
   return [
     { kind: "user", text: "旧任务", startedAt: firstTurn },
-    { kind: "plan", revision: 1, entries: [{ content: "旧步骤", status: "done" }] },
+    {
+      kind: "plan",
+      revision: 1,
+      entries: [{ content: "旧步骤", status: "done" }],
+      markdown: "# 旧计划",
+    },
     { kind: "user", text: "当前任务", startedAt: currentTurn },
     { kind: "plan", revision: 1, entries: [{ content: "当前步骤 A", status: "pending" }] },
     { kind: "user", text: "[计划修订] 增加测试", startedAt: 201 },
@@ -103,6 +210,48 @@ test("plans keep stable conversation-wide numbers across plan turns", () => {
       { revision: 3, step: "当前步骤 B" },
     ],
   );
+});
+
+test("completed background sessions remain unread until selected", () => {
+  const current = new Set(["session-a"]);
+  const completed = updateUnreadSessionIds(current, { sessionId: "session-b", unread: true });
+  assert.deepEqual([...completed], ["session-a", "session-b"]);
+  assert.deepEqual([...current], ["session-a"]);
+
+  const selected = updateUnreadSessionIds(completed, { sessionId: "session-b", unread: false });
+  assert.deepEqual([...selected], ["session-a"]);
+});
+
+test("ordinary-mode plan progress is not treated as a plan document", () => {
+  const progress: StreamItem = {
+    kind: "plan",
+    revision: 1,
+    entries: [{ content: "定位代码", status: "in_progress" }],
+  };
+  const document: StreamItem = {
+    kind: "plan",
+    revision: 1,
+    entries: [{ content: "修改并验证", status: "pending" }],
+    markdown: "# 完整计划\n\n1. 修改并验证",
+  };
+
+  assert.equal(isPlanDocument(progress), false);
+  assert.equal(isPlanDocument(document), true);
+  assert.deepEqual(latestPlan([progress]), []);
+  assert.equal(planRevisions([progress]).length, 0);
+  assert.deepEqual(latestPlan([progress, document]), document.entries);
+  assert.equal(planRevisions([progress, document]).length, 1);
+});
+
+test("ordinary-mode plan progress does not increment plan document numbering", () => {
+  const items: StreamItem[] = [
+    { kind: "user", text: "普通执行", startedAt: 100 },
+    { kind: "plan", revision: 1, entries: [{ content: "内部步骤", status: "done" }] },
+    { kind: "user", text: "生成计划", startedAt: 200 },
+    { kind: "plan", revision: 1, entries: [{ content: "正式计划", status: "pending" }] },
+  ];
+
+  assert.equal(planRevisionsForFlow(items, 200, "生成计划")[0]?.revision, 1);
 });
 
 test("rejecting a plan does not mutate historical plans", () => {

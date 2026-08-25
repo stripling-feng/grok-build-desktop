@@ -11,10 +11,16 @@ export type PlanEntry = { content: string; status: PlanEntryStatus };
 
 export type PlanRevision = { revision: number; entries: PlanEntry[]; markdown?: string };
 
+export function isPlanDocument(
+  item: StreamItem,
+): item is Extract<StreamItem, { kind: "plan" }> & { markdown: string } {
+  return item.kind === "plan" && Boolean(item.markdown?.trim());
+}
+
 export function latestPlan(items: StreamItem[]): PlanEntry[] {
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
-    if (item.kind === "plan") return item.entries;
+    if (isPlanDocument(item)) return item.entries;
   }
   return [];
 }
@@ -22,7 +28,7 @@ export function latestPlan(items: StreamItem[]): PlanEntry[] {
 export function planRevisions(items: StreamItem[]): PlanRevision[] {
   const revisions: PlanRevision[] = [];
   for (const item of items) {
-    if (item.kind !== "plan") continue;
+    if (!isPlanDocument(item)) continue;
     const last = revisions[revisions.length - 1];
     if (last && last.revision === item.revision) {
       last.entries = item.entries;
@@ -38,11 +44,31 @@ function cloneItems(items: StreamItem[]): StreamItem[] {
   return items.map((item) => {
     if (item.kind === "tool" || item.kind === "subagent") return { ...item };
     if (item.kind === "plan") return { ...item, entries: [...item.entries] };
+    if (item.kind === "changes") return { ...item, files: [...item.files] };
     if (item.kind === "user" || item.kind === "agent" || item.kind === "thought" || item.kind === "status") {
       return { ...item };
     }
     return item;
   });
+}
+
+export function appendTurnChanges(items: StreamItem[], files: string[]): StreamItem[] {
+  const normalized = [...new Set(files.map((file) => file.replace(/\\/g, "/").trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+  if (!normalized.length) return items;
+  const next = items.slice();
+  const turnStart = lastUserIndex(next);
+  for (let i = next.length - 1; i > turnStart; i -= 1) {
+    if (next[i]?.kind !== "changes") continue;
+    const existing = next[i] as Extract<StreamItem, { kind: "changes" }>;
+    next[i] = {
+      kind: "changes",
+      files: [...new Set([...existing.files, ...normalized])].sort((a, b) => a.localeCompare(b)),
+    };
+    return next;
+  }
+  next.push({ kind: "changes", files: normalized });
+  return next;
 }
 
 function lastUserIndex(items: StreamItem[]): number {

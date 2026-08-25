@@ -1,5 +1,5 @@
 import type { StreamItem } from "../../electron/shared";
-import type { PlanEntry, PlanRevision } from "./stream";
+import { isPlanDocument, type PlanEntry, type PlanRevision } from "./stream";
 
 export type PlanFlowPhase =
   | "generating"
@@ -282,7 +282,7 @@ export function planRevisionsForFlow(
   userText?: string,
 ): PlanRevision[] {
   const start = flowStartIndex(items, userStartedAt, userText);
-  const revisionBase = items.slice(0, start).filter((item) => item.kind === "plan").length;
+  const revisionBase = items.slice(0, start).filter(isPlanDocument).length;
   const revisions: PlanRevision[] = [];
   for (let i = start; i < items.length; i += 1) {
     const item = items[i];

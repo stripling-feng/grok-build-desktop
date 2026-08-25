@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import type { GrokStatus, PermissionRequest } from "./shared";
 import { grokBin } from "./grok-bin";
 import { AcpTerminals } from "./acp-terminals";
-import { sessionMeta, ZH_SESSION_RULE } from "./config";
+import { sessionMeta } from "./config";
+import type { FollowUpImage } from "./follow-ups";
 import { encodeCwd, findSessionDir, grokHome } from "./sessions";
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +29,7 @@ type Pending = {
 
 export type AcpEvents = {
   update: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown> };
+  fileWrite: { sessionId: string; path: string };
   permission: PermissionRequest;
   status: { connected: boolean; message?: string };
   stderr: string;
@@ -80,6 +82,10 @@ export class GrokAcpClient extends EventEmitter {
     this.allowedRoots.add(path.resolve(dir));
   }
 
+  cwdForSession(sessionId: string): string | null {
+    return this.sessionCwds.get(sessionId) ?? null;
+  }
+
   private allowSessionRoot(sessionId: string, cwd: string) {
     const expected = path.join(grokHome(), "sessions", encodeCwd(cwd), sessionId);
     this.allowRoot(expected);
@@ -104,7 +110,7 @@ export class GrokAcpClient extends EventEmitter {
       throw new Error("未找到 Grok CLI（~/.grok/bin 或 GROK_PATH）");
     }
     this.grokPath = grok;
-    this.proc = spawn(grok, ["--rules", ZH_SESSION_RULE, "agent", "stdio"], {
+    this.proc = spawn(grok, ["agent", "stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       env: { ...process.env },
@@ -221,26 +227,11 @@ export class GrokAcpClient extends EventEmitter {
   async prompt(
     sessionId: string,
     text: string,
-    images?: { path: string; mimeType: string }[],
+    images?: FollowUpImage[],
   ): Promise<unknown> {
     const startedAt = Date.now();
     await this.ensureStarted();
-    const prompt: Record<string, unknown>[] = [];
-    if (text.trim()) prompt.push({ type: "text", text });
-    for (const image of images ?? []) {
-      let data = "";
-      try {
-        data = fs.readFileSync(image.path).toString("base64");
-      } catch {
-        continue;
-      }
-      if (!data) continue;
-      prompt.push({
-        type: "image",
-        mimeType: image.mimeType || "image/png",
-        data,
-      });
-    }
+    const prompt = this.contentBlocks(text, images);
     if (!prompt.length) throw new Error("没有可发送的内容");
     try {
       return await this.request("session/prompt", { sessionId, prompt });
@@ -261,6 +252,49 @@ export class GrokAcpClient extends EventEmitter {
         throw this.enrichPromptError(fallbackErr, startedAt);
       }
     }
+  }
+
+  async interject(
+    sessionId: string,
+    text: string,
+    images?: FollowUpImage[],
+  ): Promise<"ok" | "unsupported"> {
+    await this.ensureStarted();
+    const content = this.contentBlocks(text, images);
+    if (!content.length) throw new Error("没有可发送的内容");
+    const visibleText = text.trim() || (images?.length ? "请参考附图并据此调整当前任务。" : "");
+    const params: Record<string, unknown> = { sessionId, text: visibleText };
+    if (images?.length) params.content = content;
+    try {
+      await this.request("_x.ai/interject", params);
+      return "ok";
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/method not found|unknown method|not found.*_x\.ai\/interject/i.test(message)) {
+        return "unsupported";
+      }
+      throw err;
+    }
+  }
+
+  private contentBlocks(text: string, images?: FollowUpImage[]): Record<string, unknown>[] {
+    const prompt: Record<string, unknown>[] = [];
+    if (text.trim()) prompt.push({ type: "text", text });
+    for (const image of images ?? []) {
+      let data = "";
+      try {
+        data = fs.readFileSync(image.path).toString("base64");
+      } catch {
+        continue;
+      }
+      if (!data) continue;
+      prompt.push({
+        type: "image",
+        mimeType: image.mimeType || "image/png",
+        data,
+      });
+    }
+    return prompt;
   }
 
   private enrichPromptError(err: unknown, startedAt: number): Error {
@@ -423,6 +457,7 @@ export class GrokAcpClient extends EventEmitter {
       if (body.length > 8 * 1024 * 1024) throw new Error("写入内容过大");
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, body, "utf8");
+      this.emit("fileWrite", { sessionId: String(p.sessionId ?? ""), path: filePath });
       return {};
     }
 

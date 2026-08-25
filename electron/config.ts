@@ -250,17 +250,14 @@ export function getDefaultReasoningEffort(text = readText()): ReasoningEffort {
   return "high";
 }
 
-export const ZH_SESSION_RULE =
-  "始终使用简体中文与用户交流。思考过程、计划、工具说明、子智能体标题与阶段总结也必须用简体中文撰写，不要改成英文。代码、命令、路径、标识符、专有名词保持原文。";
-
 export function sessionMeta(extraRules: string[] = []): Record<string, unknown> {
   const mode = getPermissionMode();
-  const meta: Record<string, unknown> = {
-    rules: [ZH_SESSION_RULE, ...extraRules.map((s) => s.trim()).filter(Boolean)].join("\n"),
-  };
+  const rules = extraRules.map((rule) => rule.trim()).filter(Boolean);
+  const meta: Record<string, unknown> = {};
+  if (rules.length > 0) meta.rules = rules.join("\n");
   if (mode === "always-approve") meta.yoloMode = true;
   if (mode === "auto") meta.autoMode = true;
-  return { _meta: meta };
+  return Object.keys(meta).length > 0 ? { _meta: meta } : {};
 }
 
 export function getDefaultModelDisplayName(text = readText()): string {
