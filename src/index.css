@@ -693,14 +693,17 @@ body.is-resizing .status-float { transition: none; }
   background: #d13b3b;
 }
 .update-notes {
-  max-height: 180px;
+  max-height: 280px;
   overflow: auto;
-  padding: 8px 10px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fafafa;
-  font-size: 12px;
-  white-space: pre-wrap;
+}
+.update-notes .md { font-size: 12px; }
+.modal.update-modal {
+  width: min(600px, calc(100vw - 40px));
+  max-height: min(86vh, 780px);
 }
 .sidebar .btn.ghost {
   color: #5a5a5a;

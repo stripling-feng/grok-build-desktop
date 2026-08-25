@@ -8,6 +8,7 @@ import type {
   ThreadSearchResult,
 } from "../../electron/shared";
 import { relativeTime } from "../lib/i18n";
+import { Markdown } from "../lib/markdown";
 
 type Props = {
   projects: ProjectInfo[];
@@ -43,6 +44,8 @@ type MenuState =
 type RenameState =
   | { kind: "project"; cwd: string; value: string }
   | { kind: "thread"; id: string; value: string };
+
+const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 function same(a: string, b: string) {
   return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
@@ -572,10 +575,39 @@ export function Sidebar({
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
+  const updateRequestRef = useRef<Promise<AppUpdateInfo> | null>(null);
+
+  const requestUpdateCheck = () => {
+    if (updateRequestRef.current) return updateRequestRef.current;
+    const request = window.grok.checkUpdate().finally(() => {
+      if (updateRequestRef.current === request) updateRequestRef.current = null;
+    });
+    updateRequestRef.current = request;
+    return request;
+  };
 
   useEffect(() => {
     const timer = window.setInterval(() => setTimeTick((tick) => tick + 1), 60_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const refresh = () => {
+      void requestUpdateCheck()
+        .then((next) => {
+          if (!disposed) setUpdate(next);
+        })
+        .catch(() => {
+          // Automatic checks stay silent. Manual checks still surface errors.
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, UPDATE_CHECK_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }, []);
   const accountTriggerRef = useRef<HTMLDivElement>(null);
   const usageRequestRef = useRef(false);
@@ -753,7 +785,7 @@ export function Sidebar({
     if (updateLoading) return;
     setUpdateLoading(true);
     try {
-      const next = await window.grok.checkUpdate();
+      const next = await requestUpdateCheck();
       setUpdate(next);
       setUpdateOpen(true);
     } catch {
@@ -1256,7 +1288,11 @@ export function Sidebar({
                   当前 {update.current}，最新 {update.latest}。
                 </p>
                 {update.dev ? <p className="settings-hint">开发版不会自动安装，请下载安装包后手动安装。</p> : null}
-                {update.notes ? <pre className="update-notes">{update.notes}</pre> : null}
+                {update.notes ? (
+                  <div className="update-notes">
+                    <Markdown text={update.notes} />
+                  </div>
+                ) : null}
                 <div className="permission-actions">
                   <button
                     className="btn primary"
