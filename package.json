@@ -1,6 +1,6 @@
 {
   "name": "grok-build-desktop",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Grok Build 桌面端：通过 ACP 调用本机 grok CLI 的 Electron 界面",
   "author": "Grok Build Desktop",
@@ -67,6 +67,8 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
     "yauzl": "^3.4.0"
   },

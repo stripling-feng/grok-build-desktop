@@ -1578,7 +1578,7 @@ export function Sidebar({
                 {update.dev ? <p className="settings-hint">开发环境仅检查版本，请在正式安装版中测试应用内更新。</p> : null}
                 {update.notes ? (
                   <div className="update-notes">
-                    <Markdown text={update.notes} />
+                    <Markdown text={update.notes} allowHtml />
                   </div>
                 ) : null}
                 {update.status === "downloading" ? (

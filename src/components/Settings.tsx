@@ -504,7 +504,7 @@ function AboutPane() {
         {info?.notes ? (
           <div className="settings-update-notes">
             <strong>更新内容</strong>
-            <Markdown text={info.notes} />
+            <Markdown text={info.notes} allowHtml />
           </div>
         ) : null}
         {info?.status === "downloading" ? (

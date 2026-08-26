@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import type { StreamItem } from "../electron/shared";
 import {
   applyUpdateToItems,
@@ -47,6 +49,7 @@ import { resolveReasoningEffortValue } from "../electron/reasoning-effort";
 import { resolveAccountUsagePercent } from "../electron/account-usage";
 import { normalizeProxySettings } from "../electron/proxy-config";
 import { pathsFromClipboardBuffer } from "../electron/clipboard-files";
+import { Markdown } from "../src/lib/markdown";
 import {
   buildApiProviderConfig,
   buildOAuthConfig,
@@ -62,6 +65,19 @@ import {
 
 const firstTurn = 100;
 const currentTurn = 200;
+
+test("update notes render sanitized HTML alongside Markdown", () => {
+  const rendered = renderToStaticMarkup(
+    createElement(Markdown, {
+      allowHtml: true,
+      text: "<h2>本次更新</h2><ul><li><strong>支持</strong> Markdown</li></ul><script>alert('x')</script><a href=\"javascript:alert('x')\">危险链接</a>",
+    }),
+  );
+
+  assert.match(rendered, /<h2>本次更新<\/h2>/);
+  assert.match(rendered, /<li><strong>支持<\/strong> Markdown<\/li>/);
+  assert.doesNotMatch(rendered, /<script|javascript:/i);
+});
 
 test("proxy settings normalize supported modes and reject unsafe manual URLs", () => {
   assert.deepEqual(normalizeProxySettings({ mode: "system", url: "http://ignored:7890" }), {

@@ -1,5 +1,7 @@
 import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 type ChatImageInfo = { path: string; dataUrl: string };
@@ -122,15 +124,18 @@ export function Markdown({
   text,
   sessionId,
   cwd,
+  allowHtml = false,
 }: {
   text: string;
   sessionId?: string;
   cwd?: string;
+  allowHtml?: boolean;
 }) {
   return (
     <div className="md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={allowHtml ? [rehypeRaw, rehypeSanitize] : undefined}
         components={{
           a: ({ href, children }) => (
             <MarkdownLink href={href} sessionId={sessionId} cwd={cwd}>
