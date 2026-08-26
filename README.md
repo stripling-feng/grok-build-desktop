@@ -84,14 +84,14 @@ grok --version
 
 从 [Releases](https://github.com/stripling-feng/grok-build-desktop/releases/latest) 下载最新版 Windows 安装程序：
 
-**[Grok-Build-Setup-0.1.5.exe](https://github.com/stripling-feng/grok-build-desktop/releases/download/v0.1.5/Grok-Build-Setup-0.1.5.exe)**
+**[Grok-Build-Setup-0.1.6.exe](https://github.com/stripling-feng/grok-build-desktop/releases/download/v0.1.6/Grok-Build-Setup-0.1.6.exe)**
 
 当前安装包尚未配置代码签名证书，Windows 可能显示“未知发布者”。请只从本仓库的 Releases 页面下载安装包，并在安装前核对文件信息。
 
-`v0.1.5` 安装包 SHA-256：
+`v0.1.6` 安装包 SHA-256：
 
 ```text
-722816B55035E470278E9ADE9B3486A921AB3225BB621C20293AD65E9D6C050E
+8216542734D5C86922E3181BE07446035532BA9DEE8B39492E7EAA2861C296A3
 ```
 
 ### 3. 登录并开始使用
@@ -135,7 +135,7 @@ npm run dev
 Windows 安装包会输出到 `release/`。
 
 发布新版本时，先同步修改 `package.json` 中的版本号，再推送同名标签（例如版本
-`0.1.5` 对应标签 `v0.1.5`）。GitHub Actions 会自动上传 NSIS 安装包、blockmap 和
+`0.1.6` 对应标签 `v0.1.6`）。GitHub Actions 会自动上传 NSIS 安装包、blockmap 和
 `latest.yml`；已安装的客户端随后可以在应用内下载，并通过“重启并安装”完成升级。
 
 ## 项目结构
