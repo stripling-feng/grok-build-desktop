@@ -15,7 +15,7 @@ import {
   threadBelongsToProject,
   unbindSession,
 } from "./projects";
-import { copySession, initializeThreadTitle, listThreads, loadTranscript, readChatImage, removeThread, renameThread, saveTurnFiles, searchThreads, touchThreadActivity } from "./sessions";
+import { copySession, initializeThreadTitle, listThreads, loadTranscript, readChatImage, removeThread, renameThread, saveTurnAttachments, saveTurnFiles, searchThreads, touchThreadActivity } from "./sessions";
 import {
   applyWorktree,
   createWorktree,
@@ -25,6 +25,7 @@ import {
   gitDiscard,
   gitFileDiff,
   gitPush,
+  readFilePreview,
   gitStage,
   gitStatus,
   gitUnstage,
@@ -75,12 +76,14 @@ import {
   type QueuedFollowUp,
 } from "./follow-ups";
 import { TurnCompletionTracker } from "./turn-completion";
+import { SessionReplayGate } from "./session-replay";
 import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
 import { startGrokInstall, stopGrokInstall, type InstallLogLine } from "./install-cli";
 import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
 import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearAccountCredentials } from "./account";
-import { checkAppUpdate, openUpdateUrl } from "./update";
+import { checkAppUpdate, downloadAppUpdate, initializeAppUpdater, installDownloadedUpdate } from "./update";
+import { pathsFromClipboardBuffer } from "./clipboard-files";
 import {
   createAutomation,
   deleteAutomation,
@@ -105,6 +108,7 @@ const activePromptSessions = new Set<string>();
 const drainingFollowUps = new Set<string>();
 const steeredSessions = new Set<string>();
 const turnCompletions = new TurnCompletionTracker();
+const sessionReplays = new SessionReplayGate();
 const activeTurnFiles = new Map<
   string,
   { cwd: string; startedAt: number; reported: Set<string>; baseline: GitWorktreeSnapshot | null }
@@ -245,6 +249,8 @@ async function executePromptTurn(
   sessionId: string,
   text: string,
   images?: FollowUpImage[],
+  attachments: string[] = [],
+  startedAt = Date.now(),
 ): Promise<unknown> {
   activePromptSessions.add(sessionId);
   turnCompletions.start(sessionId);
@@ -262,10 +268,13 @@ async function executePromptTurn(
   }
   activeTurnFiles.set(sessionId, {
     cwd,
-    startedAt: Date.now(),
+    startedAt,
     reported: new Set<string>(),
     baseline,
   });
+  if (cwd && attachments.length) {
+    saveTurnAttachments(sessionId, cwd, { startedAt, files: attachments });
+  }
   let succeeded = false;
   try {
     const result = await acp.prompt(sessionId, text, images);
@@ -285,6 +294,16 @@ async function executePromptTurn(
   }
 }
 
+async function loadSessionWithoutRendererReplay(sessionId: string, cwd: string): Promise<void> {
+  sessionReplays.begin(sessionId);
+  try {
+    await acp.loadSession(sessionId, cwd);
+  } finally {
+    const suppressed = sessionReplays.end(sessionId);
+    if (suppressed > 0) log("session replay updates suppressed", sessionId, suppressed);
+  }
+}
+
 async function drainFollowUps(sessionId: string) {
   if (activePromptSessions.has(sessionId) || drainingFollowUps.has(sessionId)) return;
   drainingFollowUps.add(sessionId);
@@ -296,7 +315,7 @@ async function drainFollowUps(sessionId: string) {
       publishFollowUps(sessionId);
       send("grok:follow-up-started", { entry, delivery: "queued" });
       try {
-        await executePromptTurn(sessionId, entry.text, entry.images);
+        await executePromptTurn(sessionId, entry.text, entry.images, entry.attachments);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log("queued follow-up failed", sessionId, err);
@@ -328,6 +347,15 @@ function showMainWindow() {
 
 function notifySessionCompleted(sessionId: string, title?: string) {
   if (!Notification.isSupported()) return;
+  if (
+    mainWindow &&
+    !mainWindow.isDestroyed() &&
+    mainWindow.isVisible() &&
+    mainWindow.isFocused()
+  ) {
+    log("completion notification skipped", sessionId, "foreground");
+    return;
+  }
   const notification = new Notification({
     title: "会话已完成",
     body: title ? `“${title}”已完成` : `会话 ${sessionId.slice(0, 8)} 已完成`,
@@ -335,6 +363,7 @@ function notifySessionCompleted(sessionId: string, title?: string) {
   });
   notification.on("click", showMainWindow);
   notification.show();
+  log("completion notification shown", sessionId);
 }
 
 function publishSessionTurnCompleted(
@@ -399,7 +428,7 @@ function createWindow() {
     height: 860,
     minWidth: 980,
     minHeight: 640,
-    title: "Grok Build 桌面端",
+    title: "Grok 桌面端",
     backgroundColor: "#ffffff",
     icon: appIconPath(),
     frame: false,
@@ -454,6 +483,7 @@ function createWindow() {
 }
 
 acp.on("update", (payload) => {
+  if (sessionReplays.shouldSuppress(payload.sessionId)) return;
   for (const filePath of extractModifiedFilePaths(payload.update)) {
     recordTurnFile(payload.sessionId, filePath);
   }
@@ -475,6 +505,7 @@ acp.on("status", (payload) => {
     loadedSessions.clear();
     steeredSessions.clear();
     turnCompletions.clear();
+    sessionReplays.clear();
     clearRunningSessions();
   }
   send("grok:agent-status", payload);
@@ -497,6 +528,7 @@ if (!gotLock) {
     app.setAppUserModelId("ai.x.grok.build.desktop");
     initLog();
     pruneLogs();
+    initializeAppUpdater((state) => send("grok:app-update-state", state));
     createTray();
     createWindow();
     void ensureSystemProxyEnvironment()
@@ -623,7 +655,7 @@ async function runAutomation(id: string, manual = false) {
     if (reused) {
       try {
         if (!loadedSessions.has(reused)) {
-          await acp.loadSession(reused, threadCwd);
+          await loadSessionWithoutRendererReplay(reused, threadCwd);
           loadedSessions.add(reused);
         }
         sessionId = reused;
@@ -735,7 +767,8 @@ ipcMain.handle("grok:logout", async () => {
   return account;
 });
 ipcMain.handle("grok:checkUpdate", () => checkAppUpdate());
-ipcMain.handle("grok:openUpdate", (_e, url?: string) => openUpdateUrl(url));
+ipcMain.handle("grok:downloadUpdate", () => downloadAppUpdate());
+ipcMain.handle("grok:installUpdate", () => installDownloadedUpdate());
 ipcMain.handle("grok:installInfo", () => ({
   command: INSTALL_COMMAND,
   docs: INSTALL_DOCS,
@@ -836,7 +869,7 @@ ipcMain.handle("grok:forkThread", async (_e, sessionId: string, cwd: string) => 
   acp.allowRoot(cwd);
   if (!loadedSessions.has(sessionId)) {
     try {
-      await acp.loadSession(sessionId, cwd);
+      await loadSessionWithoutRendererReplay(sessionId, cwd);
       loadedSessions.add(sessionId);
     } catch {
       /* fork can still copy from disk */
@@ -857,7 +890,7 @@ ipcMain.handle("grok:forkThread", async (_e, sessionId: string, cwd: string) => 
 
   acp.allowRoot(forkedCwd);
   try {
-    await acp.loadSession(forkedId, forkedCwd);
+    await loadSessionWithoutRendererReplay(forkedId, forkedCwd);
     loadedSessions.add(forkedId);
   } catch {
     /* transcript is enough to open the fork */
@@ -885,7 +918,7 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
   acp.allowRoot(cwd);
   if (!loadedSessions.has(sessionId)) {
     try {
-      await acp.loadSession(sessionId, cwd);
+      await loadSessionWithoutRendererReplay(sessionId, cwd);
       loadedSessions.add(sessionId);
     } catch (err) {
       // loadSession may be unsupported or the session may already be live
@@ -900,10 +933,17 @@ ipcMain.handle("grok:resumeThread", async (_e, sessionId: string, cwd: string) =
   return { sessionId, cwd };
 });
 
-ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, images?: FollowUpImage[]) => {
+ipcMain.handle("grok:sendPrompt", async (
+  _e,
+  sessionId: string,
+  text: string,
+  images?: FollowUpImage[],
+  attachments?: string[],
+  startedAt?: number,
+) => {
   setSessionRunning(sessionId, true);
   try {
-    return await executePromptTurn(sessionId, text, images);
+    return await executePromptTurn(sessionId, text, images, attachments, startedAt);
   } catch (err) {
     log("sendPrompt failed", sessionId, err);
     throw err;
@@ -919,9 +959,9 @@ ipcMain.handle("grok:sendPrompt", async (_e, sessionId: string, text: string, im
 ipcMain.handle("grok:runningSessions", () => [...runningSessions]);
 ipcMain.handle(
   "grok:queueFollowUp",
-  (_e, sessionId: string, text: string, images?: FollowUpImage[]) => {
+  (_e, sessionId: string, text: string, images?: FollowUpImage[], attachments?: string[]) => {
     if (!sessionId || (!text.trim() && !images?.length)) throw new Error("没有可排队的内容");
-    const entry = followUps.create(sessionId, text, images);
+    const entry = followUps.create(sessionId, text, images, attachments);
     followUps.enqueue(entry);
     publishFollowUps(sessionId);
     return { delivery: "queued", entry };
@@ -944,6 +984,13 @@ ipcMain.handle("grok:promoteFollowUp", async (_e, sessionId: string) => {
       return { delivery: "queued", entry, fallback: true };
     }
     steeredSessions.add(sessionId);
+    const cwd =
+      acp.cwdForSession(sessionId) ||
+      listThreads().find((thread) => thread.id === sessionId)?.cwd ||
+      "";
+    if (cwd && entry.attachments.length) {
+      saveTurnAttachments(sessionId, cwd, { startedAt: Date.now(), files: entry.attachments });
+    }
     setSessionRunning(sessionId, true);
     send("grok:follow-up-started", { entry, delivery: "steered" });
     return { delivery: "steered", entry };
@@ -959,6 +1006,36 @@ ipcMain.handle("grok:removeFollowUp", (_e, sessionId: string, entryId: string) =
   return removed;
 });
 ipcMain.handle("grok:queuedFollowUps", (_e, sessionId?: string) => followUps.list(sessionId));
+
+function clipboardFilePaths(): string[] {
+  const formats = clipboard.availableFormats();
+  const candidates = [
+    ...formats.filter((format) => /(?:filenamew|filename|cf_hdrop|filedrop|file-url|uri-list)/i.test(format)),
+    "FileNameW",
+    "CF_HDROP",
+  ];
+  const paths: string[] = [];
+  for (const format of [...new Set(candidates)]) {
+    try {
+      paths.push(...pathsFromClipboardBuffer(format, clipboard.readBuffer(format)));
+    } catch {
+      // Some clipboard formats are advertised but cannot be read as buffers.
+    }
+  }
+  return [...new Set(paths)]
+    .filter((filePath) => path.isAbsolute(filePath) && fs.existsSync(filePath))
+    .filter((filePath) => {
+      try {
+        return fs.statSync(filePath).isFile();
+      } catch {
+        return false;
+      }
+    });
+}
+
+ipcMain.on("grok:clipboardFilePaths", (event) => {
+  event.returnValue = clipboardFilePaths();
+});
 ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeType?: string }) => {
   const mime = (payload?.mimeType || "image/png").toLowerCase();
   const ext = mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : mime.includes("webp") ? "webp" : mime.includes("gif") ? "gif" : "png";
@@ -969,6 +1046,17 @@ ipcMain.handle("grok:savePastedImage", async (_e, payload: { data: string; mimeT
   const file = path.join(dir, `paste-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.${ext}`);
   fs.writeFileSync(file, Buffer.from(raw, "base64"));
   return { path: file, mimeType: mime.startsWith("image/") ? mime : `image/${ext}` };
+});
+ipcMain.handle("grok:savePastedFile", async (_e, payload: { data: string; name?: string; mimeType?: string }) => {
+  const raw = String(payload?.data || "").replace(/^data:[^;]*;base64,/, "");
+  if (!raw) throw new Error("剪贴板里的文件为空");
+  const originalName = path.basename(String(payload?.name || "file"));
+  const safeName = originalName.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim() || "file";
+  const dir = path.join(app.getPath("temp"), "grok-pasted");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `paste-${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${safeName}`);
+  fs.writeFileSync(file, Buffer.from(raw, "base64"));
+  return { path: file, mimeType: String(payload?.mimeType || "application/octet-stream") };
 });
 ipcMain.handle("grok:saveClipboardImage", async () => {
   const image = clipboard.readImage();
@@ -1017,6 +1105,9 @@ ipcMain.handle("grok:respondPermission", (_e, requestId: string, optionId: strin
 
 ipcMain.handle("grok:gitStatus", (_e, cwd: string) => gitStatus(cwd));
 ipcMain.handle("grok:gitFileDiff", (_e, cwd: string, filePath: string) => gitFileDiff(cwd, filePath));
+ipcMain.handle("grok:readFilePreview", (_e, cwd: string, filePath: string) =>
+  readFilePreview(cwd, filePath),
+);
 ipcMain.handle("grok:gitDiscard", (_e, cwd: string, filePath: string) => gitDiscard(cwd, filePath));
 ipcMain.handle("grok:gitStage", (_e, cwd: string, filePath: string) => gitStage(cwd, filePath));
 ipcMain.handle("grok:gitUnstage", (_e, cwd: string, filePath: string) => gitUnstage(cwd, filePath));

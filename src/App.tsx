@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Composer } from "./components/Composer";
 import { DiffPanel } from "./components/DiffPanel";
+import { FilePreviewPanel } from "./components/FilePreviewPanel";
 import { MessageStream } from "./components/MessageStream";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { StatusCard } from "./components/StatusCard";
@@ -10,7 +11,14 @@ import { AutomationPage, MarketplacePage, type WorkspacePage } from "./component
 import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
 import grokLogo from "./assets/grok-logo.jpg";
-import { appendTurnChanges, applyLiveUpdate, stampTurnDuration, stripEphemeral, type PlanRevision } from "./lib/stream";
+import {
+  appendTurnChanges,
+  applyLiveUpdate,
+  mergeTranscriptWithLiveItems,
+  stampTurnDuration,
+  stripEphemeral,
+  type PlanRevision,
+} from "./lib/stream";
 import {
   PLAN_FLOW_STORAGE_KEY,
   buildPlanConversationPrompt,
@@ -53,7 +61,6 @@ import type { QueuedFollowUp } from "../electron/follow-ups";
 type Active = {
   sessionId: string;
   cwd: string;
-  title: string;
   projectCwd: string;
   unattached?: boolean;
   pending?: boolean;
@@ -82,8 +89,14 @@ function imageMimeType(filePath: string): string {
   return "image/png";
 }
 
-function followUpDisplayText(entry: Pick<QueuedFollowUp, "text" | "images">): string {
-  return entry.text.trim() || (entry.images.length ? `图片 ×${entry.images.length}` : "后续消息");
+function followUpDisplayText(entry: Pick<QueuedFollowUp, "text" | "images" | "attachments">): string {
+  const marker = "请同时参考这些路径：";
+  const markerIndex = entry.text.lastIndexOf(marker);
+  const text = (markerIndex >= 0 ? entry.text.slice(0, markerIndex) : entry.text).trim();
+  if (text === "请参考我附带的图片。" && entry.attachments.length) return "";
+  if (text) return text;
+  if (entry.attachments.length) return "";
+  return entry.images.length ? `图片 ×${entry.images.length}` : "后续消息";
 }
 
 function followUpPayload(text: string, attached: string[]) {
@@ -94,9 +107,11 @@ function followUpPayload(text: string, attached: string[]) {
     payload += `${payload ? "\n\n" : ""}请同时参考这些路径：\n` +
       otherFiles.map((filePath) => `- @${filePath}`).join("\n");
   }
+  if (!payload && imageFiles.length) payload = "请参考我附带的图片。";
   return {
     payload,
     images: imageFiles.map((filePath) => ({ path: filePath, mimeType: imageMimeType(filePath) })),
+    attachments: attached,
   };
 }
 
@@ -309,6 +324,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [worktreeMode, setWorktreeMode] = useState(false);
   const [selectedDiffFile, setSelectedDiffFile] = useState<string | null>(null);
+  const [previewFilePath, setPreviewFilePath] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [page, setPage] = useState<WorkspacePage>("chat");
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -340,7 +356,13 @@ export function App() {
   const sendAttemptRef = useRef(0);
   const planActionRef = useRef<string | null>(null);
   const pendingThreadRef = useRef<Promise<Active | null> | null>(null);
-  const failedPromptRef = useRef<{ sessionId: string; text: string; images: { path: string; mimeType: string }[] } | null>(null);
+  const failedPromptRef = useRef<{
+    sessionId: string;
+    text: string;
+    images: { path: string; mimeType: string }[];
+    attachments: string[];
+    startedAt: number;
+  } | null>(null);
   const restoredRef = useRef(false);
   const [hydrated, setHydrated] = useState(false);
   const sidebarDragOrigin = useRef(sidebarWidth);
@@ -351,6 +373,11 @@ export function App() {
   const composerState = composerStates[composerKey] ?? EMPTY_COMPOSER_STATE;
   const { draft, attachments, planMode } = composerState;
   const activeFollowUps = active?.sessionId ? followUpsBySession[active.sessionId] ?? [] : [];
+
+  useEffect(() => {
+    setPreviewFilePath(null);
+  }, [active?.sessionId, selectedProjectCwd, page]);
+
   const setDraft = useCallback((value: string) => {
     setComposerStates((cur) => ({
       ...cur,
@@ -408,12 +435,6 @@ export function App() {
     const [p, t] = await Promise.all([window.grok.listProjects(), window.grok.listThreads()]);
     setProjects(p);
     setThreads(t);
-    setActive((cur) => {
-      if (!cur) return cur;
-      const next = t.find((thread) => thread.id === cur.sessionId);
-      if (!next || next.title === cur.title) return cur;
-      return { ...cur, title: next.title };
-    });
   }, []);
 
   useEffect(() => {
@@ -539,7 +560,12 @@ export function App() {
       if (activeRef.current?.sessionId === entry.sessionId) {
         setItems((current) => [
           ...stampTurnDuration(stripEphemeral(current)),
-          { kind: "user", text: followUpDisplayText(entry), startedAt: Date.now() },
+          {
+            kind: "user",
+            text: followUpDisplayText(entry),
+            attachments: entry.attachments,
+            startedAt: Date.now(),
+          },
         ]);
       }
     });
@@ -694,17 +720,17 @@ export function App() {
         updateUnreadSessionIds(current, { sessionId: thread.id, unread: false }),
       );
     }
+    const unattached = isUnattached(thread);
+    setPage("chat");
+    setSelectedProjectCwd(unattached ? null : thread.projectCwd);
+    if (activeRef.current?.sessionId === thread.id) return;
     sendAttemptRef.current += 1;
     planActionRef.current = null;
     setError(null);
     setPlanDocument(null);
-    const unattached = isUnattached(thread);
-    setPage("chat");
-    setSelectedProjectCwd(unattached ? null : thread.projectCwd);
     const nextActive: Active = {
       sessionId: thread.id,
       cwd: thread.cwd,
-      title: thread.title,
       projectCwd: unattached ? "" : thread.projectCwd,
       unattached,
     };
@@ -723,7 +749,7 @@ export function App() {
       return;
     }
     if (activeViewVersionRef.current !== viewVersion || activeRef.current?.sessionId !== thread.id) return;
-    setItems(transcript.items);
+    setItems((current) => mergeTranscriptWithLiveItems(transcript.items, current));
     setContextUsed(transcript.contextUsed);
     setContextUsage(transcript.contextUsage);
     const storedPlan = readStoredPlanFlow(thread.id);
@@ -823,7 +849,6 @@ export function App() {
       const nextActive: Active = {
         sessionId: "",
         cwd: cwd || "",
-        title: "新会话",
         projectCwd: cwd || "",
         unattached,
         pending: true,
@@ -867,14 +892,28 @@ export function App() {
         const next: Active = {
           sessionId: created.sessionId,
           cwd: created.cwd,
-          title: created.title,
           projectCwd: nextUnattached ? "" : created.projectCwd,
           unattached: nextUnattached,
         };
         setSelectedProjectCwd(nextUnattached ? null : created.projectCwd);
         setWorktreeMode(Boolean(created.worktree));
         setActive(next);
-        void refresh();
+        const now = new Date().toISOString();
+        const pendingThread: ThreadInfo = {
+          id: created.sessionId,
+          cwd: created.cwd,
+          title: created.title || "新会话",
+          updatedAt: now,
+          createdAt: now,
+          projectCwd: nextUnattached ? "" : created.projectCwd,
+          worktree: Boolean(created.worktree),
+          unattached: nextUnattached,
+        };
+        setThreads((current) =>
+          current.some((thread) => thread.id === pendingThread.id)
+            ? current
+            : [pendingThread, ...current],
+        );
         if (nextUnattached) setGit(null);
         else void window.grok.gitStatus(created.cwd).then(setGit);
         return next;
@@ -891,7 +930,7 @@ export function App() {
         if (pendingThreadRef.current === task) pendingThreadRef.current = null;
       }
     },
-    [refresh],
+    [],
   );
 
   const forkThread = useCallback(
@@ -916,7 +955,6 @@ export function App() {
         setActive({
           sessionId: created.sessionId,
           cwd: created.cwd,
-          title: created.title,
           projectCwd: nextUnattached ? "" : created.projectCwd,
           unattached: nextUnattached,
         });
@@ -982,10 +1020,10 @@ export function App() {
 
       const queuedDraft = draft;
       const queuedAttachments = [...attachments];
-      const { payload, images } = followUpPayload(queuedDraft, queuedAttachments);
+      const { payload, images, attachments: queuedFiles } = followUpPayload(queuedDraft, queuedAttachments);
       followUpSendingRef.current.add(runningSessionId);
       try {
-        await window.grok.queueFollowUp(runningSessionId, payload, images);
+        await window.grok.queueFollowUp(runningSessionId, payload, images, queuedFiles);
         setComposerStates((current) => {
           const source = current[sourceComposerKey] ?? EMPTY_COMPOSER_STATE;
           const unchanged =
@@ -1059,6 +1097,7 @@ export function App() {
     if (otherFiles.length) {
       payload += `${payload ? "\n\n" : ""}请同时参考这些路径：\n` + otherFiles.map((p) => `- @${p}`).join("\n");
     }
+    if (!payload && imageFiles.length) payload = "请参考我附带的图片。";
     setComposerStates((cur) => {
       const source = cur[sourceComposerKey] ?? { draft, attachments, planMode };
       const cleared = { ...source, draft: "", attachments: [], planMode };
@@ -1099,7 +1138,7 @@ export function App() {
         releaseSendLocks();
         return;
       }
-      const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
+      const userText = text;
       const userStartedAt = Date.now();
       const pendingImages = imageFiles.map((p) => ({
         path: p,
@@ -1140,7 +1179,10 @@ export function App() {
             userStartedAt,
             hasPlan: false,
           };
-      setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: userStartedAt }]);
+      setItems((prev) => [
+        ...prev,
+        { kind: "user", text: userText, attachments: [...attached], startedAt: userStartedAt },
+      ]);
       setPlanPanel(flow);
       writeStoredPlanFlow(flow);
       let planSendError: string | null = null;
@@ -1153,7 +1195,7 @@ export function App() {
         /* A missing baseline must not prevent the plan request from being sent. */
       }
       try {
-        await window.grok.sendPrompt(session.sessionId, planPrompt, pendingImages);
+        await window.grok.sendPrompt(session.sessionId, planPrompt, pendingImages, attached, userStartedAt);
       } catch (err) {
         planSendError = err instanceof Error ? err.message : String(err);
       } finally {
@@ -1210,7 +1252,8 @@ export function App() {
       }
       return;
     }
-    const userText = payload || (imageFiles.length ? `图片 ×${imageFiles.length}` : "");
+    const userText = text;
+    const userStartedAt = Date.now();
     const promptImages = imageFiles.map((p) => ({
       path: p,
       mimeType: /\.jpe?g$/i.test(p) ? "image/jpeg" : /\.gif$/i.test(p) ? "image/gif" : /\.webp$/i.test(p) ? "image/webp" : "image/png",
@@ -1235,11 +1278,20 @@ export function App() {
     }
     failedPromptRef.current = null;
     setError(null);
-    setItems((prev) => [...prev, { kind: "user", text: userText, startedAt: Date.now() }]);
+    setItems((prev) => [
+      ...prev,
+      { kind: "user", text: userText, attachments: [...attached], startedAt: userStartedAt },
+    ]);
     try {
-      await window.grok.sendPrompt(session.sessionId, payload, promptImages);
+      await window.grok.sendPrompt(session.sessionId, payload, promptImages, attached, userStartedAt);
     } catch (err) {
-      failedPromptRef.current = { sessionId: session.sessionId, text: payload, images: promptImages };
+      failedPromptRef.current = {
+        sessionId: session.sessionId,
+        text: payload,
+        images: promptImages,
+        attachments: [...attached],
+        startedAt: userStartedAt,
+      };
       if (activeRef.current?.sessionId === session.sessionId) {
         setError(err instanceof Error ? err.message : String(err));
       }
@@ -1264,7 +1316,13 @@ export function App() {
     setError(null);
     setRunningIds((cur) => new Set(cur).add(failed.sessionId));
     try {
-      await window.grok.sendPrompt(failed.sessionId, failed.text, failed.images);
+      await window.grok.sendPrompt(
+        failed.sessionId,
+        failed.text,
+        failed.images,
+        failed.attachments,
+        failed.startedAt,
+      );
       failedPromptRef.current = null;
     } catch (err) {
       if (activeRef.current?.sessionId === failed.sessionId) {
@@ -1457,7 +1515,7 @@ export function App() {
     void window.grok.cancel(active.sessionId).then((cleared) => {
       if (!cleared.length || activeRef.current?.sessionId !== active.sessionId) return;
       const queuedText = cleared.map((entry) => entry.text.trim()).filter(Boolean).join("\n\n");
-      const queuedImages = cleared.flatMap((entry) => entry.images.map((image) => image.path));
+      const queuedImages = cleared.flatMap((entry) => entry.attachments);
       setComposerStates((current) => {
         const source = current[composerKey] ?? EMPTY_COMPOSER_STATE;
         return {
@@ -1628,7 +1686,9 @@ export function App() {
   const envIsWorktree = active ? isWorktree : Boolean(selectedProject) && worktreeMode;
   const showProjectChrome = Boolean(selectedProject && !unattachedActive);
   const reviewSidebarOpen = page === "chat" && reviewOpen && showProjectChrome;
-  const rightSidebarOpen = planSidebarOpen || reviewSidebarOpen;
+  const filePreviewCwd = active?.cwd || selectedProjectCwd;
+  const fileSidebarOpen = page === "chat" && Boolean(previewFilePath && filePreviewCwd);
+  const rightSidebarOpen = planSidebarOpen || fileSidebarOpen || reviewSidebarOpen;
   const sidebarCol = fitSidebar(
     winW,
     sidebarWidth,
@@ -1654,7 +1714,6 @@ export function App() {
       }
     >
       <TitleBar
-        subtitle={active?.title}
         onTerminal={() => setTerminalOpen((v) => !v)}
         terminalActive={terminalOpen}
       />
@@ -1734,14 +1793,65 @@ export function App() {
               await refresh();
             });
           }}
+          onRemoveProjectThreads={(project) => {
+            const projectThreads = threads.filter(
+              (thread) =>
+                !thread.unattached &&
+                Boolean(thread.projectCwd) &&
+                samePath(thread.projectCwd, project.cwd),
+            );
+            if (projectThreads.length === 0) {
+              window.alert(`项目「${project.name}」中没有聊天。`);
+              return;
+            }
+            if (
+              !window.confirm(
+                `移除项目「${project.name}」中的全部 ${projectThreads.length} 个聊天？此操作无法撤销，项目文件不会被删除。`,
+              )
+            ) {
+              return;
+            }
+
+            void (async () => {
+              const removedIds = new Set(projectThreads.map((thread) => thread.id));
+              await Promise.all(
+                projectThreads.map(async (thread) => {
+                  if (runningIds.has(thread.id)) {
+                    await window.grok.cancel(thread.id).catch(() => undefined);
+                  }
+                  await window.grok.removeThread(thread.id, thread.cwd);
+                  clearStoredPlanFlow(thread.id);
+                }),
+              );
+              setUnreadIds((current) => {
+                const next = new Set(current);
+                removedIds.forEach((id) => next.delete(id));
+                return next;
+              });
+              setRunningIds((current) => {
+                const next = new Set(current);
+                removedIds.forEach((id) => next.delete(id));
+                return next;
+              });
+              if (active && removedIds.has(active.sessionId)) {
+                setActive(null);
+                setItems([]);
+                setContextUsed(null);
+                setContextUsage(null);
+                setPlanDocument(null);
+                setPlanPanel(null);
+              }
+              await refresh();
+            })().catch((err) => {
+              setError(`无法移除全部聊天：${err instanceof Error ? err.message : String(err)}`);
+              void refresh();
+            });
+          }}
           onOpenProjectFolder={(project) => {
             void window.grok.openPath(project.cwd);
           }}
           onRenameThread={(thread, title) => {
-            void window.grok.renameThread(thread.id, thread.cwd, title).then((next) => {
-              setActive((cur) =>
-                cur && cur.sessionId === next.id ? { ...cur, title: next.title } : cur,
-              );
+            void window.grok.renameThread(thread.id, thread.cwd, title).then(() => {
               void refresh();
             });
           }}
@@ -1801,7 +1911,6 @@ export function App() {
                   const nextActive: Active = {
                     sessionId,
                     cwd: sessionCwd,
-                    title: "定时任务",
                     projectCwd: unattached ? "" : sessionCwd,
                     unattached,
                   };
@@ -1859,10 +1968,11 @@ export function App() {
             }}
             onOpenFile={(filePath) => {
               setPlanDocument(null);
-              setReviewOpen(true);
-              setSelectedDiffFile(filePath.replace(/\\/g, "/"));
+              setReviewOpen(false);
+              setPreviewFilePath(filePath.replace(/\\/g, "/"));
               if (gitCwd) void window.grok.gitStatus(gitCwd).then(setGit);
             }}
+            onOpenAttachment={(filePath) => void window.grok.openPath(filePath)}
             emptyTitle={
               active
                 ? "新会话"
@@ -1888,6 +1998,7 @@ export function App() {
             }
             onOpenPlan={(revision) => {
               setReviewOpen(false);
+              setPreviewFilePath(null);
               setPlanDocument(revision);
             }}
           />
@@ -2007,6 +2118,13 @@ export function App() {
                   if (latestActivePlanRevision) void approvePlan(latestActivePlanRevision);
                 }}
               />
+            ) : fileSidebarOpen && previewFilePath && filePreviewCwd ? (
+              <FilePreviewPanel
+                cwd={filePreviewCwd}
+                filePath={previewFilePath}
+                onClose={() => setPreviewFilePath(null)}
+                onOpenEditor={() => void window.grok.openInEditor(filePreviewCwd, previewFilePath)}
+              />
             ) : (
               <DiffPanel
                 git={git}
@@ -2047,6 +2165,7 @@ export function App() {
           items={items}
           onOpenChanges={() => {
             setPlanDocument(null);
+            setPreviewFilePath(null);
             setReviewOpen(true);
             setSelectedDiffFile((cur) => cur || git?.files[0]?.path || null);
           }}

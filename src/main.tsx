@@ -1,5 +1,6 @@
 import React, { Component, type ErrorInfo, type ReactNode } from "react";
 import ReactDOM from "react-dom/client";
+import "@fontsource-variable/inter";
 import { App } from "./App";
 import "./index.css";
 
@@ -14,7 +15,7 @@ class RootErrorBoundary extends Component<{ children: ReactNode }, { error: Erro
   render() {
     if (this.state.error) {
       return (
-        <div style={{ padding: 24, fontFamily: "Segoe UI, sans-serif", color: "#1a1a1a" }}>
+        <div style={{ padding: 24, fontFamily: '"Inter Variable", "Microsoft YaHei UI", sans-serif', color: "#1a1c1f" }}>
           <h2 style={{ marginTop: 0 }}>界面出错</h2>
           <pre style={{ whiteSpace: "pre-wrap" }}>{this.state.error.stack || this.state.error.message}</pre>
         </div>

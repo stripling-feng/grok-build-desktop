@@ -25,7 +25,10 @@ export class TurnCompletionTracker {
       this.suppressLiveUntil.delete(sessionId);
       if (now <= suppressUntil) return false;
     }
-    if (this.active.has(sessionId)) this.liveCompleted.add(sessionId);
+    // Loading an existing session can replay every persisted completion. Only
+    // a completion belonging to a prompt started by this app is live.
+    if (!this.active.has(sessionId) || this.liveCompleted.has(sessionId)) return false;
+    this.liveCompleted.add(sessionId);
     return true;
   }
 

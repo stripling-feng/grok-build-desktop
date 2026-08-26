@@ -25,6 +25,7 @@ type Props = {
   onSelectThread: (thread: ThreadInfo) => void;
   onRenameProject: (project: ProjectInfo, name: string) => void;
   onRemoveProject: (project: ProjectInfo) => void;
+  onRemoveProjectThreads: (project: ProjectInfo) => void;
   onOpenProjectFolder: (project: ProjectInfo) => void;
   onRenameThread: (thread: ThreadInfo, title: string) => void;
   onForkThread: (thread: ThreadInfo) => void;
@@ -91,6 +92,16 @@ function PlusIcon() {
   return (
     <Icon>
       <path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </Icon>
+  );
+}
+
+function MoreIcon() {
+  return (
+    <Icon>
+      <circle cx="3.5" cy="8" r="1" fill="currentColor" />
+      <circle cx="8" cy="8" r="1" fill="currentColor" />
+      <circle cx="12.5" cy="8" r="1" fill="currentColor" />
     </Icon>
   );
 }
@@ -307,6 +318,76 @@ function SwitchLoginIcon() {
   );
 }
 
+function AccountLoginChoiceIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden>
+      <circle cx="12" cy="8.2" r="3.6" fill="none" stroke="currentColor" strokeWidth="1.7" />
+      <path
+        d="M5.8 19c.7-3.6 3-5.4 6.2-5.4s5.5 1.8 6.2 5.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function ApiLoginChoiceIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden>
+      <circle cx="8.2" cy="11.2" r="4.2" fill="none" stroke="currentColor" strokeWidth="1.7" />
+      <path
+        d="m11.2 14.2 6.7 6.7M15 18l2.1-2.1M17 20l2.1-2.1"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function LoginChevronIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden>
+      <path
+        d="m6 3.5 4.5 4.5L6 12.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function LoginCheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden>
+      <path
+        d="m3.2 8.3 3 3 6.6-6.6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function LoginLockIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden>
+      <rect x="3.3" y="7" width="9.4" height="6.4" rx="2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" fill="none" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
+}
+
 function LogoutIcon() {
   return (
     <Icon>
@@ -333,6 +414,13 @@ function clampMenu(x: number, y: number, width: number, height: number) {
     x: Math.max(8, Math.min(x, window.innerWidth - width - 8)),
     y: Math.max(8, Math.min(y, window.innerHeight - height - 8)),
   };
+}
+
+function formatUpdateBytes(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes)) return "";
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${Math.round(bytes)} B`;
 }
 
 type CcSwitchProvider = { id: string; name: string; baseUrl: string; apiKey: string };
@@ -417,8 +505,11 @@ function ApiLoginView({
   const hasProviders = ccSwitchProviders.length > 0;
 
   return (
-    <>
-      <p className="settings-hint">凭据仅写入本机 ~/.grok，不会上传到桌面端。</p>
+    <div className="api-login-view">
+      <div className="login-security-note">
+        <LoginLockIcon />
+        <span>凭据仅保存在本机 ~/.grok，不会上传</span>
+      </div>
       {loginError ? <p className="settings-error">{loginError}</p> : null}
 
       {ccSwitchLoading ? (
@@ -517,7 +608,7 @@ function ApiLoginView({
           </button>
         ) : null}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -536,6 +627,7 @@ export function Sidebar({
   onSelectThread,
   onRenameProject,
   onRemoveProject,
+  onRemoveProjectThreads,
   onOpenProjectFolder,
   onRenameThread,
   onForkThread,
@@ -609,6 +701,10 @@ export function Sidebar({
       window.clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    return window.grok.onAppUpdateState((next) => setUpdate(next));
+  }, []);
   const accountTriggerRef = useRef<HTMLDivElement>(null);
   const usageRequestRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -636,6 +732,15 @@ export function Sidebar({
     setShowManualEntry(false);
     setLoginOpen(true);
   };
+
+  useEffect(() => {
+    if (!loginOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeLogin();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [loginOpen, loginBusy]);
 
   const grouped = useMemo(() => {
     return projects.map((project) => ({
@@ -795,6 +900,7 @@ export function Sidebar({
         hasUpdate: false,
         url: "",
         notes: "",
+        status: "error",
         error: "检测失败",
       });
       setUpdateOpen(true);
@@ -923,13 +1029,33 @@ export function Sidebar({
                     e.preventDefault();
                     e.stopPropagation();
                     onSelectProject(project);
-                    openMenu({ kind: "project", project, x: e.clientX, y: e.clientY }, 124);
+                    openMenu({ kind: "project", project, x: e.clientX, y: e.clientY }, 164);
                   }}
                 >
                   <FolderIcon />
                   <span className="project-name">{project.name}</span>
                 </button>
               )}
+              {rename?.kind !== "project" || !same(rename.cwd, project.cwd) ? (
+                <button
+                  className={`project-action${menu?.kind === "project" && same(menu.project.cwd, project.cwd) ? " on" : ""}`}
+                  type="button"
+                  title={`更多项目操作：${project.name}`}
+                  aria-label={`打开项目「${project.name}」的操作菜单`}
+                  aria-haspopup="menu"
+                  aria-expanded={menu?.kind === "project" && same(menu.project.cwd, project.cwd)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onSelectProject(project);
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    openMenu({ kind: "project", project, x: rect.right - 176, y: rect.bottom + 4 }, 164);
+                  }}
+                >
+                  <MoreIcon />
+                </button>
+              ) : null}
               {list.map((t) =>
                 rename?.kind === "thread" && rename.id === t.id ? (
                   <div key={t.id} className="thread renaming">
@@ -967,7 +1093,11 @@ export function Sidebar({
                   >
                     <span className="thread-name">{t.title}</span>
                     {unreadIds.has(t.id) ? <span className="thread-unread" title="未读" aria-label="未读" /> : null}
-                    <ThreadActivityTime updatedAt={t.updatedAt} />
+                    {runningIds.has(t.id) ? (
+                      <SpinnerIcon className="thread-spinner" />
+                    ) : (
+                      <ThreadActivityTime updatedAt={t.updatedAt} />
+                    )}
                   </button>
                 ),
               )}
@@ -1170,105 +1300,164 @@ export function Sidebar({
       ) : null}
       {loginOpen ? (
         <div
-          className="modal-backdrop"
+          className="modal-backdrop login-backdrop"
           onClick={closeLogin}
         >
-          <div className="modal login-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h2>{loginView === "api" ? "API 登录" : "选择登录方式"}</h2>
+          <div
+            className={`modal login-modal login-modal-${loginView}`}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="login-dialog-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="login-window-bar">
+              <span className="login-window-title">Grok Build</span>
               <button
-                className="btn small ghost"
+                className="login-window-close"
                 type="button"
+                aria-label={loginBusy ? "取消登录" : "关闭"}
+                title={loginBusy ? "取消登录" : "关闭"}
                 onClick={closeLogin}
               >
-                {loginBusy ? "取消" : "关闭"}
+                <svg viewBox="0 0 16 16" aria-hidden>
+                  <path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" />
+                </svg>
               </button>
             </div>
-            {loginView === "choose" ? (
-              <>
-                <p className="settings-hint">
-                  {account?.method === "none" ? "选择一种登录方式。" : `当前登录：${accountLabel(account)}`}
-                </p>
-                {loginError ? <p className="settings-error">{loginError}</p> : null}
-                <div className="login-choices">
-                  <button
-                    className={`login-choice${account?.method === "oauth" ? " current" : ""}`}
-                    type="button"
-                    disabled={loginBusy}
-                    onClick={() => {
-                      setLoginBusy(true);
-                      setLoginError("正在打开授权页，请在浏览器中完成 xAI 账号登录…");
-                      void window.grok
-                        .loginAccount()
-                        .then((result) => {
-                          if (result.ok) {
-                            onAccountChange?.(result.account);
-                            setLoginError("");
-                            setLoginOpen(false);
-                            return;
-                          }
-                          setLoginError(result.message || "账号登录未完成");
-                        })
-                        .catch((err) => {
-                          setLoginError(err instanceof Error ? err.message : String(err));
-                        })
-                        .finally(() => setLoginBusy(false));
-                    }}
-                  >
-                    <strong>
-                      账号登录
-                      {account?.method === "oauth" ? <em>当前使用</em> : null}
-                    </strong>
-                    <span>使用 xAI 账号，浏览器完成授权</span>
-                  </button>
-                  <button
-                    className={`login-choice${account?.method === "api-key" ? " current" : ""}`}
-                    type="button"
-                    disabled={loginBusy}
-                    onClick={() => {
-                      setLoginError("");
-                      setLoginView("api");
-                    }}
-                  >
-                    <strong>
-                      API 登录
-                      {account?.method === "api-key" ? <em>当前使用</em> : null}
-                    </strong>
-                    <span>中转站 Base URL + API Key</span>
-                  </button>
+            <div className="login-modal-content">
+              <div className="login-hero">
+                <div className={`login-hero-icon ${loginView === "api" ? "api" : "account"}`}>
+                  {loginView === "api" ? <ApiLoginChoiceIcon /> : <AccountLoginChoiceIcon />}
                 </div>
-                {loginBusy ? (
-                  <p className="settings-hint">正在打开登录页，请在浏览器中完成授权…</p>
+                <h2 id="login-dialog-title">
+                  {loginView === "api"
+                    ? "使用 API 密钥"
+                    : !account || account.method === "none"
+                      ? "登录 Grok Build"
+                      : "切换登录方式"}
+                </h2>
+                <p>
+                  {loginView === "api"
+                    ? "选择已有供应商，或手动配置连接信息"
+                    : "选择最适合你的方式，稍后也可以随时切换"}
+                </p>
+                {loginView === "choose" && account && account.method !== "none" ? (
+                  <div className="login-current-account">
+                    <span aria-hidden />
+                    当前登录：{accountLabel(account)}
+                  </div>
                 ) : null}
-              </>
-            ) : (
-              <ApiLoginView
-                baseUrl={baseUrl}
-                setBaseUrl={setBaseUrl}
-                apiKey={apiKey}
-                setApiKey={setApiKey}
-                loginBusy={loginBusy}
-                setLoginBusy={setLoginBusy}
-                loginError={loginError}
-                setLoginError={setLoginError}
-                ccSwitchProviders={ccSwitchProviders}
-                ccSwitchLoading={ccSwitchLoading}
-                showManualEntry={showManualEntry}
-                setShowManualEntry={setShowManualEntry}
-                selectedProviderId={selectedProviderId}
-                setSelectedProviderId={setSelectedProviderId}
-                onBack={() => {
-                  setLoginError("");
-                  setLoginView("choose");
-                }}
-                onSuccess={(account) => {
-                  onAccountChange?.(account);
-                  setLoginOpen(false);
-                  setApiKey("");
-                  setSelectedProviderId(null);
-                }}
-              />
-            )}
+              </div>
+
+              {loginView === "choose" ? (
+                <>
+                  {loginError && !loginBusy ? <p className="settings-error">{loginError}</p> : null}
+                  <div className="login-choices">
+                    <button
+                      className={`login-choice${account?.method === "oauth" ? " current" : ""}`}
+                      type="button"
+                      aria-pressed={account?.method === "oauth"}
+                      disabled={loginBusy}
+                      onClick={() => {
+                        setLoginBusy(true);
+                        setLoginError("正在打开授权页，请在浏览器中完成 xAI 账号登录…");
+                        void window.grok
+                          .loginAccount()
+                          .then((result) => {
+                            if (result.ok) {
+                              onAccountChange?.(result.account);
+                              setLoginError("");
+                              setLoginOpen(false);
+                              return;
+                            }
+                            setLoginError(result.message || "账号登录未完成");
+                          })
+                          .catch((err) => {
+                            setLoginError(err instanceof Error ? err.message : String(err));
+                          })
+                          .finally(() => setLoginBusy(false));
+                      }}
+                    >
+                      <span className="login-choice-icon account">
+                        <AccountLoginChoiceIcon />
+                      </span>
+                      <span className="login-choice-copy">
+                        <span className="login-choice-heading">
+                          <strong>xAI 账号登录</strong>
+                          {account?.method === "oauth" ? <em>当前使用</em> : null}
+                        </span>
+                        <span className="login-choice-description">在浏览器中安全完成账号授权</span>
+                      </span>
+                      <span className={`login-choice-action${account?.method === "oauth" ? " selected" : ""}`}>
+                        {loginBusy ? <SpinnerIcon /> : account?.method === "oauth" ? <LoginCheckIcon /> : <LoginChevronIcon />}
+                      </span>
+                    </button>
+                    <button
+                      className={`login-choice${account?.method === "api-key" ? " current" : ""}`}
+                      type="button"
+                      aria-pressed={account?.method === "api-key"}
+                      disabled={loginBusy}
+                      onClick={() => {
+                        setLoginError("");
+                        setLoginView("api");
+                      }}
+                    >
+                      <span className="login-choice-icon api">
+                        <ApiLoginChoiceIcon />
+                      </span>
+                      <span className="login-choice-copy">
+                        <span className="login-choice-heading">
+                          <strong>API 密钥登录</strong>
+                          {account?.method === "api-key" ? <em>当前使用</em> : null}
+                        </span>
+                        <span className="login-choice-description">使用 Base URL 与 API Key 连接</span>
+                      </span>
+                      <span className={`login-choice-action${account?.method === "api-key" ? " selected" : ""}`}>
+                        {account?.method === "api-key" ? <LoginCheckIcon /> : <LoginChevronIcon />}
+                      </span>
+                    </button>
+                  </div>
+                  {loginBusy ? (
+                    <div className="login-progress" role="status">
+                      <SpinnerIcon />
+                      <span>授权页已打开，请在浏览器中完成登录</span>
+                      <button type="button" onClick={closeLogin}>取消</button>
+                    </div>
+                  ) : null}
+                  <p className="login-privacy-note">
+                    <LoginLockIcon />
+                    登录信息由 Grok CLI 安全保存在本机
+                  </p>
+                </>
+              ) : (
+                <ApiLoginView
+                  baseUrl={baseUrl}
+                  setBaseUrl={setBaseUrl}
+                  apiKey={apiKey}
+                  setApiKey={setApiKey}
+                  loginBusy={loginBusy}
+                  setLoginBusy={setLoginBusy}
+                  loginError={loginError}
+                  setLoginError={setLoginError}
+                  ccSwitchProviders={ccSwitchProviders}
+                  ccSwitchLoading={ccSwitchLoading}
+                  showManualEntry={showManualEntry}
+                  setShowManualEntry={setShowManualEntry}
+                  selectedProviderId={selectedProviderId}
+                  setSelectedProviderId={setSelectedProviderId}
+                  onBack={() => {
+                    setLoginError("");
+                    setLoginView("choose");
+                  }}
+                  onSuccess={(account) => {
+                    onAccountChange?.(account);
+                    setLoginOpen(false);
+                    setApiKey("");
+                    setSelectedProviderId(null);
+                  }}
+                />
+              )}
+            </div>
           </div>
         </div>
       ) : null}
@@ -1281,31 +1470,66 @@ export function Sidebar({
                 关闭
               </button>
             </div>
-            {update.error ? <p className="settings-hint">{update.error}</p> : null}
-            {!update.error && update.hasUpdate ? (
+            {update.hasUpdate ? (
               <>
                 <p>
                   当前 {update.current}，最新 {update.latest}。
                 </p>
-                {update.dev ? <p className="settings-hint">开发版不会自动安装，请下载安装包后手动安装。</p> : null}
+                {update.dev ? <p className="settings-hint">开发环境仅检查版本，请在正式安装版中测试应用内更新。</p> : null}
                 {update.notes ? (
                   <div className="update-notes">
                     <Markdown text={update.notes} />
                   </div>
                 ) : null}
+                {update.status === "downloading" ? (
+                  <div className="update-download" role="status">
+                    <div className="update-download-head">
+                      <span>正在应用内下载更新…</span>
+                      <strong>{Math.round(update.progress || 0)}%</strong>
+                    </div>
+                    <div className="update-progress-track" aria-label="更新下载进度">
+                      <span style={{ width: `${Math.max(0, Math.min(100, update.progress || 0))}%` }} />
+                    </div>
+                    <p>
+                      {formatUpdateBytes(update.transferred)}
+                      {update.total ? ` / ${formatUpdateBytes(update.total)}` : ""}
+                      {update.bytesPerSecond ? ` · ${formatUpdateBytes(update.bytesPerSecond)}/s` : ""}
+                    </p>
+                  </div>
+                ) : null}
+                {update.status === "downloaded" ? (
+                  <div className="update-ready" role="status">
+                    更新已下载完成，重启应用即可自动安装。
+                  </div>
+                ) : null}
+                {update.error ? <p className="settings-error">{update.error}</p> : null}
                 <div className="permission-actions">
                   <button
                     className="btn primary"
                     type="button"
+                    disabled={update.dev || update.status === "downloading"}
                     onClick={() => {
-                      void window.grok.openUpdate(update.url);
+                      if (update.status === "downloaded") {
+                        void window.grok.installUpdate();
+                        return;
+                      }
+                      void window.grok.downloadUpdate().then(setUpdate);
                     }}
                   >
-                    下载安装包
+                    {update.dev
+                      ? "正式安装版支持应用内更新"
+                      : update.status === "downloading"
+                        ? `下载中 ${Math.round(update.progress || 0)}%`
+                        : update.status === "downloaded"
+                          ? "重启并安装"
+                          : update.status === "error"
+                            ? "重新下载"
+                            : "在应用内下载"}
                   </button>
                 </div>
               </>
             ) : null}
+            {update.error && !update.hasUpdate ? <p className="settings-error">{update.error}</p> : null}
             {!update.error && !update.hasUpdate ? (
               <p>已是最新版本{update.current ? ` ${update.current}` : ""}。</p>
             ) : null}
@@ -1350,6 +1574,19 @@ export function Sidebar({
                 type="button"
                 className="danger"
                 onClick={() => {
+                  onRemoveProjectThreads(menu.project);
+                  setMenu(null);
+                }}
+              >
+                <span className="ctx-icon">
+                  <TrashIcon />
+                </span>
+                移除全部聊天
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => {
                   onRemoveProject(menu.project);
                   setMenu(null);
                 }}
@@ -1357,7 +1594,7 @@ export function Sidebar({
                 <span className="ctx-icon">
                   <TrashIcon />
                 </span>
-                移除
+                移除项目
               </button>
             </>
           ) : (

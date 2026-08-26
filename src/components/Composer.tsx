@@ -9,6 +9,7 @@ import type {
   ReasoningEffort,
 } from "../../electron/shared";
 import type { QueuedFollowUp } from "../../electron/follow-ups";
+import { AttachmentCard } from "./AttachmentCard";
 import { permissionOptionLabel } from "../lib/i18n";
 
 type Props = {
@@ -355,14 +356,6 @@ function ContextRing({
   );
 }
 
-function fileName(p: string) {
-  return p.replace(/^.*[\\/]/, "") || p;
-}
-
-function isImagePath(p: string) {
-  return /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(p);
-}
-
 async function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -372,11 +365,23 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
+function queuedFollowUpLabel(entry: QueuedFollowUp): string {
+  const markerIndex = entry.text.lastIndexOf("请同时参考这些路径：");
+  const text = (markerIndex >= 0 ? entry.text.slice(0, markerIndex) : entry.text).trim();
+  if (text && text !== "请参考我附带的图片。") return text;
+  return `附件 ×${entry.attachments.length || entry.images.length}`;
+}
+
+function pathForFile(file: File): string {
+  try {
+    return window.grok.pathForFile(file) || (file as File & { path?: string }).path || "";
+  } catch {
+    return (file as File & { path?: string }).path || "";
+  }
+}
+
 function dropPaths(e: DragEvent): string[] {
-  const files = [...e.dataTransfer.files];
-  return files
-    .map((f) => (f as File & { path?: string }).path || "")
-    .filter(Boolean);
+  return [...e.dataTransfer.files].map(pathForFile).filter(Boolean);
 }
 
 export function Composer({
@@ -524,12 +529,16 @@ export function Composer({
     onAttachments([...attachments, ...paths.filter((p) => !attachments.includes(p))]);
   }
 
-  async function pasteImages(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+  async function pasteFiles(e: React.ClipboardEvent<HTMLTextAreaElement>, nativeFiles: string[]) {
     const items = [...e.clipboardData.items];
     const files = items
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .filter((item) => item.kind === "file")
       .map((item) => item.getAsFile())
       .filter((file): file is File => Boolean(file));
+    if (nativeFiles.length) {
+      addPaths(nativeFiles);
+      return;
+    }
     if (!files.length) {
       if (e.clipboardData.getData("text")) return;
       const native = await window.grok.saveClipboardImage();
@@ -541,10 +550,27 @@ export function Composer({
     const saved: string[] = [];
     for (const file of files) {
       try {
+        const diskPath = pathForFile(file);
+        if (diskPath) {
+          saved.push(diskPath);
+          if (file.type.startsWith("image/")) {
+            const data = await blobToDataUrl(file);
+            setPreviews((cur) => ({ ...cur, [diskPath]: data }));
+          }
+          continue;
+        }
         const data = await blobToDataUrl(file);
-        const next = await window.grok.savePastedImage({ data, mimeType: file.type || "image/png" });
+        const next = file.type.startsWith("image/")
+          ? await window.grok.savePastedImage({ data, mimeType: file.type || "image/png" })
+          : await window.grok.savePastedFile({
+              data,
+              name: file.name || "file",
+              mimeType: file.type || "application/octet-stream",
+            });
         saved.push(next.path);
-        setPreviews((cur) => ({ ...cur, [next.path]: data }));
+        if (file.type.startsWith("image/")) {
+          setPreviews((cur) => ({ ...cur, [next.path]: data }));
+        }
       } catch {
         /* skip a bad clipboard item */
       }
@@ -606,8 +632,8 @@ export function Composer({
           </div>
           {queuedFollowUps.map((entry) => (
             <div className="follow-up-row" key={entry.id}>
-              <span title={entry.text || `图片 ×${entry.images.length}`}>
-                {entry.text.trim() || `图片 ×${entry.images.length}`}
+              <span title={queuedFollowUpLabel(entry)}>
+                {queuedFollowUpLabel(entry)}
               </span>
               <button type="button" onClick={() => onRemoveFollowUp(entry.id)} aria-label="移除排队消息">
                 ×
@@ -712,25 +738,27 @@ export function Composer({
             ) : null}
           </div>
           ) : null}
-          {attachments.length || goal ? (
-            <div className="composer-chips">
-              {goal ? (
-                <span className="chip" title={goal}>
-                  目标：{goal}
-                  <button type="button" onClick={() => onGoal("")}>
-                    ×
-                  </button>
-                </span>
-              ) : null}
+          {attachments.length ? (
+            <div className="composer-attachments" role="list" aria-label="已添加的文件">
               {attachments.map((p) => (
-                <span className={`chip${isImagePath(p) ? " image" : ""}`} key={p} title={p}>
-                  {previews[p] ? <img className="chip-thumb" src={previews[p]} alt="" /> : null}
-                  {isImagePath(p) ? "截图" : fileName(p)}
-                  <button type="button" onClick={() => onAttachments(attachments.filter((x) => x !== p))}>
-                    ×
-                  </button>
-                </span>
+                <AttachmentCard
+                  key={p}
+                  filePath={p}
+                  preview={previews[p]}
+                  onOpen={(filePath) => void window.grok.openPath(filePath)}
+                  onRemove={(filePath) => onAttachments(attachments.filter((item) => item !== filePath))}
+                />
               ))}
+            </div>
+          ) : null}
+          {goal ? (
+            <div className="composer-chips">
+              <span className="chip" title={goal}>
+                目标：{goal}
+                <button type="button" onClick={() => onGoal("")}>
+                  ×
+                </button>
+              </span>
             </div>
           ) : null}
           {slashOpen ? (
@@ -773,11 +801,15 @@ export function Composer({
             aria-label={awaitingAnswer ? "回答 Grok 的问题" : "消息输入框"}
             onChange={(e) => onChange(e.target.value)}
             onPaste={(e) => {
-              const hasImage = [...e.clipboardData.items].some(
-                (item) => item.kind === "file" && item.type.startsWith("image/"),
-              );
-              if (hasImage || !e.clipboardData.getData("text")) e.preventDefault();
-              void pasteImages(e);
+              let nativeFiles: string[] = [];
+              try {
+                nativeFiles = window.grok.clipboardFilePaths();
+              } catch {
+                /* Fall back to the files exposed by the browser paste event. */
+              }
+              const hasFile = [...e.clipboardData.items].some((item) => item.kind === "file");
+              if (hasFile || nativeFiles.length || !e.clipboardData.getData("text")) e.preventDefault();
+              void pasteFiles(e, nativeFiles);
             }}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing || e.keyCode === 229) return;

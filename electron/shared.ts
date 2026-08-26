@@ -1,5 +1,5 @@
 export type StreamItem =
-  | { kind: "user"; text: string; startedAt?: number; durationMs?: number }
+  | { kind: "user"; text: string; attachments?: string[]; startedAt?: number; durationMs?: number }
   | { kind: "agent"; text: string }
   | { kind: "thought"; text: string }
   | {
@@ -137,6 +137,11 @@ export type AppUpdateInfo = {
   url: string;
   notes: string;
   dev?: boolean;
+  status: "idle" | "checking" | "available" | "downloading" | "downloaded" | "error";
+  progress?: number;
+  transferred?: number;
+  total?: number;
+  bytesPerSecond?: number;
   error?: string;
 };
 
@@ -318,6 +323,15 @@ export type GitStatus = {
   files: GitFile[];
 };
 
+export type FilePreview = {
+  path: string;
+  content: string;
+  size: number;
+  exists: boolean;
+  binary: boolean;
+  truncated: boolean;
+};
+
 export type AcpUpdatePayload = {
   sessionId: string;
   update: Record<string, unknown>;
@@ -403,13 +417,10 @@ export function extractContextUsed(
   update: Record<string, unknown>,
   meta?: Record<string, unknown>,
 ): number | null {
-  const usage = usageRecord(update);
   const nested = update._meta && typeof update._meta === "object" ? (update._meta as Record<string, unknown>) : undefined;
   return (
     asTokenCount(meta?.totalTokens) ??
-    asTokenCount(nested?.totalTokens) ??
-    asTokenCount(usage?.inputTokens) ??
-    asTokenCount(usage?.totalTokens)
+    asTokenCount(nested?.totalTokens)
   );
 }
 

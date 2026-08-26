@@ -9,6 +9,7 @@ import type {
   Automation,
   AutomationInput,
   AvailablePluginInfo,
+  FilePreview,
   GitStatus,
   GrokStatus,
   PermissionMode,
@@ -43,7 +44,9 @@ declare global {
       listCcSwitchProviders: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string }>>;
       logout: () => Promise<AccountInfo>;
       checkUpdate: () => Promise<AppUpdateInfo>;
-      openUpdate: (url?: string) => Promise<void>;
+      downloadUpdate: () => Promise<AppUpdateInfo>;
+      installUpdate: () => Promise<boolean>;
+      onAppUpdateState: (cb: (payload: AppUpdateInfo) => void) => () => void;
       installInfo: () => Promise<{ command: string; docs: string; logsDir: string }>;
       copyInstallCommand: () => Promise<boolean>;
       openInstallDocs: () => Promise<void>;
@@ -77,18 +80,24 @@ declare global {
         sessionId: string,
         text: string,
         images?: { path: string; mimeType: string }[],
+        attachments?: string[],
+        startedAt?: number,
       ) => Promise<unknown>;
       runningSessions: () => Promise<string[]>;
       queueFollowUp: (
         sessionId: string,
         text: string,
         images?: { path: string; mimeType: string }[],
+        attachments?: string[],
       ) => Promise<FollowUpReceipt>;
       promoteFollowUp: (sessionId: string) => Promise<FollowUpReceipt | null>;
       removeFollowUp: (sessionId: string, entryId: string) => Promise<QueuedFollowUp | null>;
       queuedFollowUps: (sessionId?: string) => Promise<QueuedFollowUp[]>;
       savePastedImage: (payload: { data: string; mimeType?: string }) => Promise<{ path: string; mimeType: string }>;
+      savePastedFile: (payload: { data: string; name: string; mimeType?: string }) => Promise<{ path: string; mimeType: string }>;
       saveClipboardImage: () => Promise<{ path: string; mimeType: string; dataUrl: string } | null>;
+      clipboardFilePaths: () => string[];
+      pathForFile: (file: File) => string;
       setMode: (sessionId: string, modeId: string) => Promise<void>;
       pickFiles: () => Promise<string[]>;
       pickFolder: () => Promise<string[]>;
@@ -98,6 +107,7 @@ declare global {
       respondPermission: (requestId: string, optionId: string) => Promise<boolean>;
       gitStatus: (cwd: string) => Promise<GitStatus>;
       gitFileDiff: (cwd: string, filePath: string) => Promise<string>;
+      readFilePreview: (cwd: string, filePath: string) => Promise<FilePreview>;
       gitDiscard: (cwd: string, filePath: string) => Promise<void>;
       gitStage: (cwd: string, filePath: string) => Promise<void>;
       gitUnstage: (cwd: string, filePath: string) => Promise<void>;

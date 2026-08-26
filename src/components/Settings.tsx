@@ -6,6 +6,7 @@ import type {
   PermissionMode,
   ReasoningEffort,
 } from "../../electron/shared";
+import { Markdown } from "../lib/markdown";
 
 const MODES: { id: PermissionMode; label: string; hint: string }[] = [
   { id: "ask", label: "询问", hint: "改文件、跑命令前先问你" },
@@ -39,6 +40,40 @@ const NAV: { id: SettingsPane; label: string; hint: string }[] = [
   { id: "about", label: "关于", hint: "版本更新与运行日志" },
 ];
 
+function SettingsPaneIcon({ pane }: { pane: SettingsPane }) {
+  if (pane === "general") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden>
+        <circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" strokeWidth="1.7" />
+        <path d="M12 3.2v2.1M12 18.7v2.1M3.2 12h2.1M18.7 12h2.1M5.8 5.8l1.5 1.5M16.7 16.7l1.5 1.5M18.2 5.8l-1.5 1.5M7.3 16.7l-1.5 1.5" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  if (pane === "features") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden>
+        <rect x="4" y="4" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <rect x="13.5" y="4" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.6" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M16.75 13.5v6.5M13.5 16.75H20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden>
+      <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M12 10.7v5.5M12 7.6v.2" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function formatUpdateBytes(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes)) return "";
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${Math.round(bytes)} B`;
+}
+
 export function Settings({
   open,
   settings,
@@ -61,13 +96,21 @@ export function Settings({
   return (
     <div className="settings-overlay" role="dialog" aria-label="设置">
       <header className="settings-top">
-        <button className="btn small ghost" type="button" onClick={onClose}>
-          ← 返回
+        <div className="settings-top-title">
+          <span className="settings-top-icon" aria-hidden>
+            <SettingsPaneIcon pane="general" />
+          </span>
+          <strong>设置</strong>
+        </div>
+        <button className="settings-close" type="button" aria-label="关闭设置" title="关闭" onClick={onClose}>
+          <svg viewBox="0 0 16 16" aria-hidden>
+            <path d="m4.1 4.1 7.8 7.8M11.9 4.1l-7.8 7.8" fill="none" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" />
+          </svg>
         </button>
-        <strong>设置</strong>
       </header>
       <div className="settings-shell">
         <nav className="settings-nav" aria-label="设置分类">
+          <div className="settings-nav-heading">Grok 设置</div>
           {NAV.map((item) => (
             <button
               key={item.id}
@@ -75,12 +118,20 @@ export function Settings({
               className={`settings-nav-item${pane === item.id ? " on" : ""}`}
               onClick={() => setPane(item.id)}
             >
-              <strong>{item.label}</strong>
-              <span>{item.hint}</span>
+              <span className={`settings-nav-icon ${item.id}`} aria-hidden>
+                <SettingsPaneIcon pane={item.id} />
+              </span>
+              <span className="settings-nav-copy">
+                <strong>{item.label}</strong>
+                <small>{item.hint}</small>
+              </span>
+              <svg className="settings-nav-chevron" viewBox="0 0 12 12" aria-hidden>
+                <path d="m4.5 2.5 3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </button>
           ))}
         </nav>
-        <div className="settings-body">
+        <div className={`settings-body ${pane}`}>
           {pane === "general" ? (
             settings ? <GeneralPane settings={settings} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
           ) : pane === "features" ? (
@@ -235,19 +286,31 @@ function AboutPane() {
   const [info, setInfo] = useState<AppUpdateInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
-  const refresh = () => {
+  const refresh = (manual = false) => {
     setBusy(true);
     setError("");
+    if (manual) setNotice("");
     void window.grok
       .checkUpdate()
-      .then(setInfo)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .then((next) => {
+        setInfo(next);
+        if (manual && !next.hasUpdate) setNotice("当前已是最新版");
+      })
+      .catch((err) => {
+        setNotice("");
+        setError(err instanceof Error ? err.message : String(err));
+      })
       .finally(() => setBusy(false));
   };
 
   useEffect(() => {
     refresh();
+  }, []);
+
+  useEffect(() => {
+    return window.grok.onAppUpdateState(setInfo);
   }, []);
 
   return (
@@ -259,6 +322,7 @@ function AboutPane() {
       <section className="settings-section">
         <h3>版本更新</h3>
         {error ? <p className="settings-error">{error}</p> : null}
+        {notice ? <div className="settings-check-notice" role="status">{notice}</div> : null}
         {info ? (
           <div className="settings-kv">
             <div>
@@ -274,15 +338,58 @@ function AboutPane() {
           <p className="settings-hint">{busy ? "正在检查…" : "暂时无法读取版本信息。"}</p>
         )}
         {info?.hasUpdate ? <p className="settings-hint">有新版本可用。</p> : null}
-        {info?.notes ? <pre className="settings-pre">{info.notes}</pre> : null}
+        {info?.notes ? (
+          <div className="settings-update-notes">
+            <strong>更新内容</strong>
+            <Markdown text={info.notes} />
+          </div>
+        ) : null}
+        {info?.status === "downloading" ? (
+          <div className="update-download" role="status">
+            <div className="update-download-head">
+              <span>正在应用内下载更新…</span>
+              <strong>{Math.round(info.progress || 0)}%</strong>
+            </div>
+            <div className="update-progress-track" aria-label="更新下载进度">
+              <span style={{ width: `${Math.max(0, Math.min(100, info.progress || 0))}%` }} />
+            </div>
+            <p>
+              {formatUpdateBytes(info.transferred)}
+              {info.total ? ` / ${formatUpdateBytes(info.total)}` : ""}
+              {info.bytesPerSecond ? ` · ${formatUpdateBytes(info.bytesPerSecond)}/s` : ""}
+            </p>
+          </div>
+        ) : null}
+        {info?.status === "downloaded" ? (
+          <div className="update-ready" role="status">更新已下载完成，重启应用即可自动安装。</div>
+        ) : null}
         {info?.error ? <p className="settings-error">{info.error}</p> : null}
         <div className="settings-actions">
-          <button className="btn" type="button" disabled={busy} onClick={refresh}>
+          <button className="btn" type="button" disabled={busy || info?.status === "downloading"} onClick={() => refresh(true)}>
             {busy ? "检查中…" : "检查更新"}
           </button>
           {info?.hasUpdate ? (
-            <button className="btn primary" type="button" onClick={() => void window.grok.openUpdate(info.url)}>
-              打开下载页
+            <button
+              className="btn primary"
+              type="button"
+              disabled={info.dev || info.status === "downloading"}
+              onClick={() => {
+                if (info.status === "downloaded") {
+                  void window.grok.installUpdate();
+                  return;
+                }
+                void window.grok.downloadUpdate().then(setInfo);
+              }}
+            >
+              {info.dev
+                ? "正式安装版支持应用内更新"
+                : info.status === "downloading"
+                  ? `下载中 ${Math.round(info.progress || 0)}%`
+                  : info.status === "downloaded"
+                    ? "重启并安装"
+                    : info.status === "error"
+                      ? "重新下载"
+                      : "在应用内下载"}
             </button>
           ) : null}
         </div>

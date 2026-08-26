@@ -10,6 +10,7 @@ export type QueuedFollowUp = {
   sessionId: string;
   text: string;
   images: FollowUpImage[];
+  attachments: string[];
   createdAt: number;
 };
 
@@ -32,12 +33,14 @@ export class FollowUpQueue {
     sessionId: string,
     text: string,
     images: FollowUpImage[] = [],
+    attachments: string[] = [],
   ): QueuedFollowUp {
     return {
       id: randomUUID(),
       sessionId,
       text,
       images: images.map((image) => ({ ...image })),
+      attachments: [...new Set(attachments.filter(Boolean))],
       createdAt: Date.now(),
     };
   }

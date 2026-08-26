@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 contextBridge.exposeInMainWorld("grok", {
   status: () => ipcRenderer.invoke("grok:status"),
@@ -11,7 +11,13 @@ contextBridge.exposeInMainWorld("grok", {
   listCcSwitchProviders: () => ipcRenderer.invoke("grok:listCcSwitchProviders"),
   logout: () => ipcRenderer.invoke("grok:logout"),
   checkUpdate: () => ipcRenderer.invoke("grok:checkUpdate"),
-  openUpdate: (url?: string) => ipcRenderer.invoke("grok:openUpdate", url),
+  downloadUpdate: () => ipcRenderer.invoke("grok:downloadUpdate"),
+  installUpdate: () => ipcRenderer.invoke("grok:installUpdate"),
+  onAppUpdateState: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:app-update-state", listener);
+    return () => ipcRenderer.removeListener("grok:app-update-state", listener);
+  },
   installInfo: () => ipcRenderer.invoke("grok:installInfo"),
   copyInstallCommand: () => ipcRenderer.invoke("grok:copyInstallCommand"),
   openInstallDocs: () => ipcRenderer.invoke("grok:openInstallDocs"),
@@ -41,18 +47,31 @@ contextBridge.exposeInMainWorld("grok", {
     ipcRenderer.invoke("grok:resumeThread", sessionId, cwd),
   forkThread: (sessionId: string, cwd: string) =>
     ipcRenderer.invoke("grok:forkThread", sessionId, cwd),
-  sendPrompt: (sessionId: string, text: string, images?: { path: string; mimeType: string }[]) =>
-    ipcRenderer.invoke("grok:sendPrompt", sessionId, text, images),
+  sendPrompt: (
+    sessionId: string,
+    text: string,
+    images?: { path: string; mimeType: string }[],
+    attachments?: string[],
+    startedAt?: number,
+  ) => ipcRenderer.invoke("grok:sendPrompt", sessionId, text, images, attachments, startedAt),
   runningSessions: () => ipcRenderer.invoke("grok:runningSessions"),
-  queueFollowUp: (sessionId: string, text: string, images?: { path: string; mimeType: string }[]) =>
-    ipcRenderer.invoke("grok:queueFollowUp", sessionId, text, images),
+  queueFollowUp: (
+    sessionId: string,
+    text: string,
+    images?: { path: string; mimeType: string }[],
+    attachments?: string[],
+  ) => ipcRenderer.invoke("grok:queueFollowUp", sessionId, text, images, attachments),
   promoteFollowUp: (sessionId: string) => ipcRenderer.invoke("grok:promoteFollowUp", sessionId),
   removeFollowUp: (sessionId: string, entryId: string) =>
     ipcRenderer.invoke("grok:removeFollowUp", sessionId, entryId),
   queuedFollowUps: (sessionId?: string) => ipcRenderer.invoke("grok:queuedFollowUps", sessionId),
   savePastedImage: (payload: { data: string; mimeType?: string }) =>
     ipcRenderer.invoke("grok:savePastedImage", payload),
+  savePastedFile: (payload: { data: string; name: string; mimeType?: string }) =>
+    ipcRenderer.invoke("grok:savePastedFile", payload),
   saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
+  clipboardFilePaths: () => ipcRenderer.sendSync("grok:clipboardFilePaths") as string[],
+  pathForFile: (file: File) => webUtils.getPathForFile(file),
   setMode: (sessionId: string, modeId: string) =>
     ipcRenderer.invoke("grok:setMode", sessionId, modeId),
   pickFiles: () => ipcRenderer.invoke("grok:pickFiles"),
@@ -65,6 +84,8 @@ contextBridge.exposeInMainWorld("grok", {
   gitStatus: (cwd: string) => ipcRenderer.invoke("grok:gitStatus", cwd),
   gitFileDiff: (cwd: string, filePath: string) =>
     ipcRenderer.invoke("grok:gitFileDiff", cwd, filePath),
+  readFilePreview: (cwd: string, filePath: string) =>
+    ipcRenderer.invoke("grok:readFilePreview", cwd, filePath),
   gitDiscard: (cwd: string, filePath: string) =>
     ipcRenderer.invoke("grok:gitDiscard", cwd, filePath),
   gitStage: (cwd: string, filePath: string) =>

@@ -5,6 +5,7 @@ import path from "node:path";
 import { inferProjectRoot, isScratchPath, isUnattachedThread } from "./projects";
 import { isDesktopWorktree } from "./paths";
 import { planEntriesFromMarkdown } from "./plan-document";
+import { readPersistedThreadActivity, resolveThreadUpdatedAt } from "./thread-activity";
 import {
   isPlaceholderThreadTitle,
   threadTitleForDisplay,
@@ -227,10 +228,7 @@ export function listThreads(cwd?: string): ThreadInfo[] {
         title: localizeTitle(path.join(groupDir, id), raw),
         summary: raw.session_summary as string | undefined,
         model: raw.current_model_id as string | undefined,
-        updatedAt:
-          (raw.last_active_at as string) ||
-          (raw.updated_at as string) ||
-          new Date(0).toISOString(),
+        updatedAt: resolveThreadUpdatedAt(raw, readPersistedThreadActivity(path.join(groupDir, id))),
         createdAt: (raw.created_at as string) || new Date(0).toISOString(),
         lastTurnSummary: raw.last_turn_summary as string | undefined,
         gitRoot,
@@ -277,10 +275,7 @@ export function renameThread(sessionId: string, cwd: string, title: string): Thr
     title: trimmed,
     summary: raw.session_summary as string | undefined,
     model: raw.current_model_id as string | undefined,
-    updatedAt:
-      (raw.last_active_at as string) ||
-      (raw.updated_at as string) ||
-      new Date().toISOString(),
+    updatedAt: resolveThreadUpdatedAt(raw, readPersistedThreadActivity(dir)),
     createdAt: (raw.created_at as string) || new Date(0).toISOString(),
     lastTurnSummary: raw.last_turn_summary as string | undefined,
     gitRoot,
@@ -428,8 +423,66 @@ export type TurnFilesRecord = {
   files: string[];
 };
 
+export type TurnAttachmentsRecord = {
+  startedAt: number;
+  files: string[];
+};
+
 function turnFilesPath(dir: string): string {
   return path.join(dir, ".desktop-turn-files.json");
+}
+
+function turnAttachmentsPath(dir: string): string {
+  return path.join(dir, ".desktop-turn-attachments.json");
+}
+
+function readTurnAttachments(sessionId: string, cwd?: string): TurnAttachmentsRecord[] {
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(turnAttachmentsPath(dir), "utf8"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((row): row is TurnAttachmentsRecord =>
+        Boolean(row && typeof row.startedAt === "number" && Array.isArray(row.files)),
+      )
+      .map((row) => ({
+        startedAt: row.startedAt,
+        files: [...new Set(row.files.filter((file): file is string => typeof file === "string" && Boolean(file)))],
+      }))
+      .filter((row) => row.files.length > 0)
+      .sort((a, b) => a.startedAt - b.startedAt);
+  } catch {
+    return [];
+  }
+}
+
+export function saveTurnAttachments(
+  sessionId: string,
+  cwd: string,
+  record: TurnAttachmentsRecord,
+): void {
+  if (!record.files.length) return;
+  const dir = findSessionDir(sessionId, cwd);
+  if (!dir) return;
+  const records = readTurnAttachments(sessionId, cwd).filter((row) => row.startedAt !== record.startedAt);
+  records.push({
+    startedAt: record.startedAt,
+    files: [...new Set(record.files.filter(Boolean))],
+  });
+  records.sort((a, b) => a.startedAt - b.startedAt);
+  const target = turnAttachmentsPath(dir);
+  const temporary = `${target}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(records.slice(-200), null, 2), "utf8");
+    fs.renameSync(temporary, target);
+  } catch {
+    try {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    } catch {
+      /* persistence is best effort */
+    }
+  }
 }
 
 function readTurnFiles(sessionId: string, cwd?: string): TurnFilesRecord[] {
@@ -524,6 +577,67 @@ function attachTurnFiles(items: StreamItem[], records: TurnFilesRecord[]): Strea
   });
   flushFiles();
   return result;
+}
+
+function stripGeneratedAttachmentReferences(text: string, files: string[]): string {
+  const marker = "请同时参考这些路径：";
+  const markerIndex = text.lastIndexOf(marker);
+  let cleaned = text;
+  if (markerIndex >= 0) {
+    const referenced = text
+      .slice(markerIndex + marker.length)
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^-\s*@/, ""))
+      .filter(Boolean);
+    if (!referenced.length) return text;
+    const normalizedFiles = new Set(files.map((file) => file.replace(/\\/g, "/").toLowerCase()));
+    if (!referenced.every((file) => normalizedFiles.has(file.replace(/\\/g, "/").toLowerCase()))) return text;
+    cleaned = text.slice(0, markerIndex).trimEnd();
+  }
+  if (cleaned.startsWith("请以计划模式协助我梳理这个任务")) {
+    const request = cleaned.match(/用户需求：\s*([\s\S]*)$/)?.[1]?.trim();
+    if (request === "请根据我附带的内容规划这个任务。" || request === "请参考我附带的图片。") return "";
+    return request ?? cleaned;
+  }
+  if (cleaned === "请参考我附带的图片。") return "";
+  return cleaned;
+}
+
+function attachTurnAttachments(items: StreamItem[], records: TurnAttachmentsRecord[]): StreamItem[] {
+  if (!records.length) return items;
+  const userIndexes = items
+    .map((item, index) => ({ item, index }))
+    .filter((row): row is { item: Extract<StreamItem, { kind: "user" }>; index: number } => row.item.kind === "user");
+  if (!userIndexes.length) return items;
+
+  const assigned = new Set<number>();
+  const attachmentsByUser = new Map<number, string[]>();
+  const fallback = userIndexes.slice(-records.length);
+  records.forEach((record, recordIndex) => {
+    let best: { index: number; distance: number } | null = null;
+    for (const user of userIndexes) {
+      if (assigned.has(user.index) || typeof user.item.startedAt !== "number") continue;
+      const distance = Math.abs(user.item.startedAt - record.startedAt);
+      if (distance <= 5 * 60_000 && (!best || distance < best.distance)) {
+        best = { index: user.index, distance };
+      }
+    }
+    const userIndex = best?.index ?? fallback[recordIndex]?.index;
+    if (userIndex == null || assigned.has(userIndex)) return;
+    assigned.add(userIndex);
+    attachmentsByUser.set(userIndex, record.files);
+  });
+  if (!attachmentsByUser.size) return items;
+
+  return items.map((item, index) => {
+    const files = attachmentsByUser.get(index);
+    if (item.kind !== "user" || !files?.length) return item;
+    return {
+      ...item,
+      text: stripGeneratedAttachmentReferences(item.text, files),
+      attachments: files,
+    };
+  });
 }
 
 export function readSessionPlanDocument(
@@ -860,7 +974,10 @@ export function loadTranscript(
       });
     }
   }
-  const restoredItems = attachTurnFiles(items, readTurnFiles(sessionId, cwd));
+  const restoredItems = attachTurnFiles(
+    attachTurnAttachments(items, readTurnAttachments(sessionId, cwd)),
+    readTurnFiles(sessionId, cwd),
+  );
   return {
     items: restoredItems.filter((item) => item.kind !== "thought" && item.kind !== "tool"),
     contextUsed: contextUsage?.used ?? null,

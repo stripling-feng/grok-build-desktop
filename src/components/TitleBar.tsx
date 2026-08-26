@@ -47,11 +47,9 @@ function CloseIcon() {
 }
 
 export function TitleBar({
-  subtitle,
   onTerminal,
   terminalActive,
 }: {
-  subtitle?: string;
   onTerminal?: () => void;
   terminalActive?: boolean;
 }) {
@@ -59,8 +57,7 @@ export function TitleBar({
     <header className="titlebar">
       <div className="titlebar-left">
         <img className="titlebar-mark" src={grokMark} alt="" />
-        <span>Grok Build 桌面端</span>
-        {subtitle ? <span>· {subtitle}</span> : null}
+        <span>Grok 桌面端</span>
       </div>
       {onTerminal ? (
         <div className="titlebar-actions">

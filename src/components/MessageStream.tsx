@@ -5,6 +5,7 @@ import { Markdown } from "../lib/markdown";
 import { toolStatusLabel } from "../lib/i18n";
 import { planFlowLabel, type PlanActivity, type PlanFlowPhase } from "../lib/plan-flow";
 import { isPlanDocument, type PlanRevision } from "../lib/stream";
+import { AttachmentCard } from "./AttachmentCard";
 
 type UserItem = Extract<StreamItem, { kind: "user" }>;
 type ThoughtItem = Extract<StreamItem, { kind: "thought" }>;
@@ -347,6 +348,7 @@ export function MessageStream({
   onDismissError,
   emptyTitle,
   onOpenFile,
+  onOpenAttachment,
   sessionId,
   cwd,
   planConsole,
@@ -359,6 +361,7 @@ export function MessageStream({
   onDismissError?: () => void;
   emptyTitle: string;
   onOpenFile?: (path: string) => void;
+  onOpenAttachment?: (path: string) => void;
   sessionId?: string;
   cwd?: string;
   planConsole?: PlanConsole;
@@ -486,7 +489,7 @@ export function MessageStream({
             return (
               <div
                 className="turn"
-                key={turn.user ? `u-${ti}-${turn.user.text.slice(0, 24)}` : `t-${ti}`}
+                key={turn.user ? `u-${ti}-${turn.user.text.slice(0, 24)}-${turn.user.attachments?.[0] ?? ""}` : `t-${ti}`}
                 data-turn={ti}
                 ref={(node) => {
                   turnRefs.current[ti] = node;
@@ -495,7 +498,20 @@ export function MessageStream({
                 {turn.user ? (
                   <div className="msg user">
                     {turn.user.startedAt ? <span className="msg-time">{formatAskTime(turn.user.startedAt)}</span> : null}
-                    <div className="bubble">{turn.user.text}</div>
+                    <div className="user-message-stack">
+                      {turn.user.attachments?.length ? (
+                        <div className="message-attachments" role="list" aria-label="消息附件">
+                          {turn.user.attachments.map((filePath) => (
+                            <AttachmentCard
+                              key={filePath}
+                              filePath={filePath}
+                              onOpen={onOpenAttachment}
+                            />
+                          ))}
+                        </div>
+                      ) : null}
+                      {turn.user.text ? <div className="bubble">{turn.user.text}</div> : null}
+                    </div>
                   </div>
                 ) : null}
                 {showWorked ? (

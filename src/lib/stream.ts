@@ -71,6 +71,44 @@ export function appendTurnChanges(items: StreamItem[], files: string[]): StreamI
   return next;
 }
 
+function sameUserTurn(
+  left: Extract<StreamItem, { kind: "user" }>,
+  right: Extract<StreamItem, { kind: "user" }>,
+): boolean {
+  if (left.text.trim() !== right.text.trim()) return false;
+  const normalize = (paths?: string[]) =>
+    (paths ?? []).map((file) => file.replace(/\\/g, "/").toLowerCase()).sort();
+  const leftAttachments = normalize(left.attachments);
+  const rightAttachments = normalize(right.attachments);
+  if (
+    leftAttachments.length !== rightAttachments.length ||
+    leftAttachments.some((file, index) => file !== rightAttachments[index])
+  ) {
+    return false;
+  }
+  if (left.startedAt && right.startedAt) {
+    return Math.abs(left.startedAt - right.startedAt) < 5_000;
+  }
+  return true;
+}
+
+export function mergeTranscriptWithLiveItems(
+  transcript: StreamItem[],
+  liveItems: StreamItem[],
+): StreamItem[] {
+  if (!liveItems.length) return transcript;
+  const firstLiveUserIndex = liveItems.findIndex((item) => item.kind === "user");
+  if (firstLiveUserIndex < 0) return [...transcript, ...liveItems];
+  const firstLiveUser = liveItems[firstLiveUserIndex] as Extract<StreamItem, { kind: "user" }>;
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const item = transcript[index];
+    if (item.kind === "user" && sameUserTurn(item, firstLiveUser)) {
+      return [...transcript.slice(0, index), ...liveItems];
+    }
+  }
+  return [...transcript, ...liveItems];
+}
+
 function lastUserIndex(items: StreamItem[]): number {
   for (let i = items.length - 1; i >= 0; i--) if (items[i].kind === "user") return i;
   return -1;

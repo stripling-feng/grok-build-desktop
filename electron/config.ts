@@ -8,6 +8,7 @@ import { grokHome } from "./sessions";
 import { findGitRoot } from "./git";
 import { grokBin as resolveGrokBin } from "./grok-bin";
 import { inspectGrok, isProjectTrusted, listMarketplaces } from "./grok-cli";
+import { modelsFromCachePayload, type ModelCatalogEntry } from "./model-catalog";
 
 const execFileAsync = promisify(execFile);
 
@@ -284,6 +285,15 @@ function modelNamesFromConfig(text: string): { id: string; name: string; context
   return models;
 }
 
+function modelsFromCache(): ModelCatalogEntry[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(grokHome(), "models_cache.json"), "utf8"));
+    return modelsFromCachePayload(raw);
+  } catch {
+    return [];
+  }
+}
+
 async function modelsFromCli(): Promise<string[]> {
   const bin = grokBin();
   if (!bin) return [];
@@ -383,10 +393,22 @@ export async function loadSettings(
 ): Promise<AppSettings> {
   const text = readText();
   const fromConfig = modelNamesFromConfig(text);
+  const fromCache = modelsFromCache();
   const fromCli = opts?.skipCli ? [] : await modelsFromCli();
   const byId = new Map<string, { id: string; name: string; contextWindow?: number }>();
-  for (const id of fromCli) byId.set(id, { id, name: id });
-  for (const m of fromConfig) byId.set(m.id, m);
+  for (const model of fromCache) byId.set(model.id, model);
+  for (const id of fromCli) {
+    const cached = byId.get(id);
+    byId.set(id, cached ?? { id, name: id });
+  }
+  for (const model of fromConfig) {
+    const cached = byId.get(model.id);
+    byId.set(model.id, {
+      ...cached,
+      ...model,
+      contextWindow: model.contextWindow ?? cached?.contextWindow,
+    });
+  }
   if (byId.size === 0) {
     byId.set("grok-4.6", { id: "grok-4.6", name: "grok-4.6" });
     byId.set("grok-4.5", { id: "grok-4.5", name: "grok-4.5" });

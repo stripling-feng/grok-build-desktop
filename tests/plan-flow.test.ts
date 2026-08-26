@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { StreamItem } from "../electron/shared";
-import { applyUpdateToItems, extractModifiedFilePaths, planDocumentWasUpdatedForTurn } from "../electron/shared";
+import {
+  applyUpdateToItems,
+  extractContextUsage,
+  extractModifiedFilePaths,
+  mergeContextUsage,
+  planDocumentWasUpdatedForTurn,
+} from "../electron/shared";
 import { planEntriesFromMarkdown } from "../electron/plan-document";
 import {
   buildPlanConversationPrompt,
@@ -24,24 +30,86 @@ import {
   updateRunningSessionIds,
   updateUnreadSessionIds,
 } from "../src/lib/session-state";
-import { appendTurnChanges, isPlanDocument, latestPlan, planRevisions } from "../src/lib/stream";
+import {
+  appendTurnChanges,
+  isPlanDocument,
+  latestPlan,
+  mergeTranscriptWithLiveItems,
+  planRevisions,
+} from "../src/lib/stream";
 import { threadTitleForDisplay, threadTitleFromPrompt } from "../src/lib/thread-title";
 import { FollowUpQueue, followUpDisplayText } from "../electron/follow-ups";
 import { TurnCompletionTracker } from "../electron/turn-completion";
+import { latestUpdateTimestamp, resolveThreadUpdatedAt } from "../electron/thread-activity";
+import { modelsFromCachePayload } from "../electron/model-catalog";
+import { SessionReplayGate } from "../electron/session-replay";
+import { pathsFromClipboardBuffer } from "../electron/clipboard-files";
 
 const firstTurn = 100;
 const currentTurn = 200;
 
+test("Windows clipboard file formats are decoded into attachment paths", () => {
+  assert.deepEqual(
+    pathsFromClipboardBuffer("FileNameW", Buffer.from("C:\\docs\\menu.md\0", "utf16le")),
+    ["C:\\docs\\menu.md"],
+  );
+
+  const names = Buffer.from("C:\\docs\\one.txt\0D:\\assets\\two.pdf\0\0", "utf16le");
+  const fileDrop = Buffer.alloc(20 + names.length);
+  fileDrop.writeUInt32LE(20, 0);
+  fileDrop.writeUInt32LE(1, 16);
+  names.copy(fileDrop, 20);
+  assert.deepEqual(
+    pathsFromClipboardBuffer("CF_HDROP", fileDrop),
+    ["C:\\docs\\one.txt", "D:\\assets\\two.pdf"],
+  );
+});
+
+test("a late transcript load preserves a locally submitted turn", () => {
+  const transcript: StreamItem[] = [
+    { kind: "user", text: "旧问题", startedAt: 100 },
+    { kind: "agent", text: "旧回答" },
+  ];
+  const live: StreamItem[] = [
+    { kind: "user", text: "刚发送的问题", startedAt: 200 },
+    { kind: "thought", text: "处理中" },
+  ];
+
+  assert.deepEqual(mergeTranscriptWithLiveItems(transcript, live), [...transcript, ...live]);
+});
+
+test("a transcript containing the live user turn is merged without duplication", () => {
+  const transcript: StreamItem[] = [
+    { kind: "user", text: "旧问题", startedAt: 100 },
+    { kind: "agent", text: "旧回答" },
+    { kind: "user", text: "刚发送的问题", startedAt: 2_000 },
+  ];
+  const live: StreamItem[] = [
+    { kind: "user", text: "刚发送的问题", startedAt: 2_100 },
+    { kind: "thought", text: "处理中" },
+  ];
+
+  assert.deepEqual(mergeTranscriptWithLiveItems(transcript, live), [
+    transcript[0],
+    transcript[1],
+    ...live,
+  ]);
+});
+
 test("live and fallback turn completion publish exactly once", () => {
   const tracker = new TurnCompletionTracker();
 
+  assert.equal(tracker.acceptLive("session-replayed", 50), false);
+
   tracker.start("session-live");
   assert.equal(tracker.acceptLive("session-live", 100), true);
+  assert.equal(tracker.acceptLive("session-live", 100), false);
   assert.equal(tracker.settle("session-live", 101), false);
 
   tracker.start("session-fallback");
   assert.equal(tracker.settle("session-fallback", 200), true);
   assert.equal(tracker.acceptLive("session-fallback", 201), false);
+  assert.equal(tracker.acceptLive("session-fallback", 3_000), false);
 });
 
 test("a suppressed late live completion still lets the next turn fall back", () => {
@@ -52,6 +120,84 @@ test("a suppressed late live completion still lets the next turn fall back", () 
   tracker.start("session-sequential");
   assert.equal(tracker.acceptLive("session-sequential", 101), false);
   assert.equal(tracker.settle("session-sequential", 102), true);
+});
+
+test("historical thread activity ignores timestamps overwritten while opening a session", () => {
+  const actualActivity = Date.parse("2026-08-24T06:11:19.000Z");
+  const overwrittenSummary = {
+    created_at: "2026-08-24T05:55:59.000Z",
+    last_active_at: "2026-08-25T13:24:50.000Z",
+    updated_at: "2026-08-25T13:34:08.000Z",
+  };
+
+  assert.equal(resolveThreadUpdatedAt(overwrittenSummary, actualActivity), "2026-08-24T06:11:19.000Z");
+});
+
+test("a copied thread remains newer than the history copied into it", () => {
+  assert.equal(
+    resolveThreadUpdatedAt(
+      { created_at: "2026-08-25T13:40:00.000Z" },
+      Date.parse("2026-08-24T06:11:19.000Z"),
+    ),
+    "2026-08-25T13:40:00.000Z",
+  );
+});
+
+test("the latest persisted update timestamp is recovered from a JSONL tail", () => {
+  const raw = [
+    "partial-json-line",
+    JSON.stringify({ timestamp: 1787551800, params: { update: { sessionUpdate: "agent_message_chunk" } } }),
+    JSON.stringify({ timestamp: 1787551879, params: { update: { sessionUpdate: "turn_completed" } } }),
+  ].join("\n");
+  assert.equal(latestUpdateTimestamp(raw), 1787551879_000);
+});
+
+test("cumulative billing usage does not overwrite current context occupancy", () => {
+  const live = extractContextUsage(
+    { sessionUpdate: "agent_message_chunk" },
+    { totalTokens: 210_711 },
+  );
+  const completed = extractContextUsage({
+    sessionUpdate: "turn_completed",
+    usage: {
+      inputTokens: 8_119_129,
+      cachedReadTokens: 7_907_840,
+      totalTokens: 8_145_879,
+    },
+  });
+  const merged = mergeContextUsage(live, completed);
+
+  assert.equal(completed?.used, null);
+  assert.equal(merged?.used, 210_711);
+  assert.equal(merged?.inputTokens, 8_119_129);
+});
+
+test("model cache context windows are exposed to the context progress ring", () => {
+  assert.deepEqual(
+    modelsFromCachePayload({
+      models: {
+        "grok-4.6": {
+          info: {
+            id: "grok-4.6",
+            name: "Grok 4.6",
+            context_window: 500_000,
+          },
+        },
+      },
+    }),
+    [{ id: "grok-4.6", name: "Grok 4.6", contextWindow: 500_000 }],
+  );
+});
+
+test("historical ACP replay updates are suppressed without hiding later live updates", () => {
+  const gate = new SessionReplayGate();
+  gate.begin("session-history");
+  gate.begin("session-history");
+  assert.equal(gate.shouldSuppress("session-history"), true);
+  assert.equal(gate.end("session-history"), 0);
+  assert.equal(gate.shouldSuppress("session-history"), true);
+  assert.equal(gate.end("session-history"), 2);
+  assert.equal(gate.shouldSuppress("session-history"), false);
 });
 
 test("follow-up messages stay FIFO and a failed steer can be restored to the front", () => {

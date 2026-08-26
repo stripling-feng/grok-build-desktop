@@ -130,8 +130,13 @@ npm run dev
 | `npm test` | 运行会话和计划流程测试 |
 | `npm run build` | 构建前端与 Electron 主进程 |
 | `npm run pack:win` | 构建 Windows x64 NSIS 安装包 |
+| `npm run release:win` | 构建并发布安装包与应用内更新元数据（需要 `GH_TOKEN`） |
 
-Windows 安装包会输出到 `apps/desktop/release/`。
+Windows 安装包会输出到 `release/`。
+
+发布新版本时，先同步修改 `package.json` 中的版本号，再推送同名标签（例如版本
+`0.1.4` 对应标签 `v0.1.4`）。GitHub Actions 会自动上传 NSIS 安装包、blockmap 和
+`latest.yml`；已安装的客户端随后可以在应用内下载，并通过“重启并安装”完成升级。
 
 ## 项目结构
 

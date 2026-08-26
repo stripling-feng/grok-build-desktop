@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import type { GitFile, GitStatus } from "./shared";
+import type { FilePreview, GitFile, GitStatus } from "./shared";
 import { grokHome } from "./sessions";
 
 const execFileAsync = promisify(execFile);
@@ -228,6 +228,43 @@ export async function gitFileDiff(cwd: string, filePath: string): Promise<string
   if (vsHead.stdout.trim()) return vsHead.stdout;
   const cached = await git(["diff", "--no-color", "--cached", "--", rel], cwd);
   return cached.stdout;
+}
+
+const FILE_PREVIEW_LIMIT = 1024 * 1024;
+
+export async function readFilePreview(cwd: string, filePath: string): Promise<FilePreview> {
+  const root = (await findGitRoot(cwd)) ?? path.resolve(cwd);
+  const rel = path.relative(root, assertInside(root, filePath)).replace(/\\/g, "/");
+  const requested = assertInside(root, rel);
+
+  if (!fs.existsSync(requested)) {
+    return { path: rel, content: "", size: 0, exists: false, binary: false, truncated: false };
+  }
+
+  const realRoot = fs.realpathSync(root);
+  const full = assertInside(realRoot, fs.realpathSync(requested));
+  const stat = fs.statSync(full);
+  if (!stat.isFile()) throw new Error("所选路径不是文件");
+
+  const length = Math.min(stat.size, FILE_PREVIEW_LIMIT);
+  const buffer = Buffer.alloc(length);
+  if (length > 0) {
+    const handle = fs.openSync(full, "r");
+    try {
+      fs.readSync(handle, buffer, 0, length, 0);
+    } finally {
+      fs.closeSync(handle);
+    }
+  }
+  const binary = buffer.subarray(0, Math.min(buffer.length, 8192)).includes(0);
+  return {
+    path: rel,
+    content: binary ? "" : buffer.toString("utf8"),
+    size: stat.size,
+    exists: true,
+    binary,
+    truncated: stat.size > FILE_PREVIEW_LIMIT,
+  };
 }
 
 export async function gitDiscard(cwd: string, filePath: string): Promise<void> {
