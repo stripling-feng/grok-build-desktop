@@ -79,7 +79,7 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
     if (line) remote = line.trim().split(/\s+/)[1] || null;
   }
   const files = parsePorcelain(porcelain.stdout).slice(0, 300);
-  const counts = parseNumstat(unstagedStat.stdout, stagedStat.stdout, files);
+  const counts = parseNumstat(root, unstagedStat.stdout, stagedStat.stdout, files);
   return {
     branch: branchRes.stdout.trim() || null,
     remote,
@@ -154,23 +154,61 @@ export async function gitFilesChangedSince(
   return [...changed].sort((a, b) => a.localeCompare(b));
 }
 
+function parseNumstatPath(rawPath: string): string {
+  let filePath = rawPath.replace(/^"|"$/g, "");
+  filePath = filePath.replace(/\{([^{}]*?) => ([^{}]*?)\}/g, "$2");
+  if (filePath.includes(" => ")) filePath = filePath.split(" => ").pop() || filePath;
+  return filePath.replace(/\\/g, "/");
+}
+
+function untrackedLineCount(root: string, filePath: string): number {
+  try {
+    const full = assertInside(root, filePath);
+    const stat = fs.statSync(full);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 16 * 1024 * 1024) return 0;
+    const body = fs.readFileSync(full);
+    if (body.subarray(0, Math.min(body.length, 8192)).includes(0)) return 0;
+    let lines = 0;
+    for (const byte of body) if (byte === 10) lines += 1;
+    if (body.at(-1) !== 10) lines += 1;
+    return lines;
+  } catch {
+    return 0;
+  }
+}
+
 function parseNumstat(
+  root: string,
   unstaged: string,
   staged: string,
   files: GitFile[],
 ): { added: number; removed: number } {
+  const byPath = new Map<string, { added: number; removed: number }>();
   let added = 0;
   let removed = 0;
   for (const text of [unstaged, staged]) {
     for (const raw of text.split(/\r?\n/)) {
-      const match = raw.match(/^(\d+|-)\t(\d+|-)\t/);
+      const match = raw.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
       if (!match) continue;
-      if (match[1] !== "-") added += Number(match[1]);
-      if (match[2] !== "-") removed += Number(match[2]);
+      const filePath = parseNumstatPath(match[3]);
+      const current = byPath.get(filePath) ?? { added: 0, removed: 0 };
+      if (match[1] !== "-") {
+        current.added += Number(match[1]);
+        added += Number(match[1]);
+      }
+      if (match[2] !== "-") {
+        current.removed += Number(match[2]);
+        removed += Number(match[2]);
+      }
+      byPath.set(filePath, current);
     }
   }
   for (const file of files) {
-    if (file.untracked) added += 1;
+    const untrackedAdded = file.untracked ? untrackedLineCount(root, file.path) : 0;
+    const stats = byPath.get(file.path) ?? { added: untrackedAdded, removed: 0 };
+    file.added = stats.added;
+    file.removed = stats.removed;
+    added += untrackedAdded;
   }
   return { added, removed };
 }
@@ -187,7 +225,7 @@ function parsePorcelain(text: string): GitFile[] {
     const staged = !untracked && xy[0] !== " " && xy[0] !== "?";
     let status = untracked ? "?" : xy[1] !== " " && xy[1] !== "?" ? xy[1] : xy[0];
     if (status === " ") status = "M";
-    files.push({ path: rest.replace(/\\/g, "/"), status, untracked, staged });
+    files.push({ path: rest.replace(/\\/g, "/"), status, untracked, staged, added: 0, removed: 0 });
   }
   return files;
 }

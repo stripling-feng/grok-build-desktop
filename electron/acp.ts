@@ -7,9 +7,11 @@ import { promisify } from "node:util";
 import type { GrokStatus, PermissionRequest } from "./shared";
 import { grokBin } from "./grok-bin";
 import { AcpTerminals } from "./acp-terminals";
-import { sessionMeta } from "./config";
+import { getDefaultReasoningEffort, sessionMeta } from "./config";
 import type { FollowUpImage } from "./follow-ups";
 import { encodeCwd, findSessionDir, grokHome } from "./sessions";
+import { resolveReasoningEffortValue } from "./reasoning-effort";
+import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,6 +27,18 @@ type JsonRpc = {
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
+};
+
+type AcpModelState = {
+  currentModelId?: string;
+  availableModels?: Array<{
+    modelId?: string;
+    _meta?: {
+      supportsReasoningEffort?: boolean;
+      reasoningEffort?: string;
+      reasoningEfforts?: Array<{ value?: string }>;
+    };
+  }>;
 };
 
 export type AcpEvents = {
@@ -45,6 +59,7 @@ export class GrokAcpClient extends EventEmitter {
   private starting: Promise<void> | null = null;
   private allowedRoots = new Set<string>();
   private sessionCwds = new Map<string, string>();
+  private sessionModels = new Map<string, AcpModelState>();
   private terminals = new AcpTerminals();
   private permissionWaiters = new Map<
     string,
@@ -110,10 +125,11 @@ export class GrokAcpClient extends EventEmitter {
       throw new Error("未找到 Grok CLI（~/.grok/bin 或 GROK_PATH）");
     }
     this.grokPath = grok;
+    const env = await proxyEnvironmentForTarget(currentGrokTarget());
     this.proc = spawn(grok, ["agent", "stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      env: { ...process.env },
+      env,
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
@@ -155,6 +171,7 @@ export class GrokAcpClient extends EventEmitter {
     this.proc = null;
     this.initialized = false;
     this.terminals.killAll();
+    this.sessionModels.clear();
     if (!proc) return;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 2000);
@@ -174,8 +191,9 @@ export class GrokAcpClient extends EventEmitter {
       cwd,
       mcpServers: [],
       ...(extra ?? {}),
-    })) as { sessionId?: string };
+    })) as { sessionId?: string; models?: AcpModelState };
     if (!result?.sessionId) throw new Error("创建会话失败：未返回 sessionId");
+    this.rememberModels(result.sessionId, result.models);
     this.sessionCwds.set(result.sessionId, path.resolve(cwd));
     this.allowRoot(cwd);
     this.allowSessionRoot(result.sessionId, cwd);
@@ -185,7 +203,13 @@ export class GrokAcpClient extends EventEmitter {
   async loadSession(sessionId: string, cwd: string): Promise<void> {
     await this.ensureStarted();
     const extra = sessionMeta();
-    await this.request("session/load", { sessionId, cwd, mcpServers: [], ...extra });
+    const result = (await this.request("session/load", {
+      sessionId,
+      cwd,
+      mcpServers: [],
+      ...extra,
+    })) as { models?: AcpModelState };
+    this.rememberModels(sessionId, result?.models);
     this.sessionCwds.set(sessionId, path.resolve(cwd));
     this.allowRoot(cwd);
     this.allowSessionRoot(sessionId, cwd);
@@ -194,6 +218,45 @@ export class GrokAcpClient extends EventEmitter {
   async setMode(sessionId: string, modeId: string): Promise<void> {
     await this.ensureStarted();
     await this.request("session/set_mode", { sessionId, modeId });
+  }
+
+  async setModel(
+    sessionId: string,
+    modelId: string,
+    reasoningEffort = getDefaultReasoningEffort(),
+  ): Promise<void> {
+    await this.ensureStarted();
+    await this.request("session/set_model", {
+      sessionId,
+      modelId,
+      _meta: { reasoningEffort },
+    });
+    const state = this.sessionModels.get(sessionId);
+    if (state) {
+      state.currentModelId = modelId;
+      const model = state.availableModels?.find((item) => item.modelId === modelId);
+      if (model?._meta) model._meta.reasoningEffort = reasoningEffort;
+    }
+  }
+
+  async setReasoningEffort(sessionId: string, effort: string): Promise<void> {
+    await this.ensureStarted();
+    const state = this.sessionModels.get(sessionId);
+    const modelId = state?.currentModelId;
+    const model = state?.availableModels?.find((item) => item.modelId === modelId);
+    const available = (model?._meta?.reasoningEfforts ?? [])
+      .map((item) => item.value)
+      .filter((value): value is string => typeof value === "string");
+    if (!modelId || model?._meta?.supportsReasoningEffort !== true || available.length === 0) {
+      throw new Error("当前 API 模型没有提供推理强度选项");
+    }
+    const value = resolveReasoningEffortValue(effort, available);
+    if (!value) throw new Error(`当前 API 模型不支持推理强度 ${effort}`);
+    await this.setModel(sessionId, modelId, value);
+  }
+
+  private rememberModels(sessionId: string, models?: AcpModelState) {
+    if (models) this.sessionModels.set(sessionId, models);
   }
 
   async forkSession(sessionId: string, cwd: string): Promise<string> {

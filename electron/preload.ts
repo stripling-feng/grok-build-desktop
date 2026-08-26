@@ -4,9 +4,18 @@ contextBridge.exposeInMainWorld("grok", {
   status: () => ipcRenderer.invoke("grok:status"),
   account: () => ipcRenderer.invoke("grok:account"),
   accountUsage: () => ipcRenderer.invoke("grok:accountUsage"),
+  apiProvider: () => ipcRenderer.invoke("grok:apiProvider"),
   loginAccount: () => ipcRenderer.invoke("grok:loginAccount"),
   cancelAccountLogin: () => ipcRenderer.invoke("grok:cancelAccountLogin"),
-  loginApiKey: (input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) =>
+  loginApiKey: (input: {
+    baseUrl?: string;
+    apiKey?: string;
+    model?: string;
+    contextWindow?: number;
+    fromCcSwitchId?: string;
+    sessionId?: string;
+    cwd?: string;
+  }) =>
     ipcRenderer.invoke("grok:loginApiKey", input),
   listCcSwitchProviders: () => ipcRenderer.invoke("grok:listCcSwitchProviders"),
   logout: () => ipcRenderer.invoke("grok:logout"),
@@ -105,8 +114,13 @@ contextBridge.exposeInMainWorld("grok", {
   windowControl: (action: "min" | "max" | "close") =>
     ipcRenderer.invoke("grok:window", action),
   settings: (cwd?: string | null) => ipcRenderer.invoke("grok:settings", cwd),
+  proxySettings: () => ipcRenderer.invoke("grok:proxySettings"),
+  setProxySettings: (input: unknown) => ipcRenderer.invoke("grok:setProxySettings", input),
+  testProxy: (input: unknown, target: "oauth" | "api") =>
+    ipcRenderer.invoke("grok:testProxy", input, target),
   setModel: (id: string) => ipcRenderer.invoke("grok:setModel", id),
-  setReasoningEffort: (effort: string) => ipcRenderer.invoke("grok:setReasoningEffort", effort),
+  setReasoningEffort: (effort: string, sessionId?: string) =>
+    ipcRenderer.invoke("grok:setReasoningEffort", { effort, sessionId }),
   setPermission: (mode: string) => ipcRenderer.invoke("grok:setPermission", mode),
   setBrowserControl: (enabled: boolean, cwd?: string | null) =>
     ipcRenderer.invoke("grok:setBrowserControl", enabled, cwd),

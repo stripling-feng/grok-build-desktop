@@ -15,6 +15,7 @@ type Props = {
   threads: ThreadInfo[];
   selectedProjectCwd: string | null;
   activeId: string | null;
+  activeCwd: string | null;
   runningIds: Set<string>;
   unreadIds: Set<string>;
   grokLabel: string;
@@ -430,6 +431,12 @@ type ApiLoginViewProps = {
   setBaseUrl: (v: string) => void;
   apiKey: string;
   setApiKey: (v: string) => void;
+  model: string;
+  setModel: (v: string) => void;
+  contextWindow: string;
+  setContextWindow: (v: string) => void;
+  sessionId: string | null;
+  cwd: string | null;
   loginBusy: boolean;
   setLoginBusy: (v: boolean) => void;
   loginError: string;
@@ -449,6 +456,12 @@ function ApiLoginView({
   setBaseUrl,
   apiKey,
   setApiKey,
+  model,
+  setModel,
+  contextWindow,
+  setContextWindow,
+  sessionId,
+  cwd,
   loginBusy,
   setLoginBusy,
   loginError,
@@ -462,15 +475,34 @@ function ApiLoginView({
   onBack,
   onSuccess,
 }: ApiLoginViewProps) {
+  const parsedContextWindow = () => {
+    if (!contextWindow.trim()) return undefined;
+    const value = Number(contextWindow);
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      setLoginError("上下文长度必须是大于 0 的整数");
+      return null;
+    }
+    return value;
+  };
+
   const submitManual = () => {
     if (!baseUrl.trim() || !apiKey.trim()) {
       setLoginError("请填写 Base URL 和 API Key");
       return;
     }
+    const contextWindowValue = parsedContextWindow();
+    if (contextWindowValue === null) return;
     setLoginBusy(true);
     setLoginError("");
     void window.grok
-      .loginApiKey({ baseUrl, apiKey })
+      .loginApiKey({
+        baseUrl,
+        apiKey,
+        model,
+        contextWindow: contextWindowValue,
+        sessionId: sessionId || undefined,
+        cwd: cwd || undefined,
+      })
       .then((result) => {
         if (!result.ok) {
           setLoginError(result.message || "保存失败");
@@ -485,10 +517,18 @@ function ApiLoginView({
   };
 
   const submitCcSwitch = (id: string) => {
+    const contextWindowValue = parsedContextWindow();
+    if (contextWindowValue === null) return;
     setLoginBusy(true);
     setLoginError("");
     void window.grok
-      .loginApiKey({ fromCcSwitchId: id })
+      .loginApiKey({
+        fromCcSwitchId: id,
+        model,
+        contextWindow: contextWindowValue,
+        sessionId: sessionId || undefined,
+        cwd: cwd || undefined,
+      })
       .then((result) => {
         if (!result.ok) {
           setLoginError(result.message || "切换失败");
@@ -572,6 +612,27 @@ function ApiLoginView({
             />
           </label>
           <label className="field">
+            模型
+            <input
+              type="text"
+              value={model}
+              placeholder="grok-4.6"
+              onChange={(e) => setModel(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            上下文长度（tokens，可选）
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={contextWindow}
+              placeholder="例如 131072"
+              onChange={(e) => setContextWindow(e.target.value)}
+            />
+            <small>填写后会显示上下文容量和使用百分比。</small>
+          </label>
+          <label className="field">
             API Key
             <input
               type="password"
@@ -617,6 +678,7 @@ export function Sidebar({
   threads,
   selectedProjectCwd,
   activeId,
+  activeCwd,
   runningIds,
   unreadIds,
   grokLabel,
@@ -645,6 +707,8 @@ export function Sidebar({
   const [loginView, setLoginView] = useState<"choose" | "api">("choose");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.x.ai/v1");
+  const [apiModel, setApiModel] = useState("grok-4.6");
+  const [apiContextWindow, setApiContextWindow] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [ccSwitchProviders, setCcSwitchProviders] = useState<
@@ -668,6 +732,7 @@ export function Sidebar({
   const menuRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const updateRequestRef = useRef<Promise<AppUpdateInfo> | null>(null);
+  const savedApiProviderRef = useRef(false);
 
   const requestUpdateCheck = () => {
     if (updateRequestRef.current) return updateRequestRef.current;
@@ -718,6 +783,8 @@ export function Sidebar({
     setLoginView("choose");
     setApiKey("");
     setBaseUrl("https://api.x.ai/v1");
+    setApiModel("grok-4.6");
+    setApiContextWindow("");
     setSelectedProviderId(null);
     setShowManualEntry(false);
   };
@@ -728,6 +795,8 @@ export function Sidebar({
     setLoginView("choose");
     setApiKey("");
     setBaseUrl("https://api.x.ai/v1");
+    setApiModel("grok-4.6");
+    setApiContextWindow("");
     setSelectedProviderId(null);
     setShowManualEntry(false);
     setLoginOpen(true);
@@ -806,13 +875,36 @@ export function Sidebar({
   }, [searchOpen, searchQuery]);
 
   useEffect(() => {
+    if (!loginOpen || loginView !== "api") return;
+    let disposed = false;
+    savedApiProviderRef.current = false;
+    void window.grok
+      .apiProvider()
+      .then((saved) => {
+        if (disposed || !saved) return;
+        savedApiProviderRef.current = true;
+        setBaseUrl(saved.baseUrl);
+        setApiKey(saved.apiKey);
+        setApiModel(saved.model);
+        setApiContextWindow(saved.contextWindow ? String(saved.contextWindow) : "");
+        setShowManualEntry(true);
+      })
+      .catch(() => {
+        // Keep the blank manual form available if the local config cannot be read.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [loginOpen, loginView]);
+
+  useEffect(() => {
     if (!loginOpen || loginView !== "api" || ccSwitchProviders.length > 0 || ccSwitchLoading) return;
     setCcSwitchLoading(true);
     void window.grok
       .listCcSwitchProviders()
       .then((providers) => {
         setCcSwitchProviders(providers);
-        setShowManualEntry(providers.length === 0);
+        setShowManualEntry(savedApiProviderRef.current || providers.length === 0);
       })
       .catch(() => {
         setCcSwitchProviders([]);
@@ -1179,7 +1271,7 @@ export function Sidebar({
               {canShowUsage ? (
                 <button type="button" role="menuitem" disabled={usageLoading} onClick={refreshUsage}>
                   <UsageIcon />
-                  <span>使用情况</span>
+                  <span>OAuth 使用情况</span>
                   <em>{usageSummary}</em>
                 </button>
               ) : null}
@@ -1435,6 +1527,12 @@ export function Sidebar({
                   setBaseUrl={setBaseUrl}
                   apiKey={apiKey}
                   setApiKey={setApiKey}
+                  model={apiModel}
+                  setModel={setApiModel}
+                  contextWindow={apiContextWindow}
+                  setContextWindow={setApiContextWindow}
+                  sessionId={activeId}
+                  cwd={activeCwd}
                   loginBusy={loginBusy}
                   setLoginBusy={setLoginBusy}
                   loginError={loginError}
@@ -1453,6 +1551,8 @@ export function Sidebar({
                     onAccountChange?.(account);
                     setLoginOpen(false);
                     setApiKey("");
+                    setApiModel("grok-4.6");
+                    setApiContextWindow("");
                     setSelectedProviderId(null);
                   }}
                 />

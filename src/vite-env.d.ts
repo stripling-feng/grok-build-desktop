@@ -13,6 +13,9 @@ import type {
   GitStatus,
   GrokStatus,
   PermissionMode,
+  ProxyApplyResult,
+  ProxySettings,
+  ProxyTestResult,
   ReasoningEffort,
   PermissionRequest,
   ProjectInfo,
@@ -38,9 +41,23 @@ declare global {
       status: () => Promise<GrokStatus>;
       account: () => Promise<AccountInfo>;
       accountUsage: () => Promise<AccountUsage>;
+      apiProvider: () => Promise<{
+        baseUrl: string;
+        apiKey: string;
+        model: string;
+        contextWindow?: number;
+      } | null>;
       loginAccount: () => Promise<{ ok: boolean; account: AccountInfo; message?: string; url?: string }>;
       cancelAccountLogin: () => Promise<boolean>;
-      loginApiKey: (input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) => Promise<{ ok: boolean; account: AccountInfo; message?: string }>;
+      loginApiKey: (input: {
+        baseUrl?: string;
+        apiKey?: string;
+        model?: string;
+        contextWindow?: number;
+        fromCcSwitchId?: string;
+        sessionId?: string;
+        cwd?: string;
+      }) => Promise<{ ok: boolean; account: AccountInfo; message?: string }>;
       listCcSwitchProviders: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string }>>;
       logout: () => Promise<AccountInfo>;
       checkUpdate: () => Promise<AppUpdateInfo>;
@@ -123,8 +140,11 @@ declare global {
       }) => Promise<{ path: string; dataUrl: string } | null>;
       windowControl: (action: "min" | "max" | "close") => Promise<void>;
       settings: (cwd?: string | null) => Promise<AppSettings>;
+      proxySettings: () => Promise<ProxySettings>;
+      setProxySettings: (input: ProxySettings) => Promise<ProxyApplyResult>;
+      testProxy: (input: ProxySettings, target: "oauth" | "api") => Promise<ProxyTestResult>;
       setModel: (id: string) => Promise<AppSettings>;
-      setReasoningEffort: (effort: ReasoningEffort) => Promise<AppSettings>;
+      setReasoningEffort: (effort: ReasoningEffort, sessionId?: string) => Promise<AppSettings>;
       setPermission: (mode: PermissionMode) => Promise<AppSettings>;
       setBrowserControl: (enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
       setComputerControl: (enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
@@ -171,7 +191,11 @@ declare global {
       terminalKill: () => Promise<void>;
       onTerminalData: (cb: (chunk: string) => void) => () => void;
       onUpdate: (cb: (payload: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown>; runContinues?: boolean }) => void) => () => void;
-      onTurnFiles: (cb: (payload: { sessionId: string; files: string[] }) => void) => () => void;
+      onTurnFiles: (cb: (payload: {
+        sessionId: string;
+        files: string[];
+        stats?: Record<string, { added: number; removed: number }>;
+      }) => void) => () => void;
       onRunState: (cb: (payload: { sessionId: string; running: boolean }) => void) => () => void;
       onFollowUpState: (cb: (payload: { sessionId: string; entries: QueuedFollowUp[] }) => void) => () => void;
       onFollowUpStarted: (cb: (payload: { entry: QueuedFollowUp; delivery: "queued" | "steered" }) => void) => () => void;

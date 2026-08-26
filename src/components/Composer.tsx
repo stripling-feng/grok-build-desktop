@@ -25,6 +25,7 @@ type Props = {
   attachments: string[];
   queuedFollowUps: QueuedFollowUp[];
   settings: AppSettings | null;
+  modelSelectionLocked?: boolean;
   contextUsed?: number | null;
   contextUsage?: ContextUsage | null;
   permission: PermissionRequest | null;
@@ -397,6 +398,7 @@ export function Composer({
   attachments,
   queuedFollowUps,
   settings,
+  modelSelectionLocked = false,
   contextUsed,
   contextUsage,
   permission,
@@ -799,6 +801,7 @@ export function Composer({
                     : "随心输入，输入 / 可调用技能"
             }
             aria-label={awaitingAnswer ? "回答 Grok 的问题" : "消息输入框"}
+            onFocus={closeMenus}
             onChange={(e) => onChange(e.target.value)}
             onPaste={(e) => {
               let nativeFiles: string[] = [];
@@ -929,6 +932,7 @@ export function Composer({
                 <button
                   type="button"
                   className={`model-chip${modelOpen ? " open" : ""}`}
+                  disabled={busy}
                   onClick={() => {
                     setMenuOpen(false);
                     setPickOpen(false);
@@ -941,25 +945,27 @@ export function Composer({
                 </button>
                 {modelOpen && settings ? (
                   <div className="model-menu">
-                    <div className="model-menu-section">
-                      <div className="model-menu-kicker">模型</div>
-                      <div className="model-menu-list">
-                        {settings.models.map((m) => (
-                          <button
-                            key={m.id}
-                            type="button"
-                            className={`model-option${m.id === settings.model ? " on" : ""}`}
-                            onClick={() => onModel(m.id)}
-                          >
-                            <span className={`model-radio${m.id === settings.model ? " on" : ""}`} />
-                            <span className="perm-option-copy">
-                              <strong>{m.name}</strong>
-                              {m.name !== m.id ? <em>{m.id}</em> : null}
-                            </span>
-                          </button>
-                        ))}
+                    {!modelSelectionLocked ? (
+                      <div className="model-menu-section">
+                        <div className="model-menu-kicker">模型</div>
+                        <div className="model-menu-list">
+                          {settings.models.map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              className={`model-option${m.id === settings.model ? " on" : ""}`}
+                              onClick={() => onModel(m.id)}
+                            >
+                              <span className={`model-radio${m.id === settings.model ? " on" : ""}`} />
+                              <span className="perm-option-copy">
+                                <strong>{m.name}</strong>
+                                {m.name !== m.id ? <em>{m.id}</em> : null}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
                       </div>
-                    </div>
+                    ) : null}
                     <div className="model-menu-section">
                       <div className="model-menu-kicker">推理等级</div>
                       <div className="effort-seg">

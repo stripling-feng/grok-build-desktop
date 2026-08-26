@@ -19,6 +19,7 @@ import {
   planDocumentWasUpdatedForTurn,
   type ContextPart,
   type ContextUsage,
+  type FileLineStats,
   type StreamItem,
   type ThreadInfo,
   type ThreadSearchResult,
@@ -421,6 +422,7 @@ export type TurnFilesRecord = {
   startedAt: number;
   completedAt: number;
   files: string[];
+  stats?: Record<string, FileLineStats>;
 };
 
 export type TurnAttachmentsRecord = {
@@ -504,6 +506,20 @@ function readTurnFiles(sessionId: string, cwd?: string): TurnFilesRecord[] {
         startedAt: row.startedAt,
         completedAt: row.completedAt,
         files: [...new Set(row.files.filter((file): file is string => typeof file === "string" && Boolean(file)))],
+        stats:
+          row.stats && typeof row.stats === "object"
+            ? Object.fromEntries(
+                Object.entries(row.stats).filter(
+                  ([, value]) =>
+                    Boolean(
+                      value &&
+                        typeof value === "object" &&
+                        typeof value.added === "number" &&
+                        typeof value.removed === "number",
+                    ),
+                ),
+              )
+            : undefined,
       }))
       .filter((row) => row.files.length > 0)
       .sort((a, b) => a.startedAt - b.startedAt);
@@ -520,6 +536,11 @@ export function saveTurnFiles(sessionId: string, cwd: string, record: TurnFilesR
   records.push({
     ...record,
     files: [...new Set(record.files.map((file) => file.replace(/\\/g, "/")))].sort((a, b) => a.localeCompare(b)),
+    stats: record.stats
+      ? Object.fromEntries(
+          Object.entries(record.stats).map(([filePath, stats]) => [filePath.replace(/\\/g, "/"), stats]),
+        )
+      : undefined,
   });
   records.sort((a, b) => a.startedAt - b.startedAt);
   const target = turnFilesPath(dir);
@@ -545,6 +566,7 @@ function attachTurnFiles(items: StreamItem[], records: TurnFilesRecord[]): Strea
 
   const assigned = new Set<number>();
   const filesByUser = new Map<number, Set<string>>();
+  const statsByUser = new Map<number, TurnFilesRecord["stats"]>();
   const fallback = userIndexes.slice(-records.length);
   records.forEach((record, recordIndex) => {
     let best: { index: number; distance: number } | null = null;
@@ -559,6 +581,7 @@ function attachTurnFiles(items: StreamItem[], records: TurnFilesRecord[]): Strea
     if (userIndex == null || assigned.has(userIndex)) return;
     assigned.add(userIndex);
     filesByUser.set(userIndex, new Set(record.files));
+    statsByUser.set(userIndex, record.stats);
   });
   if (!filesByUser.size) return items;
 
@@ -566,7 +589,9 @@ function attachTurnFiles(items: StreamItem[], records: TurnFilesRecord[]): Strea
   let currentUser = -1;
   const flushFiles = () => {
     const files = filesByUser.get(currentUser);
-    if (files?.size) result.push({ kind: "changes", files: [...files] });
+    if (files?.size) {
+      result.push({ kind: "changes", files: [...files], stats: statsByUser.get(currentUser) });
+    }
   };
   items.forEach((item, index) => {
     if (item.kind === "user") {

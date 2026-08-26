@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, session as electronSession, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, shell, Tray } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -69,7 +69,12 @@ import {
   type McpAddInput,
 } from "./grok-cli";
 import { ProjectTerminal } from "./terminal";
-import { extractModifiedFilePaths, type PermissionMode, type ReasoningEffort } from "./shared";
+import {
+  extractModifiedFilePaths,
+  type GitStatus,
+  type PermissionMode,
+  type ReasoningEffort,
+} from "./shared";
 import {
   FollowUpQueue,
   type FollowUpImage,
@@ -81,8 +86,20 @@ import { INSTALL_COMMAND, INSTALL_DOCS } from "./grok-bin";
 import { startGrokInstall, stopGrokInstall, type InstallLogLine } from "./install-cli";
 import { initLog, log, logsDir, pruneLogs } from "./log";
 import { getGoal, setGoal } from "./goals";
-import { loadAccount, loadAccountUsage, saveApiKey, startAccountLogin, getCcSwitchProvider, listCcSwitchProviders, clearAccountCredentials } from "./account";
+import {
+  clearAccountCredentials,
+  getCcSwitchProvider,
+  listCcSwitchProviders,
+  loadAccount,
+  loadAccountUsage,
+  loadApiProvider,
+  repairAccountCredentials,
+  saveApiKey,
+  startAccountLogin,
+  validateApiProvider,
+} from "./account";
 import { checkAppUpdate, downloadAppUpdate, initializeAppUpdater, installDownloadedUpdate } from "./update";
+import { CUSTOM_MODEL_ID } from "./account-config";
 import { pathsFromClipboardBuffer } from "./clipboard-files";
 import {
   createAutomation,
@@ -97,6 +114,16 @@ import {
   updateAutomation,
   type AutomationInput,
 } from "./automations";
+import {
+  OAUTH_DISCOVERY_URL,
+  applyStoredProxySettings,
+  currentGrokTarget,
+  loadProxySettings,
+  proxyEnvironmentForTarget,
+  saveProxySettings,
+  testProxySettings,
+} from "./network-settings";
+import type { ProxySettings } from "./shared";
 
 app.setName("Grok Build");
 
@@ -118,73 +145,9 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let windowRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
-let systemProxyPromise: Promise<string | null> | null = null;
 let accountLoginController: AbortController | null = null;
-
-function proxyUrlFromRules(rules: string): string | null {
-  for (const rule of rules.split(";")) {
-    const match = rule.trim().match(/^(PROXY|HTTPS|SOCKS5|SOCKS4|SOCKS)\s+(.+)$/i);
-    if (!match) continue;
-    const scheme = match[1].toUpperCase().startsWith("SOCKS") ? "socks5" : "http";
-    const candidate = `${scheme}://${match[2].trim()}`;
-    try {
-      const parsed = new URL(candidate);
-      if (parsed.hostname && parsed.port) return candidate;
-    } catch {
-      /* try the next proxy rule */
-    }
-  }
-  return null;
-}
-
-function existingProxy(): string | null {
-  return (
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy ||
-    process.env.ALL_PROXY ||
-    process.env.all_proxy ||
-    null
-  );
-}
-
-function proxyLabel(value: string): string {
-  try {
-    const parsed = new URL(value);
-    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
-  } catch {
-    return "configured";
-  }
-}
-
-async function ensureSystemProxyEnvironment(): Promise<string | null> {
-  if (systemProxyPromise) return systemProxyPromise;
-  systemProxyPromise = (async () => {
-    const configured = existingProxy();
-    const proxy =
-      configured ||
-      proxyUrlFromRules(
-        await electronSession.defaultSession.resolveProxy(
-          "https://auth.x.ai/.well-known/openid-configuration",
-        ),
-      );
-    if (!proxy) {
-      log("network proxy direct");
-      return null;
-    }
-    // Grok CLI uses the conventional proxy environment variables, while
-    // Electron/Chrome reads the Windows proxy settings itself. Bridge the two.
-    if (!process.env.HTTPS_PROXY && !process.env.https_proxy) process.env.HTTPS_PROXY = proxy;
-    if (!process.env.HTTP_PROXY && !process.env.http_proxy) process.env.HTTP_PROXY = proxy;
-    log("network proxy", proxyLabel(proxy));
-    return proxy;
-  })().catch((err) => {
-    log("system proxy detection failed", err);
-    return null;
-  });
-  return systemProxyPromise;
-}
+let proxyReconnectPending = false;
+let proxyReconnectPromise: Promise<string> | null = null;
 
 function send(channel: string, payload: unknown) {
   mainWindow?.webContents.send(channel, payload);
@@ -201,6 +164,38 @@ function setSessionRunning(sessionId: string, running: boolean) {
 
 function clearRunningSessions() {
   for (const sessionId of [...runningSessions]) setSessionRunning(sessionId, false);
+}
+
+function hasProxySensitiveWork() {
+  return (
+    activePromptSessions.size > 0 ||
+    drainingFollowUps.size > 0 ||
+    steeredSessions.size > 0 ||
+    runningSessions.size > 0 ||
+    runningAutomations.size > 0
+  );
+}
+
+async function reconnectAgentForProxy(): Promise<string> {
+  if (proxyReconnectPromise) return proxyReconnectPromise;
+  proxyReconnectPromise = (async () => {
+    const route = await applyStoredProxySettings(currentGrokTarget());
+    loadedSessions.clear();
+    await acp.stop();
+    await acp.ensureStarted();
+    log("network proxy applied", route);
+    return route;
+  })().finally(() => {
+    proxyReconnectPromise = null;
+    queueMicrotask(maybeApplyPendingProxy);
+  });
+  return proxyReconnectPromise;
+}
+
+function maybeApplyPendingProxy() {
+  if (!proxyReconnectPending || hasProxySensitiveWork()) return;
+  proxyReconnectPending = false;
+  void reconnectAgentForProxy().catch((err) => log("deferred proxy reconnect failed", err));
 }
 
 function relativeTurnPath(cwd: string, candidate: string): string | null {
@@ -225,18 +220,33 @@ async function finishTurnFiles(sessionId: string, succeeded: boolean) {
   activeTurnFiles.delete(sessionId);
   if (!turn || !succeeded) return;
   let gitFiles: string[] = [];
+  let endStatus: GitStatus | undefined;
   try {
-    gitFiles = await gitFilesChangedSince(turn.cwd, turn.baseline);
+    [gitFiles, endStatus] = await Promise.all([
+      gitFilesChangedSince(turn.cwd, turn.baseline),
+      gitStatus(turn.cwd),
+    ]);
   } catch (err) {
     log("turn file comparison failed", sessionId, err);
   }
+  // File-change cards are a Git-backed view. Do not create or persist them for
+  // ordinary folders, even when an ACP tool reports that it wrote a file.
+  if (!endStatus?.isRepo) return;
   const files = [...new Set([...turn.reported, ...gitFiles])].sort((a, b) => a.localeCompare(b));
   if (!files.length) return;
-  const payload = { sessionId, files };
+  const gitFileByPath = new Map(endStatus.files.map((file) => [file.path, file]));
+  const stats = Object.fromEntries(
+    files.flatMap((filePath) => {
+      const file = gitFileByPath.get(filePath);
+      return file ? [[filePath, { added: file.added, removed: file.removed }]] : [];
+    }),
+  );
+  const payload = { sessionId, files, stats };
   saveTurnFiles(sessionId, turn.cwd, {
     startedAt: turn.startedAt,
     completedAt: Date.now(),
     files,
+    stats,
   });
   send("grok:turn-files", payload);
 }
@@ -298,6 +308,9 @@ async function loadSessionWithoutRendererReplay(sessionId: string, cwd: string):
   sessionReplays.begin(sessionId);
   try {
     await acp.loadSession(sessionId, cwd);
+    if (loadAccount().method === "api-key") {
+      await acp.setModel(sessionId, CUSTOM_MODEL_ID);
+    }
   } finally {
     const suppressed = sessionReplays.end(sessionId);
     if (suppressed > 0) log("session replay updates suppressed", sessionId, suppressed);
@@ -328,6 +341,7 @@ async function drainFollowUps(sessionId: string) {
     if (!activePromptSessions.has(sessionId) && !steeredSessions.has(sessionId)) {
       setSessionRunning(sessionId, false);
     }
+    maybeApplyPendingProxy();
   }
 }
 
@@ -528,11 +542,19 @@ if (!gotLock) {
     app.setAppUserModelId("ai.x.grok.build.desktop");
     initLog();
     pruneLogs();
+    try {
+      repairAccountCredentials();
+    } catch (err) {
+      log("account credential repair failed", err);
+    }
     initializeAppUpdater((state) => send("grok:app-update-state", state));
     createTray();
     createWindow();
-    void ensureSystemProxyEnvironment()
-      .then(() => acp.ensureStarted())
+    void applyStoredProxySettings(currentGrokTarget())
+      .then((route) => {
+        log("network proxy", route);
+        return acp.ensureStarted();
+      })
       .catch((err) => log("agent warmup failed", err));
     recoverStuckAutomations(Date.now(), { force: true, skipIds: runningAutomations });
     startAutomationLoop(() => {
@@ -666,6 +688,9 @@ async function runAutomation(id: string, manual = false) {
     }
     if (!sessionId) {
       sessionId = await acp.newSession(threadCwd, extra);
+      if (loadAccount().method === "api-key") {
+        await acp.setModel(sessionId, CUSTOM_MODEL_ID);
+      }
       loadedSessions.add(sessionId);
       bindSessionToProject(sessionId, unattached ? "" : projectCwd);
       try {
@@ -696,6 +721,7 @@ async function runAutomation(id: string, manual = false) {
   } finally {
     runningAutomations.delete(id);
     publishAutomations();
+    maybeApplyPendingProxy();
   }
 }
 
@@ -720,18 +746,24 @@ async function tickAutomations() {
 ipcMain.handle("grok:status", () => acp.status());
 ipcMain.handle("grok:account", () => loadAccount());
 ipcMain.handle("grok:accountUsage", () => loadAccountUsage());
+ipcMain.handle("grok:apiProvider", () => loadApiProvider());
 ipcMain.handle("grok:loginAccount", async () => {
-  await ensureSystemProxyEnvironment();
+  await applyStoredProxySettings(OAUTH_DISCOVERY_URL);
+  const loginEnv = await proxyEnvironmentForTarget(OAUTH_DISCOVERY_URL);
   accountLoginController?.abort();
   const controller = new AbortController();
   accountLoginController = controller;
   try {
-    return await startAccountLogin(
-      (url) => {
-        void shell.openExternal(url);
-      },
-      { signal: controller.signal },
-    );
+    const result = await startAccountLogin({ signal: controller.signal, env: loginEnv });
+    if (!result.ok) return result;
+    try {
+      await acp.stop();
+      await acp.ensureStarted();
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ...result, ok: false, message: `登录成功，但重新连接失败：${message}` };
+    }
   } finally {
     if (accountLoginController === controller) accountLoginController = null;
   }
@@ -740,20 +772,52 @@ ipcMain.handle("grok:cancelAccountLogin", () => {
   accountLoginController?.abort();
   return true;
 });
-ipcMain.handle("grok:loginApiKey", (_e, input: { baseUrl?: string; apiKey?: string; model?: string; fromCcSwitchId?: string }) => {
+ipcMain.handle("grok:loginApiKey", async (_e, input: {
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  contextWindow?: number;
+  fromCcSwitchId?: string;
+  sessionId?: string;
+  cwd?: string;
+}) => {
   try {
     const payload =
       input?.fromCcSwitchId
         ? (() => {
             const provider = getCcSwitchProvider(input.fromCcSwitchId);
             if (!provider) throw new Error("cc-switch 中没有找到该供应商");
-            return { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: input.model };
+            return {
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              model: input.model,
+              contextWindow: input.contextWindow,
+            };
           })()
         : input;
     if (!payload || !payload.baseUrl || !payload.apiKey) {
       throw new Error("请填写 Base URL 和 API Key");
     }
-    const account = saveApiKey({ baseUrl: payload.baseUrl, apiKey: payload.apiKey, model: payload.model });
+    await applyStoredProxySettings(payload.baseUrl);
+    await validateApiProvider({ baseUrl: payload.baseUrl, apiKey: payload.apiKey, model: payload.model });
+    const account = saveApiKey({
+      baseUrl: payload.baseUrl,
+      apiKey: payload.apiKey,
+      model: payload.model,
+      contextWindow: payload.contextWindow,
+    });
+    try {
+      await acp.stop();
+      await acp.ensureStarted();
+      if (input.sessionId && input.cwd) {
+        await acp.loadSession(input.sessionId, input.cwd);
+        await acp.setModel(input.sessionId, CUSTOM_MODEL_ID);
+        loadedSessions.add(input.sessionId);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, account, message: `API Key 已保存，但重新连接失败：${message}` };
+    }
     return { ok: true, account };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -848,6 +912,9 @@ ipcMain.handle("grok:newThread", async (_e, cwd?: string | null, worktree?: bool
   const goal = unattached ? "" : getGoal(projectCwd);
   const extra = sessionMeta(goal ? [`持续目标：${goal}`] : []);
   const sessionId = await acp.newSession(threadCwd, extra);
+  if (loadAccount().method === "api-key") {
+    await acp.setModel(sessionId, CUSTOM_MODEL_ID);
+  }
   loadedSessions.add(sessionId);
   if (unattached) bindSessionToProject(sessionId, "");
   else bindSessionToProject(sessionId, projectCwd);
@@ -954,6 +1021,7 @@ ipcMain.handle("grok:sendPrompt", async (
       // The prompt request settling is the authoritative fallback completion.
       setSessionRunning(sessionId, false);
     }
+    maybeApplyPendingProxy();
   }
 });
 ipcMain.handle("grok:runningSessions", () => [...runningSessions]);
@@ -1162,14 +1230,41 @@ ipcMain.handle(
 );
 
 ipcMain.handle("grok:settings", (_e, cwd?: string | null) => loadSettings(cwd));
+ipcMain.handle("grok:proxySettings", () => loadProxySettings());
+ipcMain.handle(
+  "grok:testProxy",
+  (_e, input: ProxySettings, target: "oauth" | "api") => testProxySettings(input, target),
+);
+ipcMain.handle("grok:setProxySettings", async (_e, input: ProxySettings) => {
+  const settings = saveProxySettings(input);
+  if (hasProxySensitiveWork() || proxyReconnectPromise) {
+    proxyReconnectPending = true;
+    return {
+      settings,
+      applied: false,
+      pending: true,
+      route: "等待当前任务结束后应用",
+    };
+  }
+  proxyReconnectPending = false;
+  const route = await reconnectAgentForProxy();
+  return { settings, applied: true, pending: false, route };
+});
 ipcMain.handle("grok:setModel", async (_e, id: string) => {
-  setDefaultModel(id);
+  setDefaultModel(loadAccount().method === "api-key" ? CUSTOM_MODEL_ID : id);
   loadedSessions.clear();
   await acp.stop();
   return loadSettings();
 });
-ipcMain.handle("grok:setReasoningEffort", async (_e, effort: ReasoningEffort) => {
+ipcMain.handle("grok:setReasoningEffort", async (_e, input: {
+  effort: ReasoningEffort;
+  sessionId?: string;
+}) => {
+  const effort = input?.effort;
   setDefaultReasoningEffort(effort);
+  if (input?.sessionId && loadedSessions.has(input.sessionId)) {
+    await acp.setReasoningEffort(input.sessionId, effort);
+  }
   return loadSettings(undefined, { skipCli: true });
 });
 ipcMain.handle("grok:setBrowserControl", async (_e, enabled: boolean, cwd?: string | null) => {
@@ -1200,6 +1295,9 @@ ipcMain.handle(
 ipcMain.handle(
   "grok:setSubagentTypeModel",
   async (_e, id: string, model: string | null, cwd?: string | null) => {
+    if (loadAccount().method === "api-key") {
+      return loadSettings(cwd, { skipCli: true });
+    }
     setSubagentTypeModel(id, model);
     return loadSettings(cwd, { skipCli: true });
   },
@@ -1305,7 +1403,7 @@ ipcMain.handle("grok:pluginUninstall", async (_e, name: string, cwd?: string | n
 });
 ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, cwd?: string | null) => {
   try {
-    await ensureSystemProxyEnvironment();
+    await applyStoredProxySettings("https://github.com");
     await marketplaceAdd(url, cwd);
     return await loadSettings(cwd);
   } catch (err) {
@@ -1322,7 +1420,7 @@ ipcMain.handle("grok:marketplaceRemove", async (_e, url: string, cwd?: string | 
 });
 ipcMain.handle("grok:availablePlugins", async () => {
   try {
-    await ensureSystemProxyEnvironment();
+    await applyStoredProxySettings("https://github.com");
     return await listAvailablePlugins();
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));

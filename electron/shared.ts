@@ -26,8 +26,13 @@ export type StreamItem =
       entries: { content: string; status: PlanEntryStatus }[];
       markdown?: string;
     }
-  | { kind: "changes"; files: string[] }
+  | { kind: "changes"; files: string[]; stats?: Record<string, FileLineStats> }
   | { kind: "status"; text: string };
+
+export type FileLineStats = {
+  added: number;
+  removed: number;
+};
 
 export type PlanEntryStatus =
   | "pending"
@@ -305,11 +310,36 @@ export type AppSettings = {
   inspectError?: string;
 };
 
+export type ProxyMode = "system" | "direct" | "manual";
+
+export type ProxySettings = {
+  mode: ProxyMode;
+  url: string;
+};
+
+export type ProxyApplyResult = {
+  settings: ProxySettings;
+  applied: boolean;
+  pending: boolean;
+  route: string;
+};
+
+export type ProxyTestResult = {
+  ok: boolean;
+  target: "oauth" | "api";
+  route: string;
+  durationMs: number;
+  status?: number;
+  message: string;
+};
+
 export type GitFile = {
   path: string;
   status: string;
   untracked: boolean;
   staged: boolean;
+  added: number;
+  removed: number;
 };
 
 export type GitStatus = {

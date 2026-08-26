@@ -698,7 +698,7 @@ export function App() {
     const offTurnFiles = window.grok.onTurnFiles((payload) => {
       if (!payload?.files?.length) return;
       if (!isSessionViewCurrent(activeRef.current?.sessionId, payload.sessionId)) return;
-      setItems((prev) => appendTurnChanges(prev, payload.files));
+      setItems((prev) => appendTurnChanges(prev, payload.files, payload.stats));
     });
     const offPerm = window.grok.onPermission((p) => {
       setPermissionsBySession((current) => ({ ...current, [p.sessionId]: p }));
@@ -735,6 +735,7 @@ export function App() {
       unattached,
     };
     setActive(nextActive);
+    setGit(null);
     const viewVersion = activeViewVersionRef.current;
     setItems([]);
     setContextUsed(null);
@@ -778,8 +779,7 @@ export function App() {
     setWorktreeMode(Boolean(thread.worktree));
     setSelectedDiffFile(null);
     setReviewOpen(false);
-    if (unattached) setGit(null);
-    else void window.grok.gitStatus(thread.cwd).then((next) => {
+    if (!unattached) void window.grok.gitStatus(thread.cwd).then((next) => {
       if (activeViewVersionRef.current === viewVersion && activeRef.current?.sessionId === thread.id) setGit(next);
     });
   }, []);
@@ -864,8 +864,8 @@ export function App() {
       setReviewOpen(false);
       setPlanDocument(null);
       setPlanPanel(null);
-      if (unattached) setGit(null);
-      else if (cwd) void window.grok.gitStatus(cwd).then(setGit);
+      setGit(null);
+      if (!unattached && cwd) void window.grok.gitStatus(cwd).then(setGit);
       setActive(nextActive);
     },
     [composerKey],
@@ -914,8 +914,8 @@ export function App() {
             ? current
             : [pendingThread, ...current],
         );
-        if (nextUnattached) setGit(null);
-        else void window.grok.gitStatus(created.cwd).then(setGit);
+        setGit(null);
+        if (!nextUnattached) void window.grok.gitStatus(created.cwd).then(setGit);
         return next;
       })();
       pendingThreadRef.current = task;
@@ -969,8 +969,8 @@ export function App() {
         setContextUsed(transcript.contextUsed);
         setContextUsage(transcript.contextUsage);
         setSelectedDiffFile(null);
-        if (nextUnattached) setGit(null);
-        else void window.grok.gitStatus(created.cwd).then((next) => {
+        setGit(null);
+        if (!nextUnattached) void window.grok.gitStatus(created.cwd).then((next) => {
           if (activeRef.current?.sessionId === created.sessionId) setGit(next);
         });
         void refresh();
@@ -1730,11 +1730,15 @@ export function App() {
           threads={threads}
           selectedProjectCwd={selectedProjectCwd}
           activeId={active?.sessionId ?? null}
+          activeCwd={active?.cwd ?? null}
           runningIds={runningIds}
           unreadIds={unreadIds}
           grokLabel={grokLabel}
           account={account}
-          onAccountChange={setAccount}
+          onAccountChange={(next) => {
+            setAccount(next);
+            void window.grok.settings(active?.cwd || selectedProjectCwd).then(setSettings);
+          }}
           onOpenProject={() => void openProject()}
           onNewChat={() => beginComposer(null)}
           page={page}
@@ -1953,6 +1957,7 @@ export function App() {
             <>
           <MessageStream
             items={items}
+            git={git}
             busy={sessionBusy}
             sessionId={active?.sessionId}
             cwd={active?.cwd}
@@ -2015,6 +2020,7 @@ export function App() {
             attachments={attachments}
             queuedFollowUps={activeFollowUps}
             settings={settings}
+            modelSelectionLocked={account?.method === "api-key"}
             contextUsed={contextUsed}
             contextUsage={contextUsage}
             permission={activePermission}
@@ -2040,7 +2046,13 @@ export function App() {
             }}
             onReasoningEffort={(effort) => {
               setSettings((cur) => (cur ? { ...cur, reasoningEffort: effort } : cur));
-              void window.grok.setReasoningEffort(effort).then(setSettings);
+              void window.grok
+                .setReasoningEffort(effort, active?.sessionId)
+                .then(setSettings)
+                .catch((err) => {
+                  void window.grok.settings(active?.cwd || selectedProjectCwd).then(setSettings);
+                  setError(`切换推理强度失败：${err instanceof Error ? err.message : String(err)}`);
+                });
             }}
             onSend={() => {
               void send().catch((err) => {
@@ -2196,6 +2208,8 @@ export function App() {
         open={settingsOpen}
         settings={settings}
         cwd={active?.cwd || selectedProjectCwd}
+        sessionId={active?.sessionId}
+        modelSelectionLocked={account?.method === "api-key"}
         onClose={() => setSettingsOpen(false)}
         onChange={setSettings}
       />

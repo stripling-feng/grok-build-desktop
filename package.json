@@ -1,6 +1,6 @@
 {
   "name": "grok-build-desktop",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Grok Build 桌面端：通过 ACP 调用本机 grok CLI 的 Electron 界面",
   "author": "Grok Build Desktop",

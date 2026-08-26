@@ -4,6 +4,9 @@ import type {
   AppUpdateInfo,
   AvailablePluginInfo,
   PermissionMode,
+  ProxyMode,
+  ProxySettings,
+  ProxyTestResult,
   ReasoningEffort,
 } from "../../electron/shared";
 import { Markdown } from "../lib/markdown";
@@ -32,11 +35,12 @@ export const HOOK_EVENTS = [
 
 export type SettingsRun = <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 
-type SettingsPane = "general" | "features" | "about";
+type SettingsPane = "general" | "features" | "network" | "about";
 
 const NAV: { id: SettingsPane; label: string; hint: string }[] = [
   { id: "general", label: "常规", hint: "模型、推理与权限" },
   { id: "features", label: "功能", hint: "浏览器、电脑与子智能体" },
+  { id: "network", label: "网络与代理", hint: "连接方式与网络测试" },
   { id: "about", label: "关于", hint: "版本更新与运行日志" },
 ];
 
@@ -59,6 +63,14 @@ function SettingsPaneIcon({ pane }: { pane: SettingsPane }) {
       </svg>
     );
   }
+  if (pane === "network") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden>
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M3.8 12h16.4M12 3.5c2.2 2.3 3.3 5.1 3.3 8.5S14.2 18.2 12 20.5M12 3.5C9.8 5.8 8.7 8.6 8.7 12s1.1 6.2 3.3 8.5" fill="none" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" />
+      </svg>
+    );
+  }
   return (
     <svg viewBox="0 0 24 24" aria-hidden>
       <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
@@ -78,12 +90,16 @@ export function Settings({
   open,
   settings,
   cwd,
+  sessionId,
+  modelSelectionLocked = false,
   onClose,
   onChange,
 }: {
   open: boolean;
   settings: AppSettings | null;
   cwd?: string | null;
+  sessionId?: string | null;
+  modelSelectionLocked?: boolean;
   onClose: () => void;
   onChange: (next: AppSettings) => void;
 }) {
@@ -133,9 +149,11 @@ export function Settings({
         </nav>
         <div className={`settings-body ${pane}`}>
           {pane === "general" ? (
-            settings ? <GeneralPane settings={settings} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
+            settings ? <GeneralPane settings={settings} sessionId={sessionId} modelSelectionLocked={modelSelectionLocked} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
           ) : pane === "features" ? (
             settings ? <FeaturesPane settings={settings} cwd={cwd} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
+          ) : pane === "network" ? (
+            <NetworkPane />
           ) : pane === "about" ? (
             <AboutPane />
           ) : (
@@ -149,9 +167,13 @@ export function Settings({
 
 function GeneralPane({
   settings,
+  sessionId,
+  modelSelectionLocked,
   onChange,
 }: {
   settings: AppSettings;
+  sessionId?: string | null;
+  modelSelectionLocked: boolean;
   onChange: (next: AppSettings) => void;
 }) {
   return (
@@ -162,19 +184,25 @@ function GeneralPane({
       </div>
       <section className="settings-section">
         <h3>默认模型</h3>
-        <p className="settings-hint">选择新会话默认使用的模型。</p>
-        <select
-          value={settings.model}
-          onChange={(e) => {
-            void window.grok.setModel(e.target.value).then(onChange);
-          }}
-        >
-          {settings.models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.name === m.id ? m.id : `${m.name}（${m.id}）`}
-            </option>
-          ))}
-        </select>
+        {modelSelectionLocked ? (
+          <p className="settings-hint">API 模式下模型由 API 配置固定，无需选择。</p>
+        ) : (
+          <>
+            <p className="settings-hint">选择新会话默认使用的模型。</p>
+            <select
+              value={settings.model}
+              onChange={(e) => {
+                void window.grok.setModel(e.target.value).then(onChange);
+              }}
+            >
+              {settings.models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name === m.id ? m.id : `${m.name}（${m.id}）`}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
       </section>
       <section className="settings-section">
         <h3>推理等级</h3>
@@ -187,7 +215,7 @@ function GeneralPane({
               className={`mode-item${settings.reasoningEffort === item.id ? " on" : ""}`}
               onClick={() => {
                 onChange({ ...settings, reasoningEffort: item.id });
-                void window.grok.setReasoningEffort(item.id).then(onChange);
+                void window.grok.setReasoningEffort(item.id, sessionId || undefined).then(onChange);
               }}
             >
               <strong>{item.label}</strong>
@@ -276,6 +304,141 @@ function FeaturesPane({
               }}
             />
           </label>
+        </div>
+      </section>
+    </>
+  );
+}
+
+const PROXY_MODES: Array<{ id: ProxyMode; label: string; hint: string }> = [
+  { id: "system", label: "跟随系统", hint: "使用 Windows 系统代理或代理环境变量" },
+  { id: "direct", label: "直连", hint: "不通过代理连接 Grok 和 API" },
+  { id: "manual", label: "手动代理", hint: "使用指定的 HTTP/HTTPS 代理地址" },
+];
+
+function NetworkPane() {
+  const [draft, setDraft] = useState<ProxySettings>({ mode: "system", url: "" });
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<"save" | "oauth" | "api" | null>(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [testResult, setTestResult] = useState<ProxyTestResult | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    void window.grok
+      .proxySettings()
+      .then((settings) => {
+        if (!disposed) setDraft(settings);
+      })
+      .catch((err) => {
+        if (!disposed) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!disposed) setLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const test = (target: "oauth" | "api") => {
+    setBusy(target);
+    setError("");
+    setNotice("");
+    setTestResult(null);
+    void window.grok
+      .testProxy(draft, target)
+      .then(setTestResult)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setBusy(null));
+  };
+
+  const save = () => {
+    setBusy("save");
+    setError("");
+    setNotice("");
+    void window.grok
+      .setProxySettings(draft)
+      .then((result) => {
+        setDraft(result.settings);
+        setNotice(result.pending ? "已保存，将在当前任务结束后自动应用。" : `已应用：${result.route}`);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setBusy(null));
+  };
+
+  return (
+    <>
+      <div className="settings-page-head">
+        <h1>网络与代理</h1>
+        <p>统一控制 Grok CLI、OAuth 和 API 请求使用的连接方式。</p>
+      </div>
+      <section className="settings-section">
+        <h3>代理模式</h3>
+        <p className="settings-hint">修改后会重新连接 Grok 代理，正在运行的任务不会被中断。</p>
+        {loading ? <p className="settings-hint">正在读取代理配置…</p> : null}
+        <div className="mode-list">
+          {PROXY_MODES.map((mode) => (
+            <button
+              key={mode.id}
+              type="button"
+              className={`mode-item${draft.mode === mode.id ? " on" : ""}`}
+              disabled={loading || Boolean(busy)}
+              onClick={() => {
+                setDraft((current) => ({ ...current, mode: mode.id }));
+                setError("");
+                setNotice("");
+                setTestResult(null);
+              }}
+            >
+              <strong>{mode.label}</strong>
+              <span>{mode.hint}</span>
+            </button>
+          ))}
+        </div>
+        {draft.mode === "manual" ? (
+          <label className="field proxy-url-field">
+            代理地址
+            <input
+              type="url"
+              value={draft.url}
+              placeholder="http://127.0.0.1:7897"
+              disabled={Boolean(busy)}
+              onChange={(event) => {
+                setDraft((current) => ({ ...current, url: event.target.value }));
+                setError("");
+                setNotice("");
+                setTestResult(null);
+              }}
+            />
+            <small>第一版支持 HTTP/HTTPS 代理，不支持用户名和密码。</small>
+          </label>
+        ) : null}
+        {error ? <p className="settings-error">{error}</p> : null}
+        {notice ? <p className="proxy-notice" role="status">{notice}</p> : null}
+        {testResult ? (
+          <div className={`proxy-test-result${testResult.ok ? " ok" : " error"}`} role="status">
+            <strong>{testResult.target === "oauth" ? "OAuth" : "当前 API"}</strong>
+            <span>{testResult.message}</span>
+            <small>{testResult.route}{testResult.durationMs ? ` · ${testResult.durationMs} ms` : ""}</small>
+          </div>
+        ) : null}
+        <div className="settings-actions proxy-actions">
+          <button className="btn" type="button" disabled={Boolean(busy) || loading} onClick={() => test("oauth")}>
+            {busy === "oauth" ? "测试中…" : "测试 OAuth"}
+          </button>
+          <button className="btn" type="button" disabled={Boolean(busy) || loading} onClick={() => test("api")}>
+            {busy === "api" ? "测试中…" : "测试当前 API"}
+          </button>
+          <button
+            className="btn primary"
+            type="button"
+            disabled={Boolean(busy) || loading || (draft.mode === "manual" && !draft.url.trim())}
+            onClick={save}
+          >
+            {busy === "save" ? "应用中…" : "保存并重新连接"}
+          </button>
         </div>
       </section>
     </>

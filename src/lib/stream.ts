@@ -1,4 +1,9 @@
-import { applyUpdateToItems, isSpawnSubagentUpdate, type StreamItem } from "../../electron/shared";
+import {
+  applyUpdateToItems,
+  isSpawnSubagentUpdate,
+  type FileLineStats,
+  type StreamItem,
+} from "../../electron/shared";
 
 export type PlanEntryStatus =
   | "pending"
@@ -44,7 +49,9 @@ function cloneItems(items: StreamItem[]): StreamItem[] {
   return items.map((item) => {
     if (item.kind === "tool" || item.kind === "subagent") return { ...item };
     if (item.kind === "plan") return { ...item, entries: [...item.entries] };
-    if (item.kind === "changes") return { ...item, files: [...item.files] };
+    if (item.kind === "changes") {
+      return { ...item, files: [...item.files], stats: item.stats ? { ...item.stats } : undefined };
+    }
     if (item.kind === "user" || item.kind === "agent" || item.kind === "thought" || item.kind === "status") {
       return { ...item };
     }
@@ -52,22 +59,35 @@ function cloneItems(items: StreamItem[]): StreamItem[] {
   });
 }
 
-export function appendTurnChanges(items: StreamItem[], files: string[]): StreamItem[] {
+export function appendTurnChanges(
+  items: StreamItem[],
+  files: string[],
+  stats?: Record<string, FileLineStats>,
+): StreamItem[] {
   const normalized = [...new Set(files.map((file) => file.replace(/\\/g, "/").trim()).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b));
   if (!normalized.length) return items;
+  const normalizedStats = Object.fromEntries(
+    Object.entries(stats ?? {}).map(([filePath, value]) => [filePath.replace(/\\/g, "/"), value]),
+  );
   const next = items.slice();
   const turnStart = lastUserIndex(next);
   for (let i = next.length - 1; i > turnStart; i -= 1) {
     if (next[i]?.kind !== "changes") continue;
     const existing = next[i] as Extract<StreamItem, { kind: "changes" }>;
+    const mergedStats = { ...(existing.stats ?? {}), ...normalizedStats };
     next[i] = {
       kind: "changes",
       files: [...new Set([...existing.files, ...normalized])].sort((a, b) => a.localeCompare(b)),
+      ...(Object.keys(mergedStats).length ? { stats: mergedStats } : {}),
     };
     return next;
   }
-  next.push({ kind: "changes", files: normalized });
+  next.push({
+    kind: "changes",
+    files: normalized,
+    ...(Object.keys(normalizedStats).length ? { stats: normalizedStats } : {}),
+  });
   return next;
 }
 

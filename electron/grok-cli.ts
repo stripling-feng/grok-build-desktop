@@ -12,6 +12,7 @@ import {
   removeManagedMarketplaceFiles,
 } from "./marketplace-mirror";
 import { grokHome } from "./sessions";
+import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
 import type {
   AvailablePluginInfo,
   HookInfo,
@@ -64,11 +65,13 @@ async function run(
 ): Promise<string> {
   const grok = bin();
   try {
+    const env = await proxyEnvironmentForTarget(currentGrokTarget());
     const { stdout, stderr } = await execFileAsync(grok, args, {
       cwd: opts?.cwd || undefined,
       windowsHide: true,
       timeout: opts?.timeout ?? 20_000,
       maxBuffer: 8 * 1024 * 1024,
+      env,
     });
     const out = `${stdout ?? ""}`;
     const err = `${stderr ?? ""}`.trim();

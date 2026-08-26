@@ -3,21 +3,30 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { net } from "electron";
-import { configPath, getDefaultModelDisplayName, setTableKey } from "./config";
+import {
+  API_KEY_SCOPE,
+  buildApiProviderConfig,
+  buildClearedAccountConfig,
+  buildOAuthConfig,
+  buildRepairedApiConfig,
+  detachSubagentModelOverrides,
+  normalizeApiBaseUrl,
+  preferredAuthMethod,
+  readApiProviderConfig,
+  removeLegacyApiKeyAuthEntry,
+  restoreSubagentModelOverrides,
+  type ApiProviderConfigInput,
+  type SavedApiProviderConfig,
+} from "./account-config";
+import { configPath, getDefaultModelDisplayName } from "./config";
+import { resolveAccountUsagePercent } from "./account-usage";
 import { grokBin } from "./grok-bin";
 import { grokHome } from "./sessions";
 import type { AccountInfo, AccountUsage } from "./shared";
 
 const OAUTH_SCOPE = "https://accounts.x.ai/sign-in";
-const API_KEY_SCOPE = "xai::api_key";
 const CC_SWITCH_DB = path.join(os.homedir(), ".cc-switch", "cc-switch.db");
-
-const KNOWN_OAUTH_HOSTS = [
-  "accounts.x.ai",
-  "x.ai",
-  "auth.x.ai",
-  "console.x.ai",
-];
+const API_SUBAGENT_MODELS_BACKUP = path.join(grokHome(), "desktop-api-subagent-models.toml");
 
 function isPlaceholderKey(key: string): boolean {
   return !key || /^(PROXY_MANAGED|YOUR_.*|changeme)$/i.test(key);
@@ -245,16 +254,64 @@ function parseAuthFile(): {
   return { method: "none" };
 }
 
-function hasConfigApiKey(): boolean {
-  if (process.env.XAI_API_KEY?.trim()) return true;
-  const file = path.join(grokHome(), "config.toml");
-  if (!fs.existsSync(file)) return false;
+function readConfigText(): string {
+  const file = configPath();
+  if (!fs.existsSync(file)) return "";
   try {
-    const text = fs.readFileSync(file, "utf8");
-    return /^\s*api_key\s*=\s*".+"/m.test(text);
+    return fs.readFileSync(file, "utf8");
   } catch {
-    return false;
+    return "";
   }
+}
+
+function writeConfigText(text: string) {
+  const file = configPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, "utf8");
+}
+
+function suspendSubagentModelOverrides(text: string): string {
+  const detached = detachSubagentModelOverrides(text);
+  if (detached.table && !fs.existsSync(API_SUBAGENT_MODELS_BACKUP)) {
+    fs.mkdirSync(path.dirname(API_SUBAGENT_MODELS_BACKUP), { recursive: true });
+    fs.writeFileSync(API_SUBAGENT_MODELS_BACKUP, detached.table, "utf8");
+  }
+  return detached.config;
+}
+
+function restoreSavedSubagentModelOverrides(text: string): string {
+  if (!fs.existsSync(API_SUBAGENT_MODELS_BACKUP)) return text;
+  try {
+    return restoreSubagentModelOverrides(
+      text,
+      fs.readFileSync(API_SUBAGENT_MODELS_BACKUP, "utf8"),
+    );
+  } catch {
+    return text;
+  }
+}
+
+function removeSubagentModelBackup() {
+  try {
+    fs.unlinkSync(API_SUBAGENT_MODELS_BACKUP);
+  } catch {
+    /* no saved OAuth overrides */
+  }
+}
+
+function hasConfigApiKey(text = readConfigText()): boolean {
+  if (process.env.XAI_API_KEY?.trim()) return true;
+  return Boolean(readApiProviderConfig(text));
+}
+
+function oauthAccount(): AccountInfo | null {
+  const parsed = parseAuthFile();
+  if (parsed.method !== "oauth") return null;
+  return {
+    method: "oauth",
+    name: parsed.name || parsed.email || "已登录",
+    email: parsed.email,
+  };
 }
 
 function proxyBase(): string {
@@ -302,82 +359,121 @@ function formatDate(value?: string): string | undefined {
 }
 
 export function loadAccount(): AccountInfo {
-  const parsed = parseAuthFile();
-  if (parsed.method === "oauth") {
-    return {
-      method: "oauth",
-      name: parsed.name || parsed.email || "已登录",
-      email: parsed.email,
-    };
+  const config = readConfigText();
+  if (preferredAuthMethod(config) === "api_key" && hasConfigApiKey(config)) {
+    return { method: "api-key", name: getDefaultModelDisplayName(config) };
   }
-  if (parsed.method === "api-key" || hasConfigApiKey()) {
-    return { method: "api-key", name: getDefaultModelDisplayName() };
+  const oauth = oauthAccount();
+  if (oauth) return oauth;
+  const parsed = parseAuthFile();
+  if (parsed.method === "api-key" || hasConfigApiKey(config)) {
+    return { method: "api-key", name: getDefaultModelDisplayName(config) };
   }
   return { method: "none", name: "未登录" };
 }
 
-const CUSTOM_MODEL_ID = "desktop-api";
+export type ApiProviderInput = ApiProviderConfigInput;
 
-export type ApiProviderInput = {
-  baseUrl: string;
-  apiKey: string;
-  model?: string;
-};
+export function loadApiProvider(): SavedApiProviderConfig | null {
+  return readApiProviderConfig(readConfigText());
+}
 
-function normalizeBaseUrl(raw: string) {
-  const url = raw.trim().replace(/\/+$/, "");
-  if (!/^https?:\/\//i.test(url)) throw new Error("请填写有效的 Base URL，例如 https://api.x.ai/v1");
-  return url;
+export async function validateApiProvider(input: ApiProviderInput): Promise<void> {
+  const baseUrl = normalizeApiBaseUrl(input.baseUrl);
+  const apiKey = input.apiKey.trim();
+  const model = (input.model || "grok-4.6").trim() || "grok-4.6";
+  if (!apiKey) throw new Error("请输入 API Key");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await net.fetch(`${baseUrl}/models`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("API Key 无效或没有访问权限，请检查后重试");
+    }
+    if (!response.ok) {
+      throw new Error(`Base URL 校验失败（HTTP ${response.status}），请确认它是完整的 OpenAI 兼容地址`);
+    }
+
+    try {
+      const payload = asRecord(await response.json());
+      const rows = Array.isArray(payload?.data) ? payload.data : [];
+      const ids = rows
+        .map((row) => asRecord(row))
+        .map((row) => str(row?.id))
+        .filter((id): id is string => Boolean(id));
+      if (ids.length > 0 && !ids.includes(model)) {
+        throw new Error(`接口中没有找到模型 ${model}，请填写供应商支持的模型名称`);
+      }
+    } catch (err) {
+      if (err instanceof Error && /接口中没有找到模型/.test(err.message)) throw err;
+      // Some compatible gateways return a non-standard model-list body. A
+      // successful authenticated response is still enough to accept it.
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/API Key 无效|Base URL 校验失败|接口中没有找到模型/.test(message)) throw err;
+    if (/abort/i.test(message)) throw new Error("连接 Base URL 超时，请检查地址、网络或代理");
+    throw new Error("无法连接 Base URL，请检查地址、网络或代理");
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function writeApiProvider(input: ApiProviderInput) {
-  const baseUrl = normalizeBaseUrl(input.baseUrl);
-  const apiKey = input.apiKey.trim();
-  const model = (input.model || "grok-4.6").trim() || "grok-4.6";
-  const file = configPath();
-  const prev = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  let next = prev;
-  next = setTableKey(next, "models", "default", JSON.stringify(CUSTOM_MODEL_ID));
-  next = setTableKey(next, "endpoints", "xai_api_base_url", JSON.stringify(baseUrl));
-  next = setTableKey(next, "endpoints", "models_base_url", JSON.stringify(baseUrl));
-  next = setTableKey(next, `model.${CUSTOM_MODEL_ID}`, "model", JSON.stringify(model));
-  next = setTableKey(next, `model.${CUSTOM_MODEL_ID}`, "base_url", JSON.stringify(baseUrl));
-  next = setTableKey(next, `model.${CUSTOM_MODEL_ID}`, "name", JSON.stringify("API"));
-  next = setTableKey(next, `model.${CUSTOM_MODEL_ID}`, "api_key", JSON.stringify(apiKey));
-  next = setTableKey(next, `model.${CUSTOM_MODEL_ID}`, "api_backend", JSON.stringify("chat_completions"));
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, next.endsWith("\n") ? next : `${next}\n`, "utf8");
+  const config = suspendSubagentModelOverrides(readConfigText());
+  writeConfigText(buildApiProviderConfig(config, input));
 }
 
-function writeAuthApiKey(key: string) {
+function repairLegacyApiKeyAuthFile() {
   const file = path.join(grokHome(), "auth.json");
-  const prev = readJson(file) ?? {};
-  prev[API_KEY_SCOPE] = { key };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(prev, null, 2)}\n`, "utf8");
+  const prev = readJson(file);
+  if (!prev) return;
+  const repaired = removeLegacyApiKeyAuthEntry(prev);
+  if (!repaired.changed) return;
+  fs.writeFileSync(file, `${JSON.stringify(repaired.auth, null, 2)}\n`, "utf8");
+}
+
+export function repairAccountCredentials() {
+  const config = readConfigText();
+  const repairedConfig = buildRepairedApiConfig(
+    preferredAuthMethod(config) === "api_key" ? suspendSubagentModelOverrides(config) : config,
+  );
+  if (repairedConfig !== config) writeConfigText(repairedConfig);
+  repairLegacyApiKeyAuthFile();
 }
 
 export function saveApiKey(input: ApiProviderInput): AccountInfo {
   const key = input.apiKey.trim();
   if (!key) throw new Error("请输入 API Key");
   writeApiProvider(input);
-  writeAuthApiKey(key);
+  // Custom models own their key in config.toml. Older desktop builds also
+  // wrote an incomplete xai::api_key auth entry, which makes Grok CLI 1.0.5
+  // reject the entire auth.json file because auth_mode is missing.
+  repairLegacyApiKeyAuthFile();
+  return loadAccount();
+}
+
+function selectOAuthAccount(): AccountInfo {
+  writeConfigText(buildOAuthConfig(restoreSavedSubagentModelOverrides(readConfigText())));
+  removeSubagentModelBackup();
+  repairLegacyApiKeyAuthFile();
   return loadAccount();
 }
 
 export function clearAccountCredentials(): AccountInfo {
   const file = configPath();
   if (fs.existsSync(file)) {
-    let text = fs.readFileSync(file, "utf8");
-    text = setTableKey(text, "models", "default", JSON.stringify(""));
-    text = setTableKey(text, "endpoints", "xai_api_base_url", JSON.stringify(""));
-    text = setTableKey(text, "endpoints", "models_base_url", JSON.stringify(""));
-    text = setTableKey(text, `model.${CUSTOM_MODEL_ID}`, "model", JSON.stringify(""));
-    text = setTableKey(text, `model.${CUSTOM_MODEL_ID}`, "base_url", JSON.stringify(""));
-    text = setTableKey(text, `model.${CUSTOM_MODEL_ID}`, "name", JSON.stringify(""));
-    text = setTableKey(text, `model.${CUSTOM_MODEL_ID}`, "api_key", JSON.stringify(""));
-    text = setTableKey(text, `model.${CUSTOM_MODEL_ID}`, "api_backend", JSON.stringify(""));
-    fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, "utf8");
+    const restored = restoreSavedSubagentModelOverrides(fs.readFileSync(file, "utf8"));
+    writeConfigText(buildClearedAccountConfig(restored));
+    removeSubagentModelBackup();
   }
   const authFile = path.join(grokHome(), "auth.json");
   if (fs.existsSync(authFile)) {
@@ -411,25 +507,8 @@ export type AccountLoginResult = {
   url?: string;
 };
 
-function extractHttpUrls(text: string): string[] {
-  const clean = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
-  return (clean.match(/https?:\/\/[^\s)>\]]+/g) ?? [])
-    .map((url) => url.replace(/[.,;]+$/, ""))
-    .filter((url) => /^https?:\/\//i.test(url) && !/^https?:\/\/127\.0\.0\.1/i.test(url));
-}
-
-function isOAuthUrl(url: string): boolean {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    if (host === "127.0.0.1" || host === "localhost") return false;
-    return KNOWN_OAUTH_HOSTS.some((known) => host === known || host.endsWith(`.${known}`));
-  } catch {
-    return false;
-  }
-}
-
-function spawnLoginWindow(bin: string, urlFile: string) {
-  const env = { ...process.env, GROK_TEST_OPEN_URL_FILE: urlFile };
+function spawnLoginWindow(bin: string, baseEnv?: NodeJS.ProcessEnv) {
+  const env = { ...(baseEnv ?? process.env) };
   const args = ["login", "--oauth"];
   if (process.platform === "win32") {
     try {
@@ -466,8 +545,7 @@ function looksLikeNetworkFailure(stderr: string): boolean {
 }
 
 export function startAccountLogin(
-  openUrl: (url: string) => void,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {},
 ): Promise<AccountLoginResult> {
   const bin = grokBin();
   if (!bin) {
@@ -479,15 +557,15 @@ export function startAccountLogin(
   }
 
   return new Promise((resolve) => {
-    const urlFile = path.join(os.tmpdir(), `grok-oauth-${Date.now()}.txt`);
     let settled = false;
-    let opened = "";
     let childError: string | null = null;
     let childExit = false;
     let stderrBuf = "";
     let stdoutBuf = "";
     let exitTimer: ReturnType<typeof setTimeout> | null = null;
-    const child = spawnLoginWindow(bin, urlFile);
+    // Grok CLI owns opening the OAuth page. Reopening URLs echoed by the CLI
+    // here causes two browser windows for a single login attempt.
+    const child = spawnLoginWindow(bin, options.env);
     child.unref();
 
     if (child.stdout) {
@@ -495,9 +573,6 @@ export function startAccountLogin(
       child.stdout.on("data", (chunk: string) => {
         stdoutBuf += chunk;
         if (stdoutBuf.length > 8192) stdoutBuf = stdoutBuf.slice(-8192);
-        for (const url of extractHttpUrls(stdoutBuf)) {
-          if (isOAuthUrl(url)) openOnce(url);
-        }
       });
     }
     if (child.stderr) {
@@ -505,11 +580,6 @@ export function startAccountLogin(
       child.stderr.on("data", (chunk: string) => {
         stderrBuf += chunk;
         if (stderrBuf.length > 8192) stderrBuf = stderrBuf.slice(-8192);
-        // Grok CLI 1.0.5 writes the human-facing login prompt (including the
-        // authorization URL) to stderr, not stdout.
-        for (const url of extractHttpUrls(stderrBuf)) {
-          if (isOAuthUrl(url)) openOnce(url);
-        }
       });
     }
 
@@ -525,30 +595,7 @@ export function startAccountLogin(
       } catch {
         /* ignore */
       }
-      try {
-        fs.unlinkSync(urlFile);
-      } catch {
-        /* ignore */
-      }
       resolve(result);
-    };
-
-    const openOnce = (url: string) => {
-      if (!url || url === opened || !/^https?:\/\//i.test(url)) return;
-      opened = url;
-      openUrl(url);
-    };
-
-    const readUrlFile = () => {
-      try {
-        if (!fs.existsSync(urlFile)) return;
-        const text = fs.readFileSync(urlFile, "utf8");
-        for (const url of extractHttpUrls(text)) {
-          if (isOAuthUrl(url) || !opened) openOnce(url);
-        }
-      } catch {
-        /* ignore */
-      }
     };
 
     child.on("error", (err) => {
@@ -567,46 +614,46 @@ export function startAccountLogin(
       // inspect it. Every other exit is terminal; waiting for the global
       // timeout here leaves the login modal looking stuck after a CLI error.
       exitTimer = setTimeout(() => {
-        const account = loadAccount();
-        if (account.method === "oauth") {
-          finish({ ok: true, account, url: opened || undefined });
+        const oauth = oauthAccount();
+        if (oauth) {
+          const account = selectOAuthAccount();
+          finish({ ok: true, account });
           return;
         }
+        const account = loadAccount();
         const network = looksLikeNetworkFailure(stderrBuf + " " + stdoutBuf);
         finish({
           ok: false,
           account,
-          url: opened || undefined,
           message: network
             ? `Grok CLI 退出（${code ?? signal ?? "未知"}），无法连接 auth.x.ai（请检查网络/代理/VPN 是否放行 *.x.ai），或改用 API 登录。`
             : childError
               ? `Grok CLI 启动失败：${childError}`
-              : opened
-                ? `Grok CLI 已退出（${code ?? signal ?? "未知"}），但授权没有完成。请重试或改用 API 登录。`
-                : `Grok CLI 已退出（${code ?? signal ?? "未知"}），未弹出授权页。请确认网络和 Grok CLI 后重试，或改用 API 登录。`,
+              : `Grok CLI 已退出（${code ?? signal ?? "未知"}），但授权没有完成。请确认网络和 Grok CLI 后重试，或改用 API 登录。`,
         });
       }, 250);
     });
 
     const poller = setInterval(() => {
-      readUrlFile();
-      const account = loadAccount();
-      if (account.method === "oauth") {
-        finish({ ok: true, account, url: opened || undefined });
+      const oauth = oauthAccount();
+      if (oauth) {
+        const account = selectOAuthAccount();
+        finish({ ok: true, account });
       }
     }, 400);
 
     const timeout = setTimeout(() => {
-      const account = loadAccount();
-      if (account.method === "oauth") {
-        finish({ ok: true, account, url: opened || undefined });
+      const oauth = oauthAccount();
+      if (oauth) {
+        const account = selectOAuthAccount();
+        finish({ ok: true, account });
         return;
       }
+      const account = loadAccount();
       const network = looksLikeNetworkFailure(stderrBuf + " " + stdoutBuf);
       finish({
         ok: false,
         account,
-        url: opened || undefined,
         message: childExit
           ? network
             ? "Grok CLI 已退出且无法连接 auth.x.ai。请检查网络/代理后重试，或改用 API 登录。"
@@ -619,7 +666,6 @@ export function startAccountLogin(
       finish({
         ok: false,
         account: loadAccount(),
-        url: opened || undefined,
         message: "登录已取消",
       });
     };
@@ -636,11 +682,18 @@ function usageFromPayload(payload: Record<string, unknown>): AccountUsage {
   // Grok CLI 1.0.5 wraps billing fields in `config`; older responses expose
   // the same fields at the top level.
   const config = asRecord(payload.config) || payload;
-  const current = asRecord(config.currentPeriod) || config;
-  const percent = pickNumber(
+  const currentPeriod = asRecord(config.currentPeriod);
+  const current = currentPeriod || config;
+  const productUsage = Array.isArray(config.productUsage)
+    ? config.productUsage
+        .map(asRecord)
+        .find((entry) => /GROK_BUILD/i.test(pickString(entry?.product) ?? ""))
+    : null;
+  const reportedPercent = pickNumber(
     current.creditUsagePercent,
     config.creditUsagePercent,
     payload.creditUsagePercent,
+    productUsage?.usagePercent,
     current.usagePercent,
     config.usagePercent,
   );
@@ -663,6 +716,16 @@ function usageFromPayload(payload: Record<string, unknown>): AccountUsage {
   const prepaid = pickNumber(current.prepaidBalance, config.prepaidBalance, payload.prepaidBalance);
   const onDemandUsed = pickNumber(current.onDemandUsed, config.onDemandUsed, payload.onDemandUsed);
   const onDemandCap = pickNumber(current.onDemandCap, config.onDemandCap, payload.onDemandCap);
+  // The credits endpoint omits zero-valued usage percentages. A valid current
+  // period without a percentage therefore means 0% used, not "unknown". Keep
+  // prepaid balance as secondary information instead of promoting it to the
+  // OAuth usage summary.
+  const percent = resolveAccountUsagePercent({
+    reportedPercent,
+    hasCurrentPeriod: Boolean(currentPeriod),
+    onDemandUsed,
+    onDemandCap,
+  });
   const tier = pickString(
     current.subscriptionTier,
     config.subscriptionTier,

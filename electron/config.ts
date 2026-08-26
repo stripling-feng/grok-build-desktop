@@ -9,6 +9,7 @@ import { findGitRoot } from "./git";
 import { grokBin as resolveGrokBin } from "./grok-bin";
 import { inspectGrok, isProjectTrusted, listMarketplaces } from "./grok-cli";
 import { modelsFromCachePayload, type ModelCatalogEntry } from "./model-catalog";
+import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
 
 const execFileAsync = promisify(execFile);
 
@@ -298,9 +299,11 @@ async function modelsFromCli(): Promise<string[]> {
   const bin = grokBin();
   if (!bin) return [];
   try {
+    const env = await proxyEnvironmentForTarget(currentGrokTarget());
     const { stdout } = await execFileAsync(bin, ["models"], {
       windowsHide: true,
       timeout: 12_000,
+      env,
     });
     return stdout
       .split(/\r?\n/)

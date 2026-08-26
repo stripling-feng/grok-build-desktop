@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { StreamItem } from "../../electron/shared";
+import type { FileLineStats, GitStatus, StreamItem } from "../../electron/shared";
 import grokLogo from "../assets/grok-logo.jpg";
 import { Markdown } from "../lib/markdown";
 import { toolStatusLabel } from "../lib/i18n";
@@ -231,33 +231,70 @@ function PlanConsoleStatus({ planConsole }: { planConsole: PlanConsole }) {
 
 function TurnChangesCard({
   files,
+  stats,
+  git,
   onOpenFile,
 }: {
   files: string[];
+  stats?: Record<string, FileLineStats>;
+  git: GitStatus;
   onOpenFile?: (path: string) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const initiallyVisible = 3;
+  const visibleFiles = expanded ? files : files.slice(0, initiallyVisible);
+  const remaining = Math.max(0, files.length - initiallyVisible);
+  const currentStats = new Map(
+    git.files.map((file) => [file.path.replace(/\\/g, "/"), { added: file.added, removed: file.removed }]),
+  );
+
   return (
-    <section className="turn-changes" aria-label={`本次修改 ${files.length} 个文件`}>
+    <section className="turn-changes" aria-label={`已编辑 ${files.length} 个文件`}>
       <div className="turn-changes-head">
-        <span>本次修改</span>
-        <span>{files.length} 个文件</span>
+        <span className="turn-changes-icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 18 18">
+            <rect x="2.5" y="2.5" width="13" height="13" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.4" />
+            <path d="M6.2 9h5.6M9 6.2v5.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+          </svg>
+        </span>
+        <strong>已编辑 {files.length} 个文件</strong>
       </div>
       <div className="turn-changes-list">
-        {files.map((filePath) => (
+        {visibleFiles.map((filePath) => {
+          const normalizedPath = filePath.replace(/\\/g, "/");
+          const lineStats = stats?.[normalizedPath] ?? currentStats.get(normalizedPath);
+          return (
+            <button
+              key={filePath}
+              className="turn-changes-file"
+              type="button"
+              title={filePath}
+              disabled={!onOpenFile}
+              onClick={() => onOpenFile?.(filePath)}
+            >
+              <span className="turn-changes-path">{filePath}</span>
+              {lineStats ? (
+                <span className="turn-changes-stats" aria-label={`新增 ${lineStats.added} 行，删除 ${lineStats.removed} 行`}>
+                  <span className="add">+{lineStats.added}</span>
+                  <span className="del">-{lineStats.removed}</span>
+                </span>
+              ) : null}
+            </button>
+          );
+        })}
+        {remaining > 0 ? (
           <button
-            key={filePath}
+            className="turn-changes-more"
             type="button"
-            title={filePath}
-            disabled={!onOpenFile}
-            onClick={() => onOpenFile?.(filePath)}
+            aria-expanded={expanded}
+            onClick={() => setExpanded((value) => !value)}
           >
-            <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-              <path d="M3.5 1.75h5l4 4v8.5h-9z" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-              <path d="M8.5 1.75v4h4" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+            <span>{expanded ? "收起文件" : `再显示 ${remaining} 个文件`}</span>
+            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+              <path d={expanded ? "m3.5 8.5 3.5-3 3.5 3" : "m3.5 5.5 3.5 3 3.5-3"} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            <span>{filePath}</span>
           </button>
-        ))}
+        ) : null}
       </div>
     </section>
   );
@@ -268,6 +305,7 @@ function RestItem({
   onOpenFile,
   sessionId,
   cwd,
+  git,
   planConsole,
   onOpenPlan,
   planNumber,
@@ -276,6 +314,7 @@ function RestItem({
   onOpenFile?: (path: string) => void;
   sessionId?: string;
   cwd?: string;
+  git?: GitStatus | null;
   planConsole?: PlanConsole;
   onOpenPlan?: (plan: PlanRevision) => void;
   planNumber?: number;
@@ -303,7 +342,8 @@ function RestItem({
     );
   }
   if (item.kind === "changes") {
-    return <TurnChangesCard files={item.files} onOpenFile={onOpenFile} />;
+    if (!git?.isRepo) return null;
+    return <TurnChangesCard files={item.files} stats={item.stats} git={git} onOpenFile={onOpenFile} />;
   }
   if (item.kind === "tool") {
     return <ToolCard item={item} onOpenFile={onOpenFile} />;
@@ -351,6 +391,7 @@ export function MessageStream({
   onOpenAttachment,
   sessionId,
   cwd,
+  git,
   planConsole,
   onOpenPlan,
 }: {
@@ -364,6 +405,7 @@ export function MessageStream({
   onOpenAttachment?: (path: string) => void;
   sessionId?: string;
   cwd?: string;
+  git?: GitStatus | null;
   planConsole?: PlanConsole;
   onOpenPlan?: (plan: PlanRevision) => void;
 }) {
@@ -539,6 +581,7 @@ export function MessageStream({
                     onOpenFile={onOpenFile}
                     sessionId={sessionId}
                     cwd={cwd}
+                    git={git}
                     planConsole={
                       item === latestPlanDocument && planConsole?.revision?.markdown
                         ? planConsole

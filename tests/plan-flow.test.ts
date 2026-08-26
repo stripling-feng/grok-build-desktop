@@ -43,10 +43,175 @@ import { TurnCompletionTracker } from "../electron/turn-completion";
 import { latestUpdateTimestamp, resolveThreadUpdatedAt } from "../electron/thread-activity";
 import { modelsFromCachePayload } from "../electron/model-catalog";
 import { SessionReplayGate } from "../electron/session-replay";
+import { resolveReasoningEffortValue } from "../electron/reasoning-effort";
+import { resolveAccountUsagePercent } from "../electron/account-usage";
+import { normalizeProxySettings } from "../electron/proxy-config";
 import { pathsFromClipboardBuffer } from "../electron/clipboard-files";
+import {
+  buildApiProviderConfig,
+  buildOAuthConfig,
+  buildRepairedApiConfig,
+  detachSubagentModelOverrides,
+  hasSelectedApiProvider,
+  normalizeApiBaseUrl,
+  preferredAuthMethod,
+  readApiProviderConfig,
+  removeLegacyApiKeyAuthEntry,
+  restoreSubagentModelOverrides,
+} from "../electron/account-config";
 
 const firstTurn = 100;
 const currentTurn = 200;
+
+test("proxy settings normalize supported modes and reject unsafe manual URLs", () => {
+  assert.deepEqual(normalizeProxySettings({ mode: "system", url: "http://ignored:7890" }), {
+    mode: "system",
+    url: "",
+  });
+  assert.deepEqual(normalizeProxySettings({ mode: "manual", url: "http://127.0.0.1:7897/" }), {
+    mode: "manual",
+    url: "http://127.0.0.1:7897",
+  });
+  assert.throws(
+    () => normalizeProxySettings({ mode: "manual", url: "socks5://127.0.0.1:7897" }),
+    /HTTP\/HTTPS/,
+  );
+  assert.throws(
+    () => normalizeProxySettings({ mode: "manual", url: "http://name:secret@127.0.0.1:7897" }),
+    /用户名和密码/,
+  );
+});
+
+test("an OAuth billing period with omitted zero usage does not promote prepaid balance", () => {
+  assert.equal(
+    resolveAccountUsagePercent({
+      hasCurrentPeriod: true,
+      onDemandUsed: 0,
+      onDemandCap: 0,
+    }),
+    0,
+  );
+  assert.equal(
+    resolveAccountUsagePercent({
+      reportedPercent: 36,
+      hasCurrentPeriod: true,
+      onDemandUsed: 0,
+      onDemandCap: 0,
+    }),
+    36,
+  );
+});
+
+test("a bare API origin is normalized to its OpenAI-compatible v1 path", () => {
+  assert.equal(normalizeApiBaseUrl("https://api.example.com/"), "https://api.example.com/v1");
+  assert.equal(normalizeApiBaseUrl("http://localhost:11434/v1/"), "http://localhost:11434/v1");
+  assert.throws(() => normalizeApiBaseUrl("not-a-url"), /有效的 Base URL/);
+});
+
+test("API login selects the custom model without corrupting OAuth credentials", () => {
+  const config = buildApiProviderConfig(
+    '[models]\ndefault = "grok-4.6"\n\n[endpoints]\nmodels_base_url = "https://old.example/v1"\nxai_api_base_url = "https://old.example/v1"\n',
+    {
+    baseUrl: "https://api.example.com/v1/",
+    apiKey: "secret-test-key",
+    model: "proxy-model",
+    contextWindow: 131_072,
+    },
+  );
+  assert.equal(preferredAuthMethod(config), "api_key");
+  assert.equal(hasSelectedApiProvider(config), true);
+  assert.match(config, /default = "desktop-api"/);
+  assert.match(config, /base_url = "https:\/\/api\.example\.com\/v1"/);
+  assert.match(config, /model = "proxy-model"/);
+  assert.match(config, /context_window = 131072/);
+  assert.match(config, /supports_reasoning_effort = true/);
+  assert.match(config, /reasoning_efforts = \["low","medium","high","xhigh"\]/);
+  assert.doesNotMatch(config, /models_base_url|xai_api_base_url/);
+
+  const oauth = { key: "oauth-token", auth_mode: "oidc" };
+  const repaired = removeLegacyApiKeyAuthEntry({
+    "https://auth.x.ai::user": oauth,
+    "xai::api_key": { key: "legacy-key" },
+  });
+  assert.equal(repaired.changed, true);
+  assert.deepEqual(repaired.auth, { "https://auth.x.ai::user": oauth });
+});
+
+test("saved API provider configuration can be loaded back into the login form", () => {
+  const config = buildApiProviderConfig("", {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+    model: "proxy-model",
+    contextWindow: 131_072,
+  });
+  assert.deepEqual(readApiProviderConfig(config), {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+    model: "proxy-model",
+    contextWindow: 131_072,
+  });
+  assert.equal(readApiProviderConfig(""), null);
+});
+
+test("API mode suspends OAuth subagent model overrides and restores them later", () => {
+  const original = '[models]\ndefault = "grok-4.6"\n\n[subagents.models]\ngeneral-purpose = "grok-4.6"\nexplore = "grok-4.5"\n';
+  const detached = detachSubagentModelOverrides(original);
+  assert.doesNotMatch(detached.config, /\[subagents\.models\]/);
+  assert.match(detached.table || "", /general-purpose = "grok-4\.6"/);
+
+  const api = buildApiProviderConfig(detached.config, {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+  });
+  assert.doesNotMatch(api, /\[subagents\.models\]/);
+
+  const restored = restoreSubagentModelOverrides(buildOAuthConfig(api), detached.table);
+  assert.match(restored, /\[subagents\.models\]/);
+  assert.match(restored, /explore = "grok-4\.5"/);
+});
+
+test("API context window must be a positive integer", () => {
+  assert.throws(
+    () => buildApiProviderConfig("", {
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "secret-test-key",
+      contextWindow: 0,
+    }),
+    /上下文长度/,
+  );
+});
+
+test("legacy API config is migrated and OAuth switching restores a built-in model", () => {
+  const legacy = buildApiProviderConfig("", {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+  }).replace(/\[auth\][\s\S]*?\n\n/, "");
+  const migrated = buildRepairedApiConfig(legacy);
+  assert.equal(preferredAuthMethod(migrated), "api_key");
+
+  const oauth = buildOAuthConfig(migrated);
+  assert.equal(preferredAuthMethod(oauth), "oidc");
+  assert.match(oauth, /\[models\]\s+default = "grok-4\.6"/);
+});
+
+test("API credential repair restores the fixed provider after another model was selected", () => {
+  const selectedElsewhere = buildApiProviderConfig("", {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+    model: "proxy-model",
+  }).replace('default = "desktop-api"', 'default = "grok-4.6"');
+
+  const repaired = buildRepairedApiConfig(selectedElsewhere);
+  assert.equal(preferredAuthMethod(repaired), "api_key");
+  assert.equal(hasSelectedApiProvider(repaired), true);
+});
+
+test("API reasoning effort maps to a value advertised by the live ACP session", () => {
+  assert.equal(resolveReasoningEffortValue("low", ["low", "high", "max"]), "low");
+  assert.equal(resolveReasoningEffortValue("xhigh", ["low", "high", "max"]), "max");
+  assert.equal(resolveReasoningEffortValue("medium", ["low", "high"]), "low");
+  assert.equal(resolveReasoningEffortValue("high", ["none"]), null);
+});
 
 test("Windows clipboard file formats are decoded into attachment paths", () => {
   assert.deepEqual(
@@ -269,6 +434,18 @@ test("turn changes are appended once below the current answer", () => {
     files: ["electron/main.ts", "src/App.tsx", "src/index.css"],
   });
   assert.equal(second.filter((item) => item.kind === "changes").length, 1);
+});
+
+test("turn change line counts follow normalized file paths", () => {
+  const items: StreamItem[] = [{ kind: "user", text: "修改界面" }];
+  const next = appendTurnChanges(items, ["src\\App.tsx"], {
+    "src\\App.tsx": { added: 18, removed: 4 },
+  });
+  assert.deepEqual(next.at(-1), {
+    kind: "changes",
+    files: ["src/App.tsx"],
+    stats: { "src/App.tsx": { added: 18, removed: 4 } },
+  });
 });
 
 test("background completion only clears its own session", () => {
