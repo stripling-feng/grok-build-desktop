@@ -6,6 +6,7 @@ import { inferProjectRoot, isScratchPath, isUnattachedThread } from "./projects"
 import { isDesktopWorktree } from "./paths";
 import { planEntriesFromMarkdown } from "./plan-document";
 import { readPersistedThreadActivity, resolveThreadUpdatedAt } from "./thread-activity";
+import { hasPersistedConversation } from "./thread-visibility";
 import {
   isPlaceholderThreadTitle,
   threadTitleForDisplay,
@@ -211,6 +212,7 @@ export function listThreads(cwd?: string): ThreadInfo[] {
       if (!fs.existsSync(summaryPath)) continue;
       const raw = readJson(summaryPath);
       if (!raw) continue;
+      if (!hasPersistedConversation(raw)) continue;
       const info = (raw.info as Record<string, unknown> | undefined) ?? {};
       const sessionCwd = path.resolve((info.cwd as string) || groupCwd);
       const gitRoot = raw.git_root_dir

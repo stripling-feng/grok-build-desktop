@@ -44,6 +44,7 @@ import {
   updateRunningSessionIds,
   updateUnreadSessionIds,
 } from "./lib/session-state";
+import { settingsForAccountMethod } from "./lib/model-options";
 import type {
   AccountInfo,
   AppSettings,
@@ -335,6 +336,7 @@ export function App() {
   const installLogRef = useRef<HTMLDivElement | null>(null);
   const [goal, setGoal] = useState("");
   const [account, setAccount] = useState<AccountInfo | null>(null);
+  const modelSettings = settingsForAccountMethod(settings, account?.method);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     readWidth("grok.sidebarWidth", 252, SIDEBAR_MIN),
   );
@@ -1702,6 +1704,73 @@ export function App() {
   const statusCardVisible =
     page === "chat" && (activePermission || hasGitChanges || activePlanRevisions.length > 0);
 
+  const forkSelectedThreads = (selectedThreads: ThreadInfo[]) => {
+    void (async () => {
+      setError(null);
+      const results = await Promise.allSettled(
+        selectedThreads.map((thread) => window.grok.forkThread(thread.id, thread.cwd)),
+      );
+      const failedCount = results.filter((result) => result.status === "rejected").length;
+      await refresh();
+      if (failedCount > 0) {
+        setError(`已分叉 ${results.length - failedCount} 个会话，${failedCount} 个会话分叉失败。`);
+      }
+    })().catch((err) => {
+      setError(`无法分叉所选会话：${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+
+  const removeSelectedThreads = (selectedThreads: ThreadInfo[]) => {
+    if (!window.confirm(`移除选中的 ${selectedThreads.length} 个会话？此操作无法撤销。`)) {
+      return;
+    }
+    void (async () => {
+      const results = await Promise.all(
+        selectedThreads.map(async (thread) => {
+          try {
+            if (runningIds.has(thread.id)) {
+              await window.grok.cancel(thread.id).catch(() => undefined);
+            }
+            await window.grok.removeThread(thread.id, thread.cwd);
+            clearStoredPlanFlow(thread.id);
+            return { id: thread.id, removed: true } as const;
+          } catch (reason) {
+            return { id: thread.id, removed: false, reason } as const;
+          }
+        }),
+      );
+      const removedIds = new Set(
+        results.filter((result) => result.removed).map((result) => result.id),
+      );
+      const failedCount = results.length - removedIds.size;
+      setUnreadIds((current) => {
+        const next = new Set(current);
+        removedIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      setRunningIds((current) => {
+        const next = new Set(current);
+        removedIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      if (active && removedIds.has(active.sessionId)) {
+        setActive(null);
+        setItems([]);
+        setContextUsed(null);
+        setContextUsage(null);
+        setPlanDocument(null);
+        setPlanPanel(null);
+      }
+      await refresh();
+      if (failedCount > 0) {
+        setError(`已移除 ${removedIds.size} 个会话，${failedCount} 个会话移除失败。`);
+      }
+    })().catch((err) => {
+      setError(`无法移除所选会话：${err instanceof Error ? err.message : String(err)}`);
+      void refresh();
+    });
+  };
+
   return (
     <div
       className={`app${rightSidebarOpen ? " right-sidebar-open" : ""}${
@@ -1860,6 +1929,7 @@ export function App() {
             });
           }}
           onForkThread={(thread) => void forkThread(thread)}
+          onForkThreads={forkSelectedThreads}
           onRemoveThread={(thread) => {
             if (!window.confirm(`移除会话「${thread.title}」？`)) return;
             void window.grok.removeThread(thread.id, thread.cwd).then(async () => {
@@ -1877,6 +1947,7 @@ export function App() {
               await refresh();
             });
           }}
+          onRemoveThreads={removeSelectedThreads}
         />
         <ResizeHandle
           onDragStart={() => {
@@ -1897,6 +1968,7 @@ export function App() {
             <MarketplacePage
               settings={settings}
               cwd={active?.cwd || selectedProjectCwd}
+              sessionId={active?.sessionId}
               onChange={setSettings}
             />
           ) : null}
@@ -2019,7 +2091,7 @@ export function App() {
             goal={goal}
             attachments={attachments}
             queuedFollowUps={activeFollowUps}
-            settings={settings}
+            settings={modelSettings}
             modelSelectionLocked={account?.method === "api-key"}
             contextUsed={contextUsed}
             contextUsage={contextUsage}
@@ -2206,7 +2278,7 @@ export function App() {
       ) : null}
       <Settings
         open={settingsOpen}
-        settings={settings}
+        settings={modelSettings}
         cwd={active?.cwd || selectedProjectCwd}
         sessionId={active?.sessionId}
         modelSelectionLocked={account?.method === "api-key"}

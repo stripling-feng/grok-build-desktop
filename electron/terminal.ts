@@ -1,57 +1,85 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import * as pty from "node-pty";
+
+const DEFAULT_COLS = 80;
+const DEFAULT_ROWS = 24;
+
+function validDimension(value: number | undefined, fallback: number) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(2, Math.floor(value as number));
+}
 
 export class ProjectTerminal extends EventEmitter {
-  private proc: ChildProcessWithoutNullStreams | null = null;
+  private proc: pty.IPty | null = null;
   cwd: string | null = null;
 
-  start(cwd: string) {
+  start(cwd: string, cols?: number, rows?: number) {
     this.kill();
     this.cwd = cwd;
+
     const isWin = process.platform === "win32";
-    const cmd = isWin ? "powershell.exe" : process.env.SHELL || "/bin/bash";
-    const args = isWin ? ["-NoLogo", "-NoExit", "-Command", "-"] : ["-i"];
+    const shell = isWin ? "powershell.exe" : process.env.SHELL || "/bin/bash";
+    const args = isWin ? ["-NoLogo"] : ["-l"];
+
     try {
-      this.proc = spawn(cmd, args, {
+      const proc = pty.spawn(shell, args, {
+        name: "xterm-256color",
+        cols: validDimension(cols, DEFAULT_COLS),
+        rows: validDimension(rows, DEFAULT_ROWS),
         cwd,
-        windowsHide: false,
         env: {
           ...process.env,
-          TERM: "dumb",
-          PS1: "$ ",
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
         },
+        ...(isWin ? { useConpty: true } : {}),
+      });
+      this.proc = proc;
+
+      proc.onData((data) => this.emit("data", data));
+      proc.onExit(({ exitCode }) => {
+        if (this.proc !== proc) return;
+        this.proc = null;
+        this.cwd = null;
+        this.emit("data", `\r\n\x1b[90m[终端已退出 ${exitCode}]\x1b[0m\r\n`);
+        this.emit("exit", exitCode);
       });
     } catch (err) {
-      this.emit(
-        "data",
-        `\n[无法启动终端：${err instanceof Error ? err.message : String(err)}]\n`,
-      );
-      return;
-    }
-    this.proc.on("error", (err) => {
-      this.emit("data", `\n[终端错误：${err.message}]\n`);
-    });
-    this.proc.stdout.setEncoding("utf8");
-    this.proc.stderr.setEncoding("utf8");
-    this.proc.stdout.on("data", (chunk: string) => this.emit("data", chunk));
-    this.proc.stderr.on("data", (chunk: string) => this.emit("data", chunk));
-    this.proc.on("exit", (code) => {
       this.proc = null;
-      this.emit("data", `\n[终端已退出 ${code ?? ""}]\n`);
-      this.emit("exit", code);
-    });
+      this.cwd = null;
+      throw err;
+    }
   }
 
-  write(text: string) {
-    if (!this.proc?.stdin.writable) return false;
-    this.proc.stdin.write(text.endsWith("\n") ? text : text + "\n");
-    return true;
+  write(data: string) {
+    if (!this.proc) return false;
+    try {
+      this.proc.write(data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  resize(cols: number, rows: number) {
+    if (!this.proc) return false;
+    try {
+      this.proc.resize(validDimension(cols, DEFAULT_COLS), validDimension(rows, DEFAULT_ROWS));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   kill() {
-    if (!this.proc) return;
-    this.proc.kill();
+    const proc = this.proc;
     this.proc = null;
     this.cwd = null;
+    if (!proc) return;
+    try {
+      proc.kill();
+    } catch {
+      // The shell may already have exited between the check and kill call.
+    }
   }
 }

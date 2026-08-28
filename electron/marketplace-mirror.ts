@@ -39,6 +39,19 @@ type LocalMarketplaceSource = {
 
 type MarketplaceSource = RemoteMarketplaceSource | LocalMarketplaceSource;
 
+type RemotePluginSource = {
+  cloneSource: string;
+  ref?: string;
+  sha?: string;
+  subdir: string;
+  identity: string;
+};
+
+type ExtractedRepository = {
+  directory: string;
+  paths: PortablePathMap;
+};
+
 export type PreparedMarketplaceMirror = {
   originalSource: string;
   sourceIdentity: string;
@@ -77,6 +90,9 @@ function marketplaceRootFromFile(file: string): string | null {
   const parentName = path.basename(parent).toLowerCase();
   if (parentName === ".grok-plugin" || parentName === ".claude-plugin") {
     return path.dirname(parent);
+  }
+  if (parentName === "plugins" && path.basename(path.dirname(parent)).toLowerCase() === ".agents") {
+    return path.dirname(path.dirname(parent));
   }
   return parent;
 }
@@ -351,17 +367,140 @@ function sourcePath(plugin: Record<string, unknown>): string | null {
   if (typeof plugin.source === "string") return plugin.source;
   const source = asRecord(plugin.source);
   if (!source) return null;
+  const kind = typeof source.source === "string"
+    ? source.source.toLowerCase()
+    : typeof source.type === "string"
+      ? source.type.toLowerCase()
+      : "";
+  // Remote marketplace entries may also carry a `path` (for example
+  // git-subdir). That path belongs to the external repository and must not be
+  // resolved or materialized against the marketplace checkout itself.
+  if (kind && kind !== "local" && kind !== "path" && kind !== "directory") return null;
   if (typeof source.path === "string") return source.path;
   return null;
 }
 
-function setSourcePath(plugin: Record<string, unknown>, value: string) {
-  if (typeof plugin.source === "string") {
-    plugin.source = { type: "local", path: value };
-    return;
-  }
+function remotePluginSource(plugin: Record<string, unknown>): RemotePluginSource | null {
   const source = asRecord(plugin.source);
-  if (source && typeof source.path === "string") source.path = value;
+  if (!source) return null;
+  const kind = typeof source.source === "string"
+    ? source.source.toLowerCase()
+    : typeof source.type === "string"
+      ? source.type.toLowerCase()
+      : "";
+  if (!kind || kind === "local" || kind === "path" || kind === "directory") return null;
+
+  let cloneSource = typeof source.url === "string" ? source.url.trim() : "";
+  if (!cloneSource && kind === "github" && typeof source.repo === "string" && source.repo.trim()) {
+    cloneSource = `https://github.com/${source.repo.trim().replace(/^\/+|\/+$/g, "")}.git`;
+  }
+  if (!cloneSource || !/^(?:https?|ssh|git):\/\//i.test(cloneSource) && !/^git@[^:]+:.+/i.test(cloneSource)) {
+    return null;
+  }
+
+  const ref = typeof source.ref === "string" && source.ref.trim() ? source.ref.trim() : undefined;
+  const sha = typeof source.sha === "string" && source.sha.trim() ? source.sha.trim() : undefined;
+  const subdir = typeof source.path === "string"
+    ? source.path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "")
+    : "";
+  return {
+    cloneSource,
+    ref,
+    sha,
+    subdir,
+    identity: `${cloneSource.toLowerCase()}@${sha || ref || "HEAD"}`,
+  };
+}
+
+function setLocalSourcePath(plugin: Record<string, unknown>, value: string) {
+  plugin.source = { type: "local", path: value };
+}
+
+function ensureGrokPluginManifest(sourceRoot: string, marketplacePlugin: Record<string, unknown>) {
+  const grokManifest = path.join(sourceRoot, ".grok-plugin", "plugin.json");
+  if (fs.existsSync(grokManifest)) return;
+  const codexManifest = path.join(sourceRoot, ".codex-plugin", "plugin.json");
+  if (!fs.existsSync(codexManifest)) return;
+
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = asRecord(JSON.parse(fs.readFileSync(codexManifest, "utf8"))) || {};
+  } catch {
+    parsed = {};
+  }
+  const name = typeof marketplacePlugin.name === "string" && marketplacePlugin.name.trim()
+    ? marketplacePlugin.name.trim()
+    : typeof parsed.name === "string" && parsed.name.trim()
+      ? parsed.name.trim()
+      : path.basename(sourceRoot);
+  parsed.name = name;
+  if (typeof marketplacePlugin.version === "string") parsed.version = marketplacePlugin.version;
+  if (typeof marketplacePlugin.description === "string") parsed.description = marketplacePlugin.description;
+  if (typeof marketplacePlugin.description !== "string" && typeof parsed.description === "string") {
+    marketplacePlugin.description = parsed.description;
+  }
+  if (typeof marketplacePlugin.version !== "string" && typeof parsed.version === "string") {
+    marketplacePlugin.version = parsed.version;
+  }
+  fs.mkdirSync(path.dirname(grokManifest), { recursive: true });
+  fs.writeFileSync(grokManifest, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+}
+
+function flatSkillName(contents: string, fallback: string): string | null {
+  const normalized = contents.replace(/^\uFEFF/, "");
+  const frontmatter = normalized.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!frontmatter) return null;
+  const name = frontmatter[1].match(/^name\s*:\s*["']?([^"'\r\n#]+?)["']?\s*(?:#.*)?$/im)?.[1]?.trim();
+  return name || fallback;
+}
+
+function materializeFlatSkillFiles(sourceRoot: string): number {
+  const skillsRoot = path.join(sourceRoot, "skills");
+  if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) return 0;
+
+  let created = 0;
+  for (const entry of fs.readdirSync(skillsRoot, { withFileTypes: true })) {
+    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".md" || entry.name.toLowerCase() === "skill.md") {
+      continue;
+    }
+    const source = path.join(skillsRoot, entry.name);
+    let contents = "";
+    try {
+      contents = fs.readFileSync(source, "utf8");
+    } catch {
+      continue;
+    }
+    const declaredName = flatSkillName(contents, path.basename(entry.name, path.extname(entry.name)));
+    if (!declaredName) continue;
+
+    const folderName = encodeWindowsSegment(declaredName);
+    let destination = path.join(skillsRoot, folderName, "SKILL.md");
+    if (fs.existsSync(destination)) {
+      try {
+        if (fs.readFileSync(destination, "utf8") === contents) continue;
+      } catch {
+        // A conflicting generated destination gets a stable suffix below.
+      }
+      destination = path.join(skillsRoot, `${folderName}~${shortHash(entry.name)}`, "SKILL.md");
+    }
+    if (fs.existsSync(destination)) continue;
+    linkOrCopy(source, destination);
+    created += 1;
+  }
+  return created;
+}
+
+function normalizeRemoteSourceForGrok(plugin: Record<string, unknown>, source: RemotePluginSource) {
+  const current = asRecord(plugin.source);
+  const kind = typeof current?.source === "string"
+    ? current.source.toLowerCase()
+    : typeof current?.type === "string"
+      ? current.type.toLowerCase()
+      : "";
+  if (kind !== "github" || !current) return;
+  const normalized = { ...current, source: "url", url: source.cloneSource };
+  delete normalized.repo;
+  plugin.source = normalized;
 }
 
 function rewritePluginPaths(value: unknown, originalRoot: string, safeRoot: string, paths: PortablePathMap): unknown {
@@ -401,6 +540,21 @@ const LEGACY_COMPONENT_KEYS = [
 
 function componentDestination(key: string, relativePath: string): string {
   const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+  const componentRoot = ({
+    agents: "agents",
+    commands: "commands",
+    skills: "skills",
+    hooks: "hooks",
+    mcpServers: "mcp-servers",
+    mcp_servers: "mcp-servers",
+    lspServers: "lsp-servers",
+    lsp_servers: "lsp-servers",
+  } as Record<string, string>)[key];
+  if (componentRoot) {
+    return normalized === componentRoot || normalized.startsWith(`${componentRoot}/`)
+      ? normalized
+      : path.posix.join(componentRoot, normalized);
+  }
   if (key === "workflows") return normalized.replace(/^workflows\//, "commands/workflows/");
   if (key === "outputStyles" || key === "output_styles") {
     return normalized.replace(/^(?:output-styles|outputStyles)\//, "commands/output-styles/");
@@ -429,42 +583,134 @@ function linkOrCopy(source: string, destination: string) {
   }
 }
 
+function resolveComponentSource(
+  sourceRoot: string,
+  relativePath: string,
+): { absolute: string; relative: string } | null {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+  if (!normalized || normalized === ".") return { absolute: sourceRoot, relative: "." };
+  if (path.posix.isAbsolute(normalized) || normalized.split("/").some((segment) => segment === "..")) {
+    throw new Error(`插件组件路径越界：${relativePath}`);
+  }
+
+  let current = sourceRoot;
+  const resolvedSegments: string[] = [];
+  for (const segment of normalized.split("/").filter((value) => value && value !== ".")) {
+    const exact = path.join(current, segment);
+    const portable = path.join(current, encodeWindowsSegment(segment));
+    let selected = fs.existsSync(exact) ? segment : fs.existsSync(portable) ? path.basename(portable) : "";
+    if (!selected && segment.includes("\uFFFD") && fs.existsSync(current)) {
+      const pattern = new RegExp(
+        `^${segment
+          .split(/\uFFFD+/u)
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".+")}$`,
+        "iu",
+      );
+      const matches = fs.readdirSync(current).filter((name) => pattern.test(name));
+      if (matches.length === 1) selected = matches[0];
+    }
+    if (!selected) return null;
+    current = path.join(current, selected);
+    resolvedSegments.push(selected);
+  }
+
+  const relative = path.relative(path.resolve(sourceRoot), path.resolve(current));
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`插件组件路径越界：${relativePath}`);
+  return { absolute: current, relative: resolvedSegments.join("/") || "." };
+}
+
+function materializeRootPlugin(
+  outputDir: string,
+  plugin: Record<string, unknown>,
+  sourceRoot: string,
+): string {
+  const rawName = typeof plugin.name === "string" ? plugin.name.trim() : "plugin";
+  const folderName = encodeWindowsSegment(rawName || "plugin");
+  const relativePluginDir = path.posix.join(".grok-build-plugins", folderName);
+  const pluginDir = path.join(outputDir, ...relativePluginDir.split("/"));
+  fs.mkdirSync(pluginDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(sourceRoot, { withFileTypes: true })) {
+    if (entry.name === ".git" || entry.name === ".grok-build-plugins" || entry.name === ".grok-plugin") continue;
+    linkOrCopy(path.join(sourceRoot, entry.name), path.join(pluginDir, entry.name));
+  }
+
+  const manifestCandidates = [
+    path.join(sourceRoot, ".grok-plugin", "plugin.json"),
+    path.join(sourceRoot, ".claude-plugin", "plugin.json"),
+    path.join(sourceRoot, ".codex-plugin", "plugin.json"),
+  ];
+  let pluginManifest: Record<string, unknown> = {};
+  const manifestSource = manifestCandidates.find((candidate) => fs.existsSync(candidate));
+  if (manifestSource) {
+    try {
+      pluginManifest = asRecord(JSON.parse(fs.readFileSync(manifestSource, "utf8"))) || {};
+    } catch {
+      pluginManifest = {};
+    }
+  }
+  pluginManifest.name = rawName || folderName;
+  if (typeof plugin.version === "string") pluginManifest.version = plugin.version;
+  if (typeof plugin.description === "string") pluginManifest.description = plugin.description;
+  const manifestDir = path.join(pluginDir, ".grok-plugin");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  fs.writeFileSync(path.join(manifestDir, "plugin.json"), `${JSON.stringify(pluginManifest, null, 2)}\n`, "utf8");
+  return relativePluginDir;
+}
+
 function materializeLegacyPlugin(
   outputDir: string,
   plugin: Record<string, unknown>,
-  safeSourceRoot: string,
+  sourceRoot: string,
 ): string | null {
-  const selected = LEGACY_COMPONENT_KEYS.flatMap((key) => {
+  const rawName = typeof plugin.name === "string" ? plugin.name.trim() : "plugin";
+  const folderName = encodeWindowsSegment(rawName || "plugin");
+  const selected: { key: string; item: string }[] = LEGACY_COMPONENT_KEYS.flatMap((key) => {
     const value = plugin[key];
     return Array.isArray(value)
       ? value.filter((item): item is string => typeof item === "string").map((item) => ({ key, item }))
       : [];
   });
+  const hasManifest = [".grok-plugin", ".claude-plugin", ".codex-plugin"]
+    .some((directory) => fs.existsSync(path.join(sourceRoot, directory, "plugin.json")));
+  if (!selected.length && !hasManifest && fs.existsSync(path.join(sourceRoot, "SKILL.md"))) {
+    selected.push({ key: "skills", item: "." });
+  }
   if (!selected.length) return null;
 
-  const rawName = typeof plugin.name === "string" ? plugin.name.trim() : "plugin";
-  const folderName = encodeWindowsSegment(rawName || "plugin");
   const relativePluginDir = path.posix.join(".grok-build-plugins", folderName);
   const pluginDir = path.join(outputDir, ...relativePluginDir.split("/"));
-  const sourceRoot = path.join(outputDir, ...safeSourceRoot.split("/"));
   fs.mkdirSync(pluginDir, { recursive: true });
 
-  for (const { key, item } of selected) {
-    const normalizedItem = item.replace(/\\/g, "/").replace(/^\.\//, "");
-    const source = path.resolve(sourceRoot, ...normalizedItem.split("/"));
-    const sourceRelative = path.relative(path.resolve(sourceRoot), source);
-    if (sourceRelative.startsWith("..") || path.isAbsolute(sourceRelative)) {
-      throw new Error(`插件 ${rawName} 的组件路径越界：${item}`);
-    }
-    if (!fs.existsSync(source)) throw new Error(`插件 ${rawName} 缺少组件：${item}`);
+  const missing: string[] = [];
+  let copied = 0;
 
-    const targetRelative = componentDestination(key, normalizedItem);
+  for (const { key, item } of selected) {
+    const resolved = resolveComponentSource(sourceRoot, item);
+    if (!resolved) {
+      missing.push(item);
+      continue;
+    }
+
+    const targetRelative = key === "skills" && resolved.relative === "."
+      ? path.posix.join("skills", folderName)
+      : componentDestination(key, resolved.relative);
     const destination = path.resolve(pluginDir, ...targetRelative.split("/"));
     const destinationRelative = path.relative(path.resolve(pluginDir), destination);
     if (destinationRelative.startsWith("..") || path.isAbsolute(destinationRelative)) {
       throw new Error(`插件 ${rawName} 的目标路径越界：${targetRelative}`);
     }
-    linkOrCopy(source, destination);
+    linkOrCopy(resolved.absolute, destination);
+    copied += 1;
+  }
+
+  if (!copied) throw new Error(`插件 ${rawName} 的声明组件均不存在${missing[0] ? `：${missing[0]}` : ""}`);
+  if (missing.length) {
+    const note = `Grok 兼容镜像已跳过上游清单中 ${missing.length} 个不存在的组件。`;
+    plugin.description = typeof plugin.description === "string" && plugin.description.trim()
+      ? `${plugin.description.trim()} ${note}`
+      : note;
   }
 
   const pluginManifest: Record<string, unknown> = { name: rawName || folderName };
@@ -479,14 +725,86 @@ function materializeLegacyPlugin(
   return relativePluginDir;
 }
 
-function rewriteMarketplaceManifest(outputDir: string, paths: PortablePathMap): { name: string; file: string } {
+async function extractRemotePluginRepository(
+  source: RemotePluginSource,
+  stagingRoot: string,
+  cache: Map<string, Promise<ExtractedRepository>>,
+): Promise<ExtractedRepository> {
+  const existing = cache.get(source.identity);
+  if (existing) return existing;
+
+  const pending = (async () => {
+    const target = path.join(stagingRoot, `external-${shortHash(source.identity)}`);
+    const repository = path.join(target, "repository");
+    const archive = path.join(target, "plugin.zip");
+    const content = path.join(target, "content");
+    fs.mkdirSync(content, { recursive: true });
+
+    const cloneArgs = ["-c", "core.protectNTFS=false", "clone", "--bare", "--depth", "1"];
+    if (source.ref) cloneArgs.push("--branch", source.ref);
+    cloneArgs.push("--", source.cloneSource, repository);
+    try {
+      await execFileAsync("git", cloneArgs, {
+        windowsHide: true,
+        timeout: 180_000,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+    } catch (err) {
+      throw new Error(`克隆外部插件仓库失败（${source.cloneSource}）：${processErrorMessage(err)}`);
+    }
+
+    let treeish = "HEAD";
+    if (source.sha) {
+      try {
+        await execFileAsync("git", ["-C", repository, "cat-file", "-e", `${source.sha}^{commit}`], {
+          windowsHide: true,
+          timeout: 30_000,
+          maxBuffer: 2 * 1024 * 1024,
+        });
+      } catch {
+        try {
+          await execFileAsync("git", ["-C", repository, "fetch", "--depth", "1", "origin", source.sha], {
+            windowsHide: true,
+            timeout: 180_000,
+            maxBuffer: 8 * 1024 * 1024,
+          });
+        } catch (err) {
+          throw new Error(`无法获取外部插件固定版本（${source.sha}）：${processErrorMessage(err)}`);
+        }
+      }
+      treeish = source.sha;
+    }
+
+    try {
+      await execFileAsync(
+        "git",
+        ["-c", "core.protectNTFS=false", "-C", repository, "archive", "--format=zip", "--output", archive, treeish],
+        { windowsHide: true, timeout: 180_000, maxBuffer: 8 * 1024 * 1024 },
+      );
+    } catch (err) {
+      throw new Error(`生成外部插件归档失败（${source.cloneSource}）：${processErrorMessage(err)}`);
+    }
+
+    const paths = await extractPortableZip(archive, content);
+    return { directory: content, paths };
+  })();
+  cache.set(source.identity, pending);
+  return pending;
+}
+
+async function rewriteMarketplaceManifest(
+  outputDir: string,
+  paths: PortablePathMap,
+  stagingRoot: string,
+): Promise<{ name: string; file: string }> {
   const candidates = [
     path.join(outputDir, ".grok-plugin", "marketplace.json"),
     path.join(outputDir, ".claude-plugin", "marketplace.json"),
+    path.join(outputDir, ".agents", "plugins", "marketplace.json"),
   ];
   const manifestPath = candidates.find((candidate) => fs.existsSync(candidate));
   if (!manifestPath) {
-    throw new Error("仓库中没有 .grok-plugin/marketplace.json 或 .claude-plugin/marketplace.json");
+    throw new Error("仓库中没有 Grok、Claude 或 Codex marketplace.json");
   }
 
   let parsed: unknown;
@@ -498,18 +816,45 @@ function rewriteMarketplaceManifest(outputDir: string, paths: PortablePathMap): 
   const manifest = asRecord(parsed);
   if (!manifest || !Array.isArray(manifest.plugins)) throw new Error("市场清单缺少 plugins 数组");
   const name = typeof manifest.name === "string" && manifest.name.trim() ? manifest.name.trim() : "marketplace";
+  const externalRepositories = new Map<string, Promise<ExtractedRepository>>();
 
   for (const rawPlugin of manifest.plugins) {
     const plugin = asRecord(rawPlugin);
     if (!plugin) continue;
+    const remote = remotePluginSource(plugin);
+    if (remote) normalizeRemoteSourceForGrok(plugin, remote);
+    if (remote && LEGACY_COMPONENT_KEYS.some((key) => Array.isArray(plugin[key]) && plugin[key].length > 0)) {
+      const extracted = await extractRemotePluginRepository(remote, stagingRoot, externalRepositories);
+      const safeSubdir = remote.subdir ? extracted.paths.get(remote.subdir) : "";
+      if (remote.subdir && !safeSubdir) {
+        throw new Error(`插件 ${String(plugin.name || "plugin")} 的外部子目录不存在：${remote.subdir}`);
+      }
+      const sourceRoot = safeSubdir
+        ? path.join(extracted.directory, ...safeSubdir.split("/"))
+        : extracted.directory;
+      const materialized = materializeLegacyPlugin(outputDir, plugin, sourceRoot);
+      if (materialized) {
+        setLocalSourcePath(plugin, `./${materialized.replace(/^\.\//, "")}`);
+        continue;
+      }
+    }
     const originalRoot = sourcePath(plugin);
     if (!originalRoot || /^\w+:\/\//.test(originalRoot)) continue;
     const normalizedRoot = originalRoot.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
     const safeRoot = paths.get(normalizedRoot) || paths.map(normalizedRoot);
     rewritePluginPaths(plugin, normalizedRoot, safeRoot, paths);
-    const materialized = materializeLegacyPlugin(outputDir, plugin, safeRoot);
-    const finalRoot = materialized || safeRoot;
-    setSourcePath(plugin, `./${finalRoot.replace(/^\.\//, "")}`);
+    const localSourceRoot = path.join(outputDir, ...safeRoot.split("/"));
+    ensureGrokPluginManifest(localSourceRoot, plugin);
+    materializeFlatSkillFiles(localSourceRoot);
+    const materialized = materializeLegacyPlugin(
+      outputDir,
+      plugin,
+      localSourceRoot,
+    );
+    const finalRoot = materialized || (!safeRoot || safeRoot === "."
+      ? materializeRootPlugin(outputDir, plugin, outputDir)
+      : safeRoot);
+    setLocalSourcePath(plugin, `./${finalRoot.replace(/^\.\//, "")}`);
   }
 
   const serialized = `${JSON.stringify(manifest, null, 2)}\n`;
@@ -663,7 +1008,7 @@ export async function prepareMarketplaceSource(
     }
 
     const paths = await extractPortableZip(archive, content);
-    const manifest = rewriteMarketplaceManifest(content, paths);
+    const manifest = await rewriteMarketplaceManifest(content, paths, stagingRoot);
     const metadata: MirrorMetadata = {
       version: 1,
       originalSource: parsed.originalSource,

@@ -40,6 +40,7 @@ import {
   planRevisions,
 } from "../src/lib/stream";
 import { threadTitleForDisplay, threadTitleFromPrompt } from "../src/lib/thread-title";
+import { settingsForAccountMethod } from "../src/lib/model-options";
 import { FollowUpQueue, followUpDisplayText } from "../electron/follow-ups";
 import { TurnCompletionTracker } from "../electron/turn-completion";
 import { latestUpdateTimestamp, resolveThreadUpdatedAt } from "../electron/thread-activity";
@@ -47,6 +48,7 @@ import { modelsFromCachePayload } from "../electron/model-catalog";
 import { SessionReplayGate } from "../electron/session-replay";
 import { resolveReasoningEffortValue } from "../electron/reasoning-effort";
 import { resolveAccountUsagePercent } from "../electron/account-usage";
+import { hasPersistedConversation } from "../electron/thread-visibility";
 import { normalizeProxySettings } from "../electron/proxy-config";
 import { pathsFromClipboardBuffer } from "../electron/clipboard-files";
 import { Markdown } from "../src/lib/markdown";
@@ -65,6 +67,12 @@ import {
 
 const firstTurn = 100;
 const currentTurn = 200;
+
+test("synthetic runtime probe sessions stay out of the conversation list", () => {
+  assert.equal(hasPersistedConversation({ num_messages: 0, num_chat_messages: 2 }), false);
+  assert.equal(hasPersistedConversation({ num_messages: 1, num_chat_messages: 3 }), true);
+  assert.equal(hasPersistedConversation({ generated_title: "旧版真实会话" }), true);
+});
 
 test("update notes render sanitized HTML alongside Markdown", () => {
   const rendered = renderToStaticMarkup(
@@ -208,6 +216,25 @@ test("legacy API config is migrated and OAuth switching restores a built-in mode
   const oauth = buildOAuthConfig(migrated);
   assert.equal(preferredAuthMethod(oauth), "oidc");
   assert.match(oauth, /\[models\]\s+default = "grok-4\.6"/);
+});
+
+test("OAuth model choices hide the desktop API provider", () => {
+  const settings = {
+    model: "grok-4.6",
+    models: [
+      { id: "grok-4.6", name: "Grok 4.6" },
+      { id: "desktop-api", name: "API" },
+    ],
+  } as Parameters<typeof settingsForAccountMethod>[0];
+
+  assert.deepEqual(
+    settingsForAccountMethod(settings, "oauth")?.models.map((model) => model.id),
+    ["grok-4.6"],
+  );
+  assert.deepEqual(
+    settingsForAccountMethod(settings, "api-key")?.models.map((model) => model.id),
+    ["grok-4.6", "desktop-api"],
+  );
 });
 
 test("API credential repair restores the fixed provider after another model was selected", () => {

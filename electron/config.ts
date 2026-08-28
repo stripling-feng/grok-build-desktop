@@ -10,6 +10,7 @@ import { grokBin as resolveGrokBin } from "./grok-bin";
 import { inspectGrok, isProjectTrusted, listMarketplaces } from "./grok-cli";
 import { modelsFromCachePayload, type ModelCatalogEntry } from "./model-catalog";
 import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
+import { attachPluginRuntimeDependencies } from "./runtime-dependencies";
 
 const execFileAsync = promisify(execFile);
 
@@ -329,11 +330,34 @@ function parseFrontmatter(md: string): { name?: string; description?: string } {
   return { name, description };
 }
 
-function walkSkillDir(dir: string, source: string, out: SkillInfo[]) {
+function pathIsIgnored(file: string, ignored: string[]): boolean {
+  const absolute = path.resolve(file);
+  return ignored.some((entry) => {
+    const relative = path.relative(entry, absolute);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  });
+}
+
+function fallbackSkill(meta: { name?: string; description?: string }, file: string, source: string): SkillInfo {
+  const name = meta.name || path.basename(path.dirname(file)) || path.parse(file).name;
+  return {
+    id: `${source}:${file}:${name}`,
+    name,
+    description: meta.description || "",
+    source,
+    path: file,
+    disabled: false,
+    userInvocable: true,
+    invocableAs: `/${name}`,
+  };
+}
+
+function walkSkillDir(dir: string, source: string, out: SkillInfo[], ignored: string[]) {
   if (!fs.existsSync(dir)) return;
   const stack = [dir];
   while (stack.length) {
     const cur = stack.pop()!;
+    if (pathIsIgnored(cur, ignored)) continue;
     let entries: fs.Dirent[] = [];
     try {
       entries = fs.readdirSync(cur, { withFileTypes: true });
@@ -342,6 +366,7 @@ function walkSkillDir(dir: string, source: string, out: SkillInfo[]) {
     }
     for (const ent of entries) {
       const full = path.join(cur, ent.name);
+      if (pathIsIgnored(full, ignored)) continue;
       if (ent.isDirectory()) stack.push(full);
       else if (ent.isFile() && ent.name.toLowerCase() === "skill.md") {
         let md = "";
@@ -351,40 +376,114 @@ function walkSkillDir(dir: string, source: string, out: SkillInfo[]) {
           continue;
         }
         const meta = parseFrontmatter(md);
-        const name = meta.name || path.basename(cur);
-        out.push({
-          name,
-          description: meta.description || "",
-          source,
-          path: full,
-          disabled: false,
-          userInvocable: true,
-          invocableAs: `/${name}`,
-        });
+        out.push(fallbackSkill(meta, full, source));
       }
     }
   }
 }
 
+function walkCommandDir(dir: string, source: string, out: SkillInfo[], ignored: string[]) {
+  if (!fs.existsSync(dir)) return;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (pathIsIgnored(cur, ignored)) continue;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(cur, entry.name);
+      if (pathIsIgnored(full, ignored)) continue;
+      if (entry.isDirectory()) stack.push(full);
+      else if (entry.isFile() && /\.md$/i.test(entry.name) && entry.name.toLowerCase() !== "skill.md") {
+        let md = "";
+        try {
+          md = fs.readFileSync(full, "utf8");
+        } catch {
+          continue;
+        }
+        const meta = parseFrontmatter(md);
+        out.push(fallbackSkill({ ...meta, name: meta.name || path.parse(entry.name).name }, full, source));
+      }
+    }
+  }
+}
+
+function expandSkillPath(value: string): string {
+  return path.resolve(value.replace(/^~(?=[\\/]|$)/, os.homedir()));
+}
+
+function directoryChain(cwd: string, gitRoot: string | null): string[] {
+  const current = path.resolve(cwd);
+  const root = path.resolve(gitRoot || cwd);
+  const relative = path.relative(root, current);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return [current];
+  const result: string[] = [];
+  let cursor = current;
+  for (;;) {
+    result.push(cursor);
+    if (cursor.toLowerCase() === root.toLowerCase()) break;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return result;
+}
+
 export async function listSkills(cwd?: string | null): Promise<SkillInfo[]> {
   const text = readText();
   const disabled = new Set(readStringArray(text, "skills", "disabled").map((s) => s.toLowerCase()));
+  const ignored = readStringArray(text, "skills", "ignore").map(expandSkillPath);
   const found: SkillInfo[] = [];
   const gitRoot = cwd ? await findGitRoot(cwd) : null;
-  const dirs: { dir: string; source: string }[] = [];
-  if (cwd) dirs.push({ dir: path.join(cwd, ".grok", "skills"), source: "项目" });
-  if (gitRoot && gitRoot !== cwd) dirs.push({ dir: path.join(gitRoot, ".grok", "skills"), source: "仓库" });
-  dirs.push({ dir: path.join(grokHome(), "skills"), source: "用户" });
+  const dirs: { dir: string; source: string; kind: "skills" | "commands" }[] = [];
+  const claudeEnabled = readBool(text, "compat.claude", "skills") !== false && process.env.GROK_CLAUDE_SKILLS_ENABLED !== "false";
+  const cursorEnabled = readBool(text, "compat.cursor", "skills") !== false && process.env.GROK_CURSOR_SKILLS_ENABLED !== "false";
+  for (const base of cwd ? directoryChain(cwd, gitRoot) : []) {
+    const source = gitRoot && path.resolve(base).toLowerCase() === path.resolve(gitRoot).toLowerCase() ? "仓库" : "项目";
+    for (const vendor of [".grok", ".agents"]) {
+      dirs.push({ dir: path.join(base, vendor, "skills"), source, kind: "skills" });
+      dirs.push({ dir: path.join(base, vendor, "commands"), source, kind: "commands" });
+    }
+    if (claudeEnabled) {
+      dirs.push({ dir: path.join(base, ".claude", "skills"), source: "Claude", kind: "skills" });
+      dirs.push({ dir: path.join(base, ".claude", "commands"), source: "Claude", kind: "commands" });
+    }
+    if (cursorEnabled) dirs.push({ dir: path.join(base, ".cursor", "skills"), source: "Cursor", kind: "skills" });
+  }
+  dirs.push({ dir: path.join(grokHome(), "skills"), source: "用户", kind: "skills" });
+  dirs.push({ dir: path.join(grokHome(), "commands"), source: "用户", kind: "commands" });
+  dirs.push({ dir: path.join(grokHome(), "server-skills"), source: "托管", kind: "skills" });
+  for (const vendor of [".agents", ...(claudeEnabled ? [".claude"] : [])]) {
+    dirs.push({ dir: path.join(os.homedir(), vendor, "skills"), source: vendor === ".claude" ? "Claude" : "用户", kind: "skills" });
+    dirs.push({ dir: path.join(os.homedir(), vendor, "commands"), source: vendor === ".claude" ? "Claude" : "用户", kind: "commands" });
+  }
+  if (cursorEnabled) dirs.push({ dir: path.join(os.homedir(), ".cursor", "skills"), source: "Cursor", kind: "skills" });
   for (const extra of readStringArray(text, "skills", "paths")) {
-    const expanded = extra.replace(/^~(?=[\\/]|$)/, os.homedir());
-    dirs.push({ dir: expanded, source: "额外" });
+    const expanded = expandSkillPath(extra);
+    if (fs.existsSync(expanded) && fs.statSync(expanded).isFile()) {
+      if (!pathIsIgnored(expanded, ignored) && path.basename(expanded).toLowerCase() === "skill.md") {
+        try {
+          found.push(fallbackSkill(parseFrontmatter(fs.readFileSync(expanded, "utf8")), expanded, "额外"));
+        } catch {
+          // Ignore unreadable compatibility paths.
+        }
+      }
+    } else dirs.push({ dir: expanded, source: "额外", kind: "skills" });
   }
-  for (const { dir, source } of dirs) walkSkillDir(dir, source, found);
-  const byName = new Map<string, SkillInfo>();
+  for (const { dir, source, kind } of dirs) {
+    if (kind === "commands") walkCommandDir(dir, source, found, ignored);
+    else walkSkillDir(dir, source, found, ignored);
+  }
+  const byPath = new Map<string, SkillInfo>();
   for (const skill of found) {
-    if (!byName.has(skill.name.toLowerCase())) byName.set(skill.name.toLowerCase(), skill);
+    const key = (skill.path || skill.id).toLowerCase();
+    if (!byPath.has(key)) byPath.set(key, skill);
   }
-  return [...byName.values()].map((s) => ({
+  return [...byPath.values()].map((s) => ({
     ...s,
     disabled: disabled.has(s.name.toLowerCase()),
   }));
@@ -431,24 +530,28 @@ export async function loadSettings(
     const inspected = await inspectGrok(cwd);
     projectTrusted = inspected.projectTrusted;
     mcpServers = inspected.mcpServers;
-    plugins = inspected.plugins;
+    plugins = attachPluginRuntimeDependencies(inspected.plugins, inspected.mcpServers);
     hooks = inspected.hooks;
     if (inspected.skills.length) {
       const disabled = new Set(scanned.filter((s) => s.disabled).map((s) => s.name.toLowerCase()));
-      const byName = new Map<string, SkillInfo>();
-      for (const skill of scanned) byName.set(skill.name.toLowerCase(), skill);
-      for (const skill of inspected.skills) {
+      const unusedScanned = [...scanned];
+      skills = inspected.skills.map((skill) => {
+        const index = unusedScanned.findIndex((local) =>
+          skill.path && local.path
+            ? path.resolve(skill.path).toLowerCase() === path.resolve(local.path).toLowerCase()
+            : skill.name.toLowerCase() === local.name.toLowerCase(),
+        );
+        const local = index >= 0 ? unusedScanned.splice(index, 1)[0] : undefined;
         const key = skill.name.toLowerCase();
-        const local = byName.get(key);
-        byName.set(key, {
+        return {
           ...skill,
           path: skill.path || local?.path || "",
           disabled: skill.disabled || disabled.has(key),
           userInvocable: skill.userInvocable ?? local?.userInvocable ?? true,
           invocableAs: skill.invocableAs || local?.invocableAs || `/${skill.name}`,
-        });
-      }
-      skills = [...byName.values()];
+        };
+      });
+      skills.push(...unusedScanned);
     }
     try {
       marketplaces = await listMarketplaces();
@@ -504,4 +607,29 @@ export function setSkillDisabled(name: string, disabled: boolean) {
   }
   const raw = `[${[...set].map((s) => JSON.stringify(s)).join(", ")}]`;
   writeText(setTableKey(text, "skills", "disabled", raw));
+}
+
+export function addSkillSearchPath(skillPath: string) {
+  const value = skillPath.trim();
+  if (!value) throw new Error("Skills 路径不能为空");
+  const text = readText();
+  const paths = readStringArray(text, "skills", "paths");
+  if (!paths.some((item) => path.resolve(item).toLowerCase() === path.resolve(value).toLowerCase())) paths.push(value);
+  const ignore = readStringArray(text, "skills", "ignore").filter((item) => item.toLowerCase() !== value.toLowerCase());
+  let next = setTableKey(text, "skills", "paths", `[${paths.map(JSON.stringify).join(", ")}]`);
+  next = setTableKey(next, "skills", "ignore", `[${ignore.map(JSON.stringify).join(", ")}]`);
+  writeText(next);
+}
+
+export function removeSkillSearchPath(skillPath: string) {
+  const value = skillPath.trim();
+  const text = readText();
+  const paths = readStringArray(text, "skills", "paths").filter((item) => item.toLowerCase() !== value.toLowerCase());
+  writeText(setTableKey(text, "skills", "paths", `[${paths.map(JSON.stringify).join(", ")}]`));
+}
+
+export function resetSkillConfig() {
+  let text = readText();
+  for (const key of ["paths", "ignore", "disabled"]) text = setTableKey(text, "skills", key, "[]");
+  writeText(text);
 }

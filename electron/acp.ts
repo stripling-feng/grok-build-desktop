@@ -12,6 +12,11 @@ import type { FollowUpImage } from "./follow-ups";
 import { encodeCwd, findSessionDir, grokHome } from "./sessions";
 import { resolveReasoningEffortValue } from "./reasoning-effort";
 import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
+import {
+  grokExtensionMethodCandidates,
+  grokExtensionNotificationMethod,
+  isMethodNotFoundError,
+} from "./acp-extensions";
 
 const execFileAsync = promisify(execFile);
 
@@ -340,6 +345,21 @@ export class GrokAcpClient extends EventEmitter {
     }
   }
 
+  async extensionRequest(method: string, params: unknown, timeoutMs = 60_000): Promise<unknown> {
+    const candidates = grokExtensionMethodCandidates(method);
+    await this.ensureStarted();
+    let lastError: Error | null = null;
+    for (const candidate of candidates) {
+      try {
+        return await this.request(candidate, params, timeoutMs);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (!isMethodNotFoundError(lastError)) throw lastError;
+      }
+    }
+    throw lastError ?? new Error(`Grok 不支持扩展方法：${method}`);
+  }
+
   private contentBlocks(text: string, images?: FollowUpImage[]): Record<string, unknown>[] {
     const prompt: Record<string, unknown>[] = [];
     if (text.trim()) prompt.push({ type: "text", text });
@@ -453,7 +473,10 @@ export class GrokAcpClient extends EventEmitter {
       const update = (p.update ?? p) as Record<string, unknown>;
       const meta = p._meta && typeof p._meta === "object" ? (p._meta as Record<string, unknown>) : undefined;
       this.emit("update", { sessionId, update, method, meta });
+      return;
     }
+    const extensionMethod = grokExtensionNotificationMethod(method);
+    if (extensionMethod) this.emit("extension", { method: extensionMethod, params });
   }
 
   private async handleRequest(method: string, params: unknown, rpcId: string): Promise<unknown> {
@@ -569,10 +592,10 @@ export class GrokAcpClient extends EventEmitter {
     throw new Error("路径不在当前项目内");
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  private request(method: string, params: unknown, requestedTimeoutMs?: number): Promise<unknown> {
     if (!this.proc) return Promise.reject(new Error("Grok 代理未运行"));
     const id = this.nextId++;
-    const timeoutMs = method === "session/prompt" ? 15 * 60_000 : 60_000;
+    const timeoutMs = requestedTimeoutMs ?? (method === "session/prompt" ? 15 * 60_000 : 60_000);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);

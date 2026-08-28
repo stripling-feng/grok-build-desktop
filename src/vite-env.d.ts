@@ -12,11 +12,16 @@ import type {
   FilePreview,
   GitStatus,
   GrokStatus,
+  McpAddInput,
+  McpServerInfo,
   PermissionMode,
+  PluginTagInput,
   ProxyApplyResult,
   ProxySettings,
   ProxyTestResult,
   ReasoningEffort,
+  SkillCatalog,
+  SkillCreateInput,
   PermissionRequest,
   ProjectInfo,
   StreamItem,
@@ -153,28 +158,39 @@ declare global {
       setSubagentTypeModel: (id: string, model: string | null, cwd?: string | null) => Promise<AppSettings>;
       openAgentsDir: () => Promise<string>;
       setSkillDisabled: (name: string, disabled: boolean, cwd?: string | null) => Promise<AppSettings>;
+      skillsCatalog: (cwd?: string | null) => Promise<SkillCatalog>;
+      skillsSetEnabled: (name: string, enabled: boolean, cwd?: string | null) => Promise<SkillCatalog>;
+      skillsAddPath: (path: string, cwd?: string | null) => Promise<SkillCatalog>;
+      skillsRemovePath: (path: string, cwd?: string | null) => Promise<SkillCatalog>;
+      skillsReset: (cwd?: string | null) => Promise<SkillCatalog>;
+      skillsCreate: (input: SkillCreateInput, cwd?: string | null) => Promise<{ file: string; catalog: SkillCatalog }>;
       openSkillsDir: () => Promise<string>;
+      openProjectSkillsDir: (cwd: string) => Promise<string>;
       openHooksDir: () => Promise<string>;
       mcpAdd: (
-        input: {
-          name: string;
-          transport: "stdio" | "http" | "sse";
-          scope: "user" | "project";
-          commandOrUrl: string;
-          args?: string[];
-          env?: string[];
-          headers?: string[];
-        },
+        input: McpAddInput,
         cwd?: string | null,
+        sessionId?: string | null,
       ) => Promise<AppSettings>;
-      mcpRemove: (name: string, scope?: "user" | "project", cwd?: string | null) => Promise<AppSettings>;
-      mcpSetEnabled: (name: string, enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
+      mcpCatalog: (sessionId?: string | null, cwd?: string | null, refresh?: boolean) => Promise<McpServerInfo[]>;
+      mcpRemove: (name: string, scope?: "user" | "project", cwd?: string | null, sessionId?: string | null) => Promise<AppSettings>;
+      mcpSetEnabled: (name: string, enabled: boolean, cwd?: string | null, sessionId?: string | null) => Promise<AppSettings>;
+      mcpSetToolEnabled: (sessionId: string, name: string, tool: string, enabled: boolean, cwd?: string | null) => Promise<McpServerInfo[]>;
+      mcpAuthenticate: (sessionId: string, name: string, cwd?: string | null) => Promise<{ result: unknown; servers: McpServerInfo[] }>;
+      mcpSetup: (sessionId: string, name: string, values: Record<string, string>, cwd?: string | null) => Promise<McpServerInfo[]>;
       mcpDoctor: (name?: string, cwd?: string | null) => Promise<string>;
+      onExtensionUpdate: (cb: (payload: unknown) => void) => () => void;
       pluginSetEnabled: (name: string, enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
-      pluginInstall: (source: string, trust: boolean, cwd?: string | null) => Promise<AppSettings>;
-      pluginUninstall: (name: string, cwd?: string | null) => Promise<AppSettings>;
-      marketplaceAdd: (url: string, cwd?: string | null) => Promise<AppSettings>;
+      pluginInstall: (source: string, trust: boolean, cwd?: string | null, sessionId?: string | null) => Promise<AppSettings>;
+      pluginInstallDependency: (command: string) => Promise<{ command: string; packageName: string; restartRequired: boolean }>;
+      pluginUninstall: (name: string, keepData: boolean, cwd?: string | null) => Promise<AppSettings>;
+      pluginUpdate: (name?: string, cwd?: string | null) => Promise<AppSettings>;
+      pluginDetails: (name: string, cwd?: string | null) => Promise<string>;
+      pluginValidate: (targetPath?: string, cwd?: string | null) => Promise<string>;
+      pluginTag: (input: PluginTagInput, cwd?: string | null) => Promise<string>;
+      marketplaceAdd: (url: string, force: boolean, cwd?: string | null) => Promise<AppSettings>;
       marketplaceRemove: (url: string, cwd?: string | null) => Promise<AppSettings>;
+      marketplaceUpdate: (source?: string, cwd?: string | null) => Promise<AppSettings>;
       availablePlugins: () => Promise<AvailablePluginInfo[]>;
       trustProject: (cwd: string) => Promise<AppSettings>;
       listAutomations: () => Promise<Automation[]>;
@@ -186,8 +202,9 @@ declare global {
         input: { name: string; event: string; matcher?: string; command: string },
         cwd?: string | null,
       ) => Promise<AppSettings>;
-      terminalStart: (cwd: string) => Promise<{ cwd: string }>;
+      terminalStart: (cwd: string, cols?: number, rows?: number) => Promise<{ cwd: string }>;
       terminalWrite: (text: string) => Promise<boolean>;
+      terminalResize: (cols: number, rows: number) => Promise<boolean>;
       terminalKill: () => Promise<void>;
       onTerminalData: (cb: (chunk: string) => void) => () => void;
       onUpdate: (cb: (payload: { sessionId: string; update: Record<string, unknown>; method?: string; meta?: Record<string, unknown>; runContinues?: boolean }) => void) => () => void;

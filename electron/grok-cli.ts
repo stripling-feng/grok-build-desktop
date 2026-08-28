@@ -13,12 +13,26 @@ import {
 } from "./marketplace-mirror";
 import { grokHome } from "./sessions";
 import { currentGrokTarget, proxyEnvironmentForTarget } from "./network-settings";
+import {
+  marketplaceAddArgs,
+  marketplaceUpdateArgs,
+  pluginDetailsArgs,
+  pluginInstallArgs,
+  pluginTagArgs,
+  pluginUninstallArgs,
+  pluginUpdateArgs,
+  pluginValidateArgs,
+} from "./plugin-commands";
+import { applyMcpAdvancedConfig } from "./mcp-config";
+import { mcpAddArgs, validateMcpAddInput } from "./mcp-commands";
 import type {
   AvailablePluginInfo,
   HookInfo,
   MarketplaceInfo,
+  McpAddInput,
   McpServerInfo,
   PluginInfo,
+  PluginTagInput,
   SkillInfo,
 } from "./shared";
 
@@ -31,6 +45,16 @@ export type GrokInspect = {
   plugins: PluginInfo[];
   marketplaces: MarketplaceInfo[];
   hooks: HookInfo[];
+};
+
+export type McpDoctorReport = {
+  servers: Array<{
+    name: string;
+    healthy: boolean;
+    checks: Array<{ label: string; passed: boolean; detail: string }>;
+  }>;
+  healthyCount: number;
+  failingCount: number;
 };
 
 export class GrokCliError extends Error {
@@ -132,7 +156,10 @@ function skillSourceLabel(source: Record<string, unknown>): string {
   const type = str(source.type).toLowerCase();
   if (type === "project" || type === "repo" || type === "local") return "项目";
   if (type === "user") return "用户";
-  if (type === "plugin") return "插件";
+  if (type === "plugin") {
+    const plugin = str(source.pluginName || source.plugin_name || source.name);
+    return plugin ? `插件 · ${plugin}` : "插件";
+  }
   if (type === "bundled") return "内置";
   if (type === "claude") return "Claude";
   if (type === "cursor") return "Cursor";
@@ -160,18 +187,102 @@ function mapSkill(raw: unknown): SkillInfo | null {
   if (!name) return null;
   const filePath = str(o.path) || str(source.path);
   const invocableAs = str(o.invocableAs) || str(o.invocable_as) || `/${name}`;
+  const sourceLabel = skillSourceLabel(source);
+  const pluginName = str(o.pluginName || o.plugin_name || source.pluginName || source.plugin_name);
   const userInvocable = o.userInvocable === undefined && o.user_invocable === undefined
     ? true
     : bool(o.userInvocable ?? o.user_invocable, true);
   return {
+    id: `${pluginName || sourceLabel}:${filePath || name}:${name}`,
     name,
+    displayName: str(o.displayName || o.display_name) || undefined,
     description: str(o.description),
-    source: skillSourceLabel(source),
+    source: sourceLabel,
+    scope: str(o.scope || source.type) || undefined,
     path: filePath,
     disabled: bool(o.disabled),
     userInvocable,
     invocableAs,
+    collidesWith: str(o.collidesWith || o.collides_with) || undefined,
+    pluginName: pluginName || undefined,
   };
+}
+
+export function mapRuntimeSkill(raw: unknown): SkillInfo | null {
+  const o = asRecord(raw);
+  const name = str(o.name);
+  if (!name) return null;
+  const scope = str(o.scope).toLowerCase();
+  const pluginName = str(o.pluginName || o.plugin_name);
+  const filePath = str(o.path);
+  const source = pluginName
+    ? `插件 · ${pluginName}`
+    : ({ local: "当前目录", repo: "仓库", user: "用户", server: "托管", bundled: "内置", plugin: "插件" } as Record<string, string>)[scope]
+      || scope
+      || "未知";
+  const metadataRaw = asRecord(o.metadata);
+  const metadata = Object.fromEntries(
+    Object.entries(metadataRaw).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+  const enabled = o.enabled === undefined ? true : bool(o.enabled, true);
+  const allowedToolsRaw = o.allowedTools ?? o.allowed_tools;
+  return {
+    id: `${pluginName || scope || source}:${filePath || name}:${name}`,
+    name,
+    displayName: str(o.displayName || o.display_name) || undefined,
+    description: str(o.description),
+    source,
+    scope: scope || undefined,
+    path: filePath,
+    disabled: !enabled,
+    userInvocable: o.userInvocable === undefined && o.user_invocable === undefined
+      ? true
+      : bool(o.userInvocable ?? o.user_invocable, true),
+    invocableAs: `/${name}`,
+    whenToUse: str(o.whenToUse || o.when_to_use) || undefined,
+    shortDescription: str(o.shortDescription || o.short_description) || undefined,
+    author: str(o.author) || undefined,
+    argumentHint: str(o.argumentHint || o.argument_hint) || undefined,
+    license: str(o.license) || undefined,
+    compatibility: str(o.compatibility) || undefined,
+    metadata: Object.keys(metadata).length ? metadata : undefined,
+    allowedTools: Array.isArray(allowedToolsRaw)
+      ? allowedToolsRaw.filter((value): value is string => typeof value === "string")
+      : undefined,
+    model: str(o.model) || undefined,
+    effort: str(o.effort) || undefined,
+    disableModelInvocation: bool(o.disableModelInvocation ?? o.disable_model_invocation),
+    pluginName: pluginName || undefined,
+    pluginVersion: str(o.pluginVersion || o.plugin_version) || undefined,
+    paths: Array.isArray(o.paths) ? o.paths.filter((value): value is string => typeof value === "string") : undefined,
+  };
+}
+
+function sameSkill(left: SkillInfo, right: SkillInfo): boolean {
+  if (left.path && right.path) {
+    return path.resolve(left.path).toLowerCase() === path.resolve(right.path).toLowerCase();
+  }
+  return left.name.toLowerCase() === right.name.toLowerCase()
+    && (left.pluginName || left.source).toLowerCase() === (right.pluginName || right.source).toLowerCase();
+}
+
+export function mergeSkillCatalog(runtime: SkillInfo[], inspected: SkillInfo[]): SkillInfo[] {
+  const merged = runtime.map((skill) => {
+    const detail = inspected.find((item) => sameSkill(skill, item));
+    return detail
+      ? {
+          ...skill,
+          disabled: skill.disabled || detail.disabled,
+          collidesWith: detail.collidesWith,
+          invocableAs: detail.invocableAs || skill.invocableAs,
+          source: detail.source || skill.source,
+        }
+      : skill;
+  });
+  for (const skill of inspected) {
+    if (!merged.some((item) => sameSkill(item, skill))) merged.push(skill);
+  }
+  return merged;
 }
 
 function mapMcp(raw: unknown): McpServerInfo | null {
@@ -202,21 +313,157 @@ function mapMcp(raw: unknown): McpServerInfo | null {
   };
 }
 
+export function mapMcpCatalog(raw: unknown, fallback: McpServerInfo[] = []): McpServerInfo[] {
+  const envelope = asRecord(raw);
+  const nestedResult = asRecord(envelope.result);
+  const data = Array.isArray(nestedResult.servers) ? nestedResult : envelope;
+  const rows = Array.isArray(data.servers) ? data.servers : [];
+  const mapped: McpServerInfo[] = [];
+  for (const entry of rows) {
+    const o = asRecord(entry);
+    const name = str(o.name);
+    if (!name) continue;
+    const session = asRecord(o.session);
+    const existing = fallback.find((item) => item.name === name);
+    const type = str(o.type).toLowerCase();
+    const sourceLabel = str(o.sourceLabel || o.source_label);
+    const rawSource = str(o.source);
+    const source = sourceLabel
+      ? sourceLabel.replace(/^plugin:\s*/i, "插件 · ")
+      : rawSource === "managed" ? "托管" : existing?.source || "用户";
+    const tools: NonNullable<McpServerInfo["tools"]> = [];
+    for (const tool of Array.isArray(session.tools) ? session.tools : []) {
+      const row = asRecord(tool);
+      const toolName = str(row.name);
+      if (!toolName) continue;
+      tools.push({
+        name: toolName,
+        displayName: str(row.displayName || row.display_name) || undefined,
+        description: str(row.description) || undefined,
+        enabled: row.enabled === undefined ? true : bool(row.enabled, true),
+      });
+    }
+    const reportedStatus = str(session.status || session.state);
+    const reportedError = str(
+      session.error_message ||
+      session.errorMessage ||
+      asRecord(session.error).message ||
+      session.error ||
+      o.error_message ||
+      o.errorMessage ||
+      asRecord(o.error).message ||
+      o.error,
+    );
+    const authRequired = bool(session.authRequired ?? session.auth_required) ||
+      /(?:oauth|authorization|authentication|auth).{0,24}(?:required|needed)|needs?.{0,12}(?:oauth|auth)|unauthorized|需要认证|未认证|\b401\b/i
+        .test(`${reportedStatus} ${reportedError}`);
+    const status = reportedStatus || (authRequired ? "needs auth" : existing?.status || "unavailable");
+    const transport = type === "http"
+      ? existing?.transport === "sse" ? "sse" : "http"
+      : type === "stdio" ? "stdio" : existing?.transport || type || "http";
+    const env: { name: string; value: string }[] = [];
+    for (const value of Array.isArray(o.env) ? o.env : []) {
+      const row = asRecord(value);
+      const envName = str(row.name);
+      if (envName) env.push({ name: envName, value: str(row.value) });
+    }
+    const setupRaw = asRecord(o.setup);
+    const setupFields: NonNullable<McpServerInfo["setup"]>["fields"] = [];
+    for (const field of Array.isArray(setupRaw.fields) ? setupRaw.fields : []) {
+      const row = asRecord(field);
+      const id = str(row.id);
+      if (!id) continue;
+      const options: { label: string; value: string }[] = [];
+      for (const option of Array.isArray(row.options) ? row.options : []) {
+        const value = asRecord(option);
+        const optionValue = str(value.value);
+        if (optionValue) options.push({ label: str(value.label) || optionValue, value: optionValue });
+      }
+      setupFields.push({
+        id,
+        label: str(row.label) || id,
+        type: str(row.type) || "select",
+        required: bool(row.required),
+        default: str(row.default) || undefined,
+        options,
+      });
+    }
+    const setupValues = Object.fromEntries(
+      Object.entries(asRecord(o.setupValues || o.setup_values))
+        .filter((item): item is [string, string] => typeof item[1] === "string"),
+    );
+    mapped.push({
+      name,
+      displayName: str(o.displayName || o.display_name) || undefined,
+      transport,
+      target: str(o.command || o.url) || existing?.target || "",
+      source,
+      path: existing?.path || "",
+      vendor: existing?.vendor || "",
+      enabled: session.enabled === undefined ? existing?.enabled ?? true : bool(session.enabled, true),
+      status,
+      native: existing?.native ?? !/^插件|托管/i.test(source),
+      live: Boolean(o.session),
+      toolCount: tools.length,
+      tools,
+      authRequired,
+      setupRequired: bool(session.setupRequired ?? session.setup_required),
+      setup: setupFields.length ? { fields: setupFields } : undefined,
+      setupValues,
+      args: Array.isArray(o.args) ? o.args.filter((value): value is string => typeof value === "string") : undefined,
+      env: env.length ? env : undefined,
+    });
+  }
+  for (const item of fallback) {
+    if (!mapped.some((row) => row.name === item.name)) mapped.push(item);
+  }
+  return mapped;
+}
+
 function mapPlugin(raw: unknown): PluginInfo | null {
   const o = asRecord(raw);
   const name = str(o.name);
   if (!name) return null;
   const provides = asRecord(o.provides);
+  const pluginPath = str(o.path);
   return {
     name,
+    version: str(o.version) || undefined,
+    description: str(o.description) || readInstalledPluginDescription(pluginPath) || undefined,
     scope: str(o.scope, "user"),
-    path: str(o.path),
+    path: pluginPath,
     enabled: o.enabled === undefined ? true : bool(o.enabled, true),
     skills: num(provides.skills),
     agents: num(provides.agents),
     hooks: bool(provides.hooks),
     mcpServers: num(provides.mcpServers ?? provides.mcp_servers),
+    commands: num(provides.commands ?? provides.slashCommands ?? provides.slash_commands),
+    lspServers: num(provides.lspServers ?? provides.lsp_servers ?? provides.lsps),
   };
+}
+
+function readInstalledPluginDescription(pluginPath: string): string {
+  if (!pluginPath) return "";
+  const manifests = [
+    path.join(pluginPath, ".grok-plugin", "plugin.json"),
+    path.join(pluginPath, ".claude-plugin", "plugin.json"),
+    path.join(pluginPath, ".codex-plugin", "plugin.json"),
+    path.join(pluginPath, ".cursor-plugin", "plugin.json"),
+    path.join(pluginPath, ".github", "plugin", "plugin.json"),
+    path.join(pluginPath, "plugin.json"),
+    path.join(pluginPath, "package.json"),
+  ];
+  for (const manifest of manifests) {
+    try {
+      if (!fs.existsSync(manifest)) continue;
+      const data = asRecord(JSON.parse(fs.readFileSync(manifest, "utf8")));
+      const description = str(data.description);
+      if (description) return description;
+    } catch {
+      /* Try the next supported plugin manifest. */
+    }
+  }
+  return "";
 }
 
 function mapMarketplace(raw: unknown): MarketplaceInfo | null {
@@ -248,6 +495,8 @@ function mapAvailable(raw: unknown): AvailablePluginInfo | null {
     hasHooks: bool(o.has_hooks ?? o.hasHooks),
     hasAgents: bool(o.has_agents ?? o.hasAgents),
     hasMcp: bool(o.has_mcp ?? o.hasMcp),
+    commandCount: num(o.command_count ?? o.commandCount),
+    hasLsp: bool(o.has_lsp ?? o.hasLsp),
   };
 }
 
@@ -327,30 +576,14 @@ export async function listAvailablePlugins(): Promise<AvailablePluginInfo[]> {
     : [];
 }
 
-export type McpAddInput = {
-  name: string;
-  transport: "stdio" | "http" | "sse";
-  scope: "user" | "project";
-  commandOrUrl: string;
-  args?: string[];
-  env?: string[];
-  headers?: string[];
-};
-
 export async function mcpAdd(input: McpAddInput, cwd?: string | null) {
-  const args = ["mcp", "add", "--transport", input.transport, "--scope", input.scope];
-  for (const env of input.env ?? []) args.push("-e", env);
-  for (const header of input.headers ?? []) args.push("--header", header);
-  args.push(input.name);
-  if (input.transport === "stdio") {
-    args.push("--", input.commandOrUrl, ...(input.args ?? []));
-  } else {
-    args.push(input.commandOrUrl);
-  }
-  await run(args, { cwd, timeout: 30_000 });
+  const checked = validateMcpAddInput(input, cwd);
+  await run(mcpAddArgs(checked), { cwd, timeout: 30_000 });
+  applyMcpAdvancedConfig(checked, cwd);
 }
 
 export async function mcpRemove(name: string, scope?: "user" | "project", cwd?: string | null) {
+  if (scope === "project" && !cwd?.trim()) throw new GrokCliError("删除项目级 MCP 前请先选择项目");
   const args = ["mcp", "remove", name];
   if (scope) args.splice(2, 0, "--scope", scope);
   await run(args, { cwd });
@@ -370,6 +603,43 @@ export async function mcpDoctor(name?: string, cwd?: string | null): Promise<str
   return (await run(args, { cwd, timeout: 45_000 })).trim();
 }
 
+export function parseMcpDoctorReport(raw: unknown): McpDoctorReport {
+  const data = asRecord(raw);
+  const servers = (Array.isArray(data.servers) ? data.servers : []).flatMap((value) => {
+    const server = asRecord(value);
+    const name = str(server.name);
+    if (!name) return [];
+    const checks = (Array.isArray(server.checks) ? server.checks : []).flatMap((item) => {
+      const check = asRecord(item);
+      const label = str(check.label);
+      return label ? [{ label, passed: bool(check.passed), detail: str(check.detail) }] : [];
+    });
+    return [{ name, healthy: bool(server.healthy), checks }];
+  });
+  return {
+    servers,
+    healthyCount: num(data.healthy_count ?? data.healthyCount),
+    failingCount: num(data.failing_count ?? data.failingCount),
+  };
+}
+
+export async function mcpDoctorReport(name?: string, cwd?: string | null): Promise<McpDoctorReport> {
+  const args = ["mcp", "doctor"];
+  if (name) args.push(name);
+  args.push("--json");
+  try {
+    const stdout = await run(args, { cwd, timeout: 120_000, json: true });
+    return parseMcpDoctorReport(extractJson(stdout));
+  } catch (err) {
+    if (!(err instanceof GrokCliError) || !err.detail) throw err;
+    try {
+      return parseMcpDoctorReport(extractJson(err.detail));
+    } catch {
+      throw err;
+    }
+  }
+}
+
 export async function pluginEnable(name: string, cwd?: string | null) {
   await run(["plugin", "enable", name], { cwd });
 }
@@ -379,20 +649,33 @@ export async function pluginDisable(name: string, cwd?: string | null) {
 }
 
 export async function pluginInstall(source: string, trust: boolean, cwd?: string | null) {
-  const args = ["plugin", "install"];
-  if (trust) args.push("--trust");
-  args.push(source);
-  await run(args, { cwd, timeout: 120_000 });
+  await run(pluginInstallArgs(source, trust), { cwd, timeout: 120_000 });
 }
 
-export async function pluginUninstall(name: string, cwd?: string | null) {
-  await run(["plugin", "uninstall", "--confirm", name], { cwd, timeout: 60_000 });
+export async function pluginUninstall(name: string, keepData: boolean, cwd?: string | null) {
+  await run(pluginUninstallArgs(name, keepData), { cwd, timeout: 60_000 });
 }
 
-export async function marketplaceAdd(url: string, cwd?: string | null) {
+export async function pluginUpdate(name?: string, cwd?: string | null) {
+  await run(pluginUpdateArgs(name), { cwd, timeout: 180_000 });
+}
+
+export async function pluginDetails(name: string, cwd?: string | null): Promise<string> {
+  return (await run(pluginDetailsArgs(name), { cwd, timeout: 30_000 })).trim();
+}
+
+export async function pluginValidate(targetPath?: string, cwd?: string | null): Promise<string> {
+  return (await run(pluginValidateArgs(targetPath), { cwd, timeout: 60_000 })).trim();
+}
+
+export async function pluginTag(input: PluginTagInput, cwd?: string | null): Promise<string> {
+  return (await run(pluginTagArgs(input), { cwd, timeout: input.push ? 120_000 : 60_000 })).trim();
+}
+
+export async function marketplaceAdd(url: string, cwd?: string | null, force = false) {
   const prepared = await prepareMarketplaceSource(url, cwd);
   if (prepared.kind === "local") {
-    await run(["plugin", "marketplace", "add", prepared.path], { cwd, timeout: 60_000 });
+    await run(marketplaceAddArgs(prepared.path, force), { cwd, timeout: 60_000 });
     return;
   }
 
@@ -416,7 +699,7 @@ export async function marketplaceAdd(url: string, cwd?: string | null) {
     await run(["plugin", "marketplace", "remove", removedSource], { cwd, timeout: 30_000 });
   }
   try {
-    await run(["plugin", "marketplace", "add", prepared.value.localPath], { cwd, timeout: 60_000 });
+    await run(marketplaceAddArgs(prepared.value.localPath, force), { cwd, timeout: 60_000 });
   } catch (err) {
     if (removedSource) {
       try {
@@ -426,6 +709,39 @@ export async function marketplaceAdd(url: string, cwd?: string | null) {
       }
     }
     throw err;
+  }
+}
+
+export async function marketplaceUpdate(source?: string, cwd?: string | null) {
+  const current = await listMarketplaces();
+  if (!source?.trim()) {
+    for (const item of current) {
+      const registered = item.registeredSource || item.url || item.name;
+      if (managedMarketplaceMetadata(registered)) await marketplaceAdd(item.url, cwd);
+    }
+    await run(marketplaceUpdateArgs(), { cwd, timeout: 180_000 });
+    return;
+  }
+
+  const targets = source?.trim()
+    ? current.filter((item) => {
+        const value = source.trim();
+        return item.name === value || item.url === value || item.registeredSource === value;
+      })
+    : current;
+
+  if (source?.trim() && targets.length === 0) {
+    await run(marketplaceUpdateArgs(source), { cwd, timeout: 180_000 });
+    return;
+  }
+
+  for (const item of targets) {
+    const registered = item.registeredSource || item.url || item.name;
+    if (managedMarketplaceMetadata(registered)) {
+      await marketplaceAdd(item.url, cwd);
+    } else {
+      await run(marketplaceUpdateArgs(item.name), { cwd, timeout: 180_000 });
+    }
   }
 }
 

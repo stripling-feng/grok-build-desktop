@@ -135,23 +135,56 @@ contextBridge.exposeInMainWorld("grok", {
   openAgentsDir: () => ipcRenderer.invoke("grok:openAgentsDir"),
   setSkillDisabled: (name: string, disabled: boolean, cwd?: string | null) =>
     ipcRenderer.invoke("grok:setSkillDisabled", name, disabled, cwd),
+  skillsCatalog: (cwd?: string | null) => ipcRenderer.invoke("grok:skillsCatalog", cwd),
+  skillsSetEnabled: (name: string, enabled: boolean, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:skillsSetEnabled", name, enabled, cwd),
+  skillsAddPath: (skillPath: string, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:skillsAddPath", skillPath, cwd),
+  skillsRemovePath: (skillPath: string, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:skillsRemovePath", skillPath, cwd),
+  skillsReset: (cwd?: string | null) => ipcRenderer.invoke("grok:skillsReset", cwd),
+  skillsCreate: (input: unknown, cwd?: string | null) => ipcRenderer.invoke("grok:skillsCreate", input, cwd),
   openSkillsDir: () => ipcRenderer.invoke("grok:openSkillsDir"),
+  openProjectSkillsDir: (cwd: string) => ipcRenderer.invoke("grok:openProjectSkillsDir", cwd),
   openHooksDir: () => ipcRenderer.invoke("grok:openHooksDir"),
-  mcpAdd: (input: unknown, cwd?: string | null) => ipcRenderer.invoke("grok:mcpAdd", input, cwd),
-  mcpRemove: (name: string, scope?: string, cwd?: string | null) =>
-    ipcRenderer.invoke("grok:mcpRemove", name, scope, cwd),
-  mcpSetEnabled: (name: string, enabled: boolean, cwd?: string | null) =>
-    ipcRenderer.invoke("grok:mcpSetEnabled", name, enabled, cwd),
+  mcpAdd: (input: unknown, cwd?: string | null, sessionId?: string | null) =>
+    ipcRenderer.invoke("grok:mcpAdd", input, cwd, sessionId),
+  mcpCatalog: (sessionId?: string | null, cwd?: string | null, refresh?: boolean) =>
+    ipcRenderer.invoke("grok:mcpCatalog", sessionId, cwd, refresh),
+  mcpRemove: (name: string, scope?: string, cwd?: string | null, sessionId?: string | null) =>
+    ipcRenderer.invoke("grok:mcpRemove", name, scope, cwd, sessionId),
+  mcpSetEnabled: (name: string, enabled: boolean, cwd?: string | null, sessionId?: string | null) =>
+    ipcRenderer.invoke("grok:mcpSetEnabled", name, enabled, cwd, sessionId),
+  mcpSetToolEnabled: (sessionId: string, name: string, tool: string, enabled: boolean, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:mcpSetToolEnabled", sessionId, name, tool, enabled, cwd),
+  mcpAuthenticate: (sessionId: string, name: string, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:mcpAuthenticate", sessionId, name, cwd),
+  mcpSetup: (sessionId: string, name: string, values: Record<string, string>, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:mcpSetup", sessionId, name, values, cwd),
   mcpDoctor: (name?: string, cwd?: string | null) => ipcRenderer.invoke("grok:mcpDoctor", name, cwd),
+  onExtensionUpdate: (cb: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on("grok:extension-update", listener);
+    return () => ipcRenderer.removeListener("grok:extension-update", listener);
+  },
   pluginSetEnabled: (name: string, enabled: boolean, cwd?: string | null) =>
     ipcRenderer.invoke("grok:pluginSetEnabled", name, enabled, cwd),
-  pluginInstall: (source: string, trust: boolean, cwd?: string | null) =>
-    ipcRenderer.invoke("grok:pluginInstall", source, trust, cwd),
-  pluginUninstall: (name: string, cwd?: string | null) =>
-    ipcRenderer.invoke("grok:pluginUninstall", name, cwd),
-  marketplaceAdd: (url: string, cwd?: string | null) => ipcRenderer.invoke("grok:marketplaceAdd", url, cwd),
+  pluginInstall: (source: string, trust: boolean, cwd?: string | null, sessionId?: string | null) =>
+    ipcRenderer.invoke("grok:pluginInstall", source, trust, cwd, sessionId),
+  pluginInstallDependency: (command: string) => ipcRenderer.invoke("grok:pluginInstallDependency", command),
+  pluginUninstall: (name: string, keepData: boolean, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:pluginUninstall", name, keepData, cwd),
+  pluginUpdate: (name?: string, cwd?: string | null) => ipcRenderer.invoke("grok:pluginUpdate", name, cwd),
+  pluginDetails: (name: string, cwd?: string | null) => ipcRenderer.invoke("grok:pluginDetails", name, cwd),
+  pluginValidate: (targetPath?: string, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:pluginValidate", targetPath, cwd),
+  pluginTag: (input: unknown, cwd?: string | null) => ipcRenderer.invoke("grok:pluginTag", input, cwd),
+  marketplaceAdd: (url: string, force: boolean, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:marketplaceAdd", url, force, cwd),
   marketplaceRemove: (url: string, cwd?: string | null) =>
     ipcRenderer.invoke("grok:marketplaceRemove", url, cwd),
+  marketplaceUpdate: (source?: string, cwd?: string | null) =>
+    ipcRenderer.invoke("grok:marketplaceUpdate", source, cwd),
   availablePlugins: () => ipcRenderer.invoke("grok:availablePlugins"),
   trustProject: (cwd: string) => ipcRenderer.invoke("grok:trustProject", cwd),
   listAutomations: () => ipcRenderer.invoke("grok:listAutomations"),
@@ -160,8 +193,11 @@ contextBridge.exposeInMainWorld("grok", {
   deleteAutomation: (id: string) => ipcRenderer.invoke("grok:deleteAutomation", id),
   runAutomation: (id: string) => ipcRenderer.invoke("grok:runAutomation", id),
   addHook: (input: unknown, cwd?: string | null) => ipcRenderer.invoke("grok:addHook", input, cwd),
-  terminalStart: (cwd: string) => ipcRenderer.invoke("grok:terminalStart", cwd),
+  terminalStart: (cwd: string, cols?: number, rows?: number) =>
+    ipcRenderer.invoke("grok:terminalStart", cwd, cols, rows),
   terminalWrite: (text: string) => ipcRenderer.invoke("grok:terminalWrite", text),
+  terminalResize: (cols: number, rows: number) =>
+    ipcRenderer.invoke("grok:terminalResize", cols, rows),
   terminalKill: () => ipcRenderer.invoke("grok:terminalKill"),
   onTerminalData: (cb: (chunk: string) => void) => {
     const listener = (_event: unknown, chunk: string) => cb(chunk);

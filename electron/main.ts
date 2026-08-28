@@ -33,7 +33,10 @@ import {
   type GitWorktreeSnapshot,
 } from "./git";
 import {
+  addSkillSearchPath,
   loadSettings,
+  removeSkillSearchPath,
+  resetSkillConfig,
   sessionMeta,
   setDefaultModel,
   setDefaultReasoningEffort,
@@ -53,27 +56,55 @@ import {
   ensureUserHooksDir,
   ensureUserSkillsDir,
   listAvailablePlugins,
+  inspectGrok,
   marketplaceAdd,
   marketplaceRemove,
+  marketplaceUpdate,
   mcpAdd,
   mcpDisable,
   mcpDoctor,
+  mcpDoctorReport,
   mcpEnable,
   mcpRemove,
+  mapMcpCatalog,
+  mapRuntimeSkill,
+  mergeSkillCatalog,
   pluginDisable,
+  pluginDetails,
   pluginEnable,
   pluginInstall,
+  pluginTag,
   pluginUninstall,
+  pluginUpdate,
+  pluginValidate,
   trustProject,
   writeUserHook,
-  type McpAddInput,
 } from "./grok-cli";
+import { createSkillFile } from "./skills";
+import {
+  mcpAuthTriggerParams,
+  mcpAuthResultError,
+  mcpAuthenticationSettled,
+  mcpDeleteParams,
+  failedMcpStatus,
+  mcpRuntimeReady,
+  mcpRuntimeSettled,
+  mcpToggleParams,
+  mcpToggleToolParams,
+  mcpUpsertParams,
+  validateMcpAddInput,
+} from "./mcp-commands";
 import { ProjectTerminal } from "./terminal";
 import {
   extractModifiedFilePaths,
   type GitStatus,
+  type McpAddInput,
+  type McpServerInfo,
   type PermissionMode,
+  type PluginTagInput,
   type ReasoningEffort,
+  type SkillCatalog,
+  type SkillCreateInput,
 } from "./shared";
 import {
   FollowUpQueue,
@@ -124,8 +155,11 @@ import {
   testProxySettings,
 } from "./network-settings";
 import type { ProxySettings } from "./shared";
+import { ensurePluginRuntimePath, installPluginRuntimeDependency, pluginOwnsServer } from "./runtime-dependencies";
+import { installPluginTransaction } from "./plugin-installation";
 
 app.setName("Grok Build");
+ensurePluginRuntimePath();
 
 const acp = new GrokAcpClient();
 const loadedSessions = new Set<string>();
@@ -151,6 +185,174 @@ let proxyReconnectPromise: Promise<string> | null = null;
 
 function send(channel: string, payload: unknown) {
   mainWindow?.webContents.send(channel, payload);
+}
+
+function extensionUnsupported(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /method not found|unknown method|unsupported/i.test(message);
+}
+
+async function loadSkillCatalog(cwd?: string | null): Promise<SkillCatalog> {
+  const effectiveCwd = cwd?.trim() || process.cwd();
+  try {
+    const [raw, inspected] = await Promise.all([
+      acp.extensionRequest("x.ai/skills/config", { cwd: effectiveCwd }),
+      inspectGrok(effectiveCwd),
+    ]);
+    const data = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    const runtime = (Array.isArray(data.skills) ? data.skills : []).flatMap((item) => {
+      const skill = mapRuntimeSkill(item);
+      return skill ? [skill] : [];
+    });
+    return {
+      skills: mergeSkillCatalog(runtime, inspected.skills),
+      paths: Array.isArray(data.paths) ? data.paths.filter((value): value is string => typeof value === "string") : [],
+      ignore: Array.isArray(data.ignore) ? data.ignore.filter((value): value is string => typeof value === "string") : [],
+      message: typeof data.message === "string" ? data.message : "",
+    };
+  } catch (err) {
+    if (!extensionUnsupported(err)) log("skills catalog fallback", err instanceof Error ? err.message : String(err));
+    const settings = await loadSettings(cwd);
+    return { skills: settings.skills, paths: [], ignore: [], message: "当前 Grok CLI 使用兼容扫描模式" };
+  }
+}
+
+async function loadLiveMcpCatalog(sessionId?: string | null, cwd?: string | null, refresh = false) {
+  const settings = await loadSettings(cwd);
+  try {
+    const raw = await acp.extensionRequest("x.ai/mcp/list", {
+      ...(sessionId ? { sessionId } : {}),
+      cache: !refresh,
+    }, refresh ? 120_000 : 60_000);
+    return mapMcpCatalog(raw, settings.mcpServers);
+  } catch (err) {
+    if (!extensionUnsupported(err)) log("mcp catalog fallback", err instanceof Error ? err.message : String(err));
+    return settings.mcpServers;
+  }
+}
+
+async function restoreAgentSession(sessionId?: string | null, cwd?: string | null) {
+  loadedSessions.clear();
+  await acp.stop();
+  await acp.ensureStarted();
+  if (sessionId && cwd) {
+    await acp.loadSession(sessionId, cwd);
+    loadedSessions.add(sessionId);
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runtimeMcpCatalog(
+  sessionId: string,
+  cwd?: string | null,
+  fallback?: McpServerInfo[],
+): Promise<McpServerInfo[] | null> {
+  try {
+    const raw = await acp.extensionRequest("x.ai/mcp/list", { sessionId, cache: false }, 120_000);
+    return mapMcpCatalog(raw, fallback || (await loadSettings(cwd)).mcpServers);
+  } catch (err) {
+    if (extensionUnsupported(err)) return null;
+    throw err;
+  }
+}
+
+async function waitForRuntimeMcps(
+  sessionId: string,
+  expected: Array<Pick<McpServerInfo, "name">>,
+  cwd?: string | null,
+  waitForAuthentication = false,
+): Promise<McpServerInfo[] | null> {
+  const deadline = Date.now() + 30_000;
+  const fallback = (await loadSettings(cwd)).mcpServers;
+  let latest: McpServerInfo[] = [];
+  for (;;) {
+    const catalog = await runtimeMcpCatalog(sessionId, cwd, fallback);
+    if (catalog === null) return null;
+    latest = catalog;
+    const settled = expected.every((configured) => {
+      const server = catalog.find((item) => item.name === configured.name);
+      return waitForAuthentication ? mcpAuthenticationSettled(server) : mcpRuntimeSettled(server);
+    });
+    if (settled || Date.now() >= deadline) return latest;
+    await delay(750);
+  }
+}
+
+async function validateMcpsWithDoctor(expected: McpServerInfo[], cwd?: string | null): Promise<void> {
+  for (const configured of expected) {
+    const report = await mcpDoctorReport(configured.name, cwd);
+    const server = report.servers.find((item) => item.name === configured.name);
+    if (server?.healthy) continue;
+    const failedChecks = (server?.checks || [])
+      .filter((check) => !check.passed)
+      .map((check) => check.detail ? `${check.label}: ${check.detail}` : check.label);
+    const detail = failedChecks.length ? `：${failedChecks.join("；")}` : "";
+    throw new Error(`MCP ${configured.name} 健康检查失败${detail}`);
+  }
+}
+
+async function validateInstalledPluginMcps(
+  plugins: import("./shared").PluginInfo[],
+  settings: import("./shared").AppSettings,
+  sessionId?: string | null,
+  cwd?: string | null,
+) {
+  const expected = settings.mcpServers.filter((server) => plugins.some((plugin) => pluginOwnsServer(plugin, server)));
+  for (const plugin of plugins) {
+    if (plugin.mcpServers > 0 && !expected.some((server) => pluginOwnsServer(plugin, server))) {
+      throw new Error(`${plugin.name} 声明了 MCP，但 Grok 没有加载对应服务器`);
+    }
+  }
+  if (expected.length === 0) {
+    await restoreAgentSession(sessionId, cwd);
+    return;
+  }
+
+  const validationCwd = cwd?.trim() || process.cwd();
+  let temporarySessionId = "";
+  loadedSessions.clear();
+  await acp.stop();
+  await acp.ensureStarted();
+  try {
+    temporarySessionId = await acp.newSession(validationCwd, sessionMeta());
+    let catalog = await waitForRuntimeMcps(temporarySessionId, expected, cwd);
+    if (catalog === null) {
+      await validateMcpsWithDoctor(expected, cwd);
+      return;
+    }
+    for (const configured of expected) {
+      let server = catalog.find((item) => item.name === configured.name);
+      if (!server || !server.live) throw new Error(`MCP ${configured.name} 没有进入运行时会话`);
+      if (server.authRequired) {
+        const result = await acp.extensionRequest(
+          "x.ai/mcp/auth_trigger",
+          mcpAuthTriggerParams(temporarySessionId, server.name),
+          10 * 60_000,
+        );
+        const authError = mcpAuthResultError(result);
+        if (authError) throw new Error(`MCP ${server.name} 认证失败：${authError}`);
+        catalog = await waitForRuntimeMcps(temporarySessionId, [configured], cwd, true) || [];
+        server = catalog.find((item) => item.name === configured.name);
+      }
+      if (!server || !server.live) throw new Error(`MCP ${configured.name} 认证后没有连接`);
+      if (server.authRequired) throw new Error(`MCP ${configured.name} 认证未完成`);
+      if (server.setupRequired) throw new Error(`MCP ${configured.name} 仍需要初始化字段，无法完成自动安装`);
+      if (!server.enabled) throw new Error(`MCP ${configured.name} 未启用`);
+      if (failedMcpStatus(server.status || "")) throw new Error(`MCP ${configured.name} 启动失败：${server.status}`);
+      if (!mcpRuntimeReady(server)) throw new Error(`MCP ${configured.name} 初始化超时：${server.status || "状态未知"}`);
+    }
+  } finally {
+    await acp.stop();
+    if (temporarySessionId) removeThread(temporarySessionId, validationCwd);
+    await acp.ensureStarted();
+    if (sessionId && cwd) {
+      await acp.loadSession(sessionId, cwd);
+      loadedSessions.add(sessionId);
+    }
+  }
 }
 
 function setSessionRunning(sessionId: string, running: boolean) {
@@ -513,6 +715,7 @@ acp.on("update", (payload) => {
 acp.on("fileWrite", (payload: { sessionId: string; path: string }) => {
   recordTurnFile(payload.sessionId, payload.path);
 });
+acp.on("extension", (payload) => send("grok:extension-update", payload));
 acp.on("permission", (payload) => send("grok:permission", payload));
 acp.on("status", (payload) => {
   if (!payload.connected) {
@@ -1331,11 +1534,66 @@ ipcMain.handle("grok:setPermission", (_e, mode: PermissionMode) => {
   return loadSettings();
 });
 ipcMain.handle("grok:setSkillDisabled", async (_e, name: string, disabled: boolean, cwd?: string | null) => {
-  setSkillDisabled(name, disabled);
+  try {
+    await acp.extensionRequest("x.ai/skills/toggle", { name, enabled: !disabled, cwd: cwd?.trim() || process.cwd() });
+  } catch (err) {
+    if (!extensionUnsupported(err)) throw err;
+    setSkillDisabled(name, disabled);
+  }
   return loadSettings(cwd);
+});
+ipcMain.handle("grok:skillsCatalog", (_e, cwd?: string | null) => loadSkillCatalog(cwd));
+ipcMain.handle("grok:skillsSetEnabled", async (_e, name: string, enabled: boolean, cwd?: string | null) => {
+  try {
+    await acp.extensionRequest("x.ai/skills/toggle", { name, enabled, cwd: cwd?.trim() || process.cwd() });
+  } catch (err) {
+    if (!extensionUnsupported(err)) throw err;
+    setSkillDisabled(name, !enabled);
+  }
+  return loadSkillCatalog(cwd);
+});
+ipcMain.handle("grok:skillsAddPath", async (_e, skillPath: string, cwd?: string | null) => {
+  try {
+    await acp.extensionRequest("x.ai/skills/add", { path: skillPath, cwd: cwd?.trim() || process.cwd() });
+  } catch (err) {
+    if (!extensionUnsupported(err)) throw err;
+    addSkillSearchPath(skillPath);
+  }
+  return loadSkillCatalog(cwd);
+});
+ipcMain.handle("grok:skillsRemovePath", async (_e, skillPath: string, cwd?: string | null) => {
+  try {
+    await acp.extensionRequest("x.ai/skills/remove", { path: skillPath, cwd: cwd?.trim() || process.cwd() });
+  } catch (err) {
+    if (!extensionUnsupported(err)) throw err;
+    removeSkillSearchPath(skillPath);
+  }
+  return loadSkillCatalog(cwd);
+});
+ipcMain.handle("grok:skillsReset", async (_e, cwd?: string | null) => {
+  try {
+    await acp.extensionRequest("x.ai/skills/reset", { cwd: cwd?.trim() || process.cwd() });
+  } catch (err) {
+    if (!extensionUnsupported(err)) throw err;
+    resetSkillConfig();
+  }
+  return loadSkillCatalog(cwd);
+});
+ipcMain.handle("grok:skillsCreate", async (_e, input: SkillCreateInput, cwd?: string | null) => {
+  const projectRoot = input.scope === "project" && cwd ? await findGitRoot(cwd) || cwd : cwd;
+  const file = createSkillFile(input, projectRoot);
+  return { file, catalog: await loadSkillCatalog(cwd) };
 });
 ipcMain.handle("grok:openSkillsDir", async () => {
   const dir = ensureUserSkillsDir();
+  await shell.openPath(dir);
+  return dir;
+});
+ipcMain.handle("grok:openProjectSkillsDir", async (_e, cwd: string) => {
+  if (!cwd?.trim()) throw new Error("请先选择项目");
+  const root = await findGitRoot(cwd) || cwd;
+  const dir = path.join(root, ".grok", "skills");
+  fs.mkdirSync(dir, { recursive: true });
   await shell.openPath(dir);
   return dir;
 });
@@ -1344,30 +1602,103 @@ ipcMain.handle("grok:openHooksDir", async () => {
   await shell.openPath(dir);
   return dir;
 });
-ipcMain.handle("grok:mcpAdd", async (_e, input: McpAddInput, cwd?: string | null) => {
+ipcMain.handle("grok:mcpAdd", async (_e, input: McpAddInput, cwd?: string | null, sessionId?: string | null) => {
   try {
-    await mcpAdd(input, cwd);
+    const checked = validateMcpAddInput(input, cwd);
+    let addedLive = false;
+    if (sessionId && checked.scope === "user") {
+      try {
+        await acp.extensionRequest("x.ai/mcp/upsert", mcpUpsertParams(sessionId, checked), 120_000);
+        addedLive = true;
+      } catch (err) {
+        if (!extensionUnsupported(err)) throw err;
+      }
+    }
+    if (!addedLive) {
+      await mcpAdd(checked, cwd);
+      if (sessionId) {
+        try {
+          await acp.extensionRequest("x.ai/mcp/toggle", mcpToggleParams(sessionId, checked.name, true), 120_000);
+        } catch (err) {
+          if (!extensionUnsupported(err)) throw err;
+        }
+      }
+    }
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:mcpCatalog", (_e, sessionId?: string | null, cwd?: string | null, refresh?: boolean) =>
+  loadLiveMcpCatalog(sessionId, cwd, Boolean(refresh)));
+ipcMain.handle("grok:mcpRemove", async (_e, name: string, scope: "user" | "project" | undefined, cwd?: string | null, sessionId?: string | null) => {
+  try {
+    let deletedLive = false;
+    if (sessionId && scope !== "project") {
+      try {
+        await acp.extensionRequest("x.ai/mcp/delete", mcpDeleteParams(sessionId, name), 120_000);
+        deletedLive = true;
+      } catch (err) {
+        if (!extensionUnsupported(err)) throw err;
+      }
+    }
+    if (!deletedLive) {
+      await mcpRemove(name, scope, cwd);
+      if (sessionId) {
+        try {
+          await acp.extensionRequest("x.ai/mcp/toggle", mcpToggleParams(sessionId, name, false), 120_000);
+        } catch (err) {
+          if (!extensionUnsupported(err)) throw err;
+        }
+      }
+    }
     return await loadSettings(cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
   }
 });
-ipcMain.handle("grok:mcpRemove", async (_e, name: string, scope: "user" | "project" | undefined, cwd?: string | null) => {
+ipcMain.handle("grok:mcpSetEnabled", async (_e, name: string, enabled: boolean, cwd?: string | null, sessionId?: string | null) => {
   try {
-    await mcpRemove(name, scope, cwd);
-    return await loadSettings(cwd);
-  } catch (err) {
-    throw new Error(err instanceof GrokCliError ? err.message : String(err));
-  }
-});
-ipcMain.handle("grok:mcpSetEnabled", async (_e, name: string, enabled: boolean, cwd?: string | null) => {
-  try {
-    if (enabled) await mcpEnable(name, cwd);
+    if (sessionId) {
+      try {
+        await acp.extensionRequest("x.ai/mcp/toggle", mcpToggleParams(sessionId, name, enabled), 120_000);
+      } catch (err) {
+        if (!extensionUnsupported(err)) throw err;
+        if (enabled) await mcpEnable(name, cwd);
+        else await mcpDisable(name, cwd);
+      }
+    } else if (enabled) await mcpEnable(name, cwd);
     else await mcpDisable(name, cwd);
     return await loadSettings(cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
   }
+});
+ipcMain.handle("grok:mcpSetToolEnabled", async (_e, sessionId: string, name: string, tool: string, enabled: boolean, cwd?: string | null) => {
+  if (!sessionId) throw new Error("按工具开关需要一个已打开的会话");
+  await acp.extensionRequest("x.ai/mcp/toggle_tool", mcpToggleToolParams(sessionId, name, tool, enabled));
+  return loadLiveMcpCatalog(sessionId, cwd, false);
+});
+ipcMain.handle("grok:mcpAuthenticate", async (_e, sessionId: string, name: string, cwd?: string | null) => {
+  if (!sessionId) throw new Error("OAuth 认证需要一个已打开的会话");
+  const result = await acp.extensionRequest("x.ai/mcp/auth_trigger", mcpAuthTriggerParams(sessionId, name), 10 * 60_000);
+  const authError = mcpAuthResultError(result);
+  if (authError) throw new Error(authError);
+  const servers = await waitForRuntimeMcps(sessionId, [{ name }], cwd, true)
+    || await loadLiveMcpCatalog(sessionId, cwd, true);
+  const server = servers.find((item) => item.name === name);
+  if (!server) throw new Error(`认证完成后没有找到 MCP：${name}`);
+  if (server.authRequired) throw new Error(`MCP ${name} 认证未完成，请重试`);
+  if (server.setupRequired) return { result, servers };
+  if (!mcpRuntimeReady(server)) {
+    throw new Error(`MCP ${name} 认证后未能连接：${server.status || "状态未知"}`);
+  }
+  return { result, servers };
+});
+ipcMain.handle("grok:mcpSetup", async (_e, sessionId: string, name: string, values: Record<string, string>, cwd?: string | null) => {
+  if (!sessionId) throw new Error("MCP 配置需要一个已打开的会话");
+  await acp.extensionRequest("x.ai/mcp/setup", { sessionId, serverName: name, values }, 120_000);
+  return loadLiveMcpCatalog(sessionId, cwd, true);
 });
 ipcMain.handle("grok:mcpDoctor", async (_e, name?: string, cwd?: string | null) => {
   try {
@@ -1385,26 +1716,69 @@ ipcMain.handle("grok:pluginSetEnabled", async (_e, name: string, enabled: boolea
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
   }
 });
-ipcMain.handle("grok:pluginInstall", async (_e, source: string, trust: boolean, cwd?: string | null) => {
+ipcMain.handle("grok:pluginInstall", async (_e, source: string, trust: boolean, cwd?: string | null, sessionId?: string | null) => {
   try {
-    await pluginInstall(source, trust, cwd);
+    return await installPluginTransaction({
+      install: () => pluginInstall(source, trust, cwd),
+      uninstall: (name) => pluginUninstall(name, false, cwd),
+      loadSettings: () => loadSettings(cwd),
+      installDependency: (command) => installPluginRuntimeDependency(command),
+      validate: (plugins, settings) => validateInstalledPluginMcps(plugins, settings, sessionId, cwd),
+      restoreAfterRollback: () => restoreAgentSession(sessionId, cwd),
+    });
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginUninstall", async (_e, name: string, keepData: boolean, cwd?: string | null) => {
+  try {
+    await pluginUninstall(name, keepData, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginInstallDependency", async (_e, command: string) => {
+  try {
+    const result = await installPluginRuntimeDependency(command);
+    return { ...result, restartRequired: true };
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginUpdate", async (_e, name?: string, cwd?: string | null) => {
+  try {
+    await pluginUpdate(name, cwd);
     return await loadSettings(cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
   }
 });
-ipcMain.handle("grok:pluginUninstall", async (_e, name: string, cwd?: string | null) => {
+ipcMain.handle("grok:pluginDetails", async (_e, name: string, cwd?: string | null) => {
   try {
-    await pluginUninstall(name, cwd);
-    return await loadSettings(cwd);
+    return await pluginDetails(name, cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
   }
 });
-ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, cwd?: string | null) => {
+ipcMain.handle("grok:pluginValidate", async (_e, targetPath?: string, cwd?: string | null) => {
+  try {
+    return await pluginValidate(targetPath, cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:pluginTag", async (_e, input: PluginTagInput, cwd?: string | null) => {
+  try {
+    return await pluginTag(input, cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, force: boolean, cwd?: string | null) => {
   try {
     await applyStoredProxySettings("https://github.com");
-    await marketplaceAdd(url, cwd);
+    await marketplaceAdd(url, cwd, force);
     return await loadSettings(cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
@@ -1413,6 +1787,15 @@ ipcMain.handle("grok:marketplaceAdd", async (_e, url: string, cwd?: string | nul
 ipcMain.handle("grok:marketplaceRemove", async (_e, url: string, cwd?: string | null) => {
   try {
     await marketplaceRemove(url, cwd);
+    return await loadSettings(cwd);
+  } catch (err) {
+    throw new Error(err instanceof GrokCliError ? err.message : String(err));
+  }
+});
+ipcMain.handle("grok:marketplaceUpdate", async (_e, source?: string, cwd?: string | null) => {
+  try {
+    await applyStoredProxySettings("https://github.com");
+    await marketplaceUpdate(source, cwd);
     return await loadSettings(cwd);
   } catch (err) {
     throw new Error(err instanceof GrokCliError ? err.message : String(err));
@@ -1459,11 +1842,14 @@ ipcMain.handle("grok:addHook", async (_e, input: { name: string; event: string; 
   writeUserHook(input);
   return loadSettings(cwd);
 });
-ipcMain.handle("grok:terminalStart", (_e, cwd: string) => {
-  terminal.start(cwd);
+ipcMain.handle("grok:terminalStart", (_e, cwd: string, cols?: number, rows?: number) => {
+  terminal.start(cwd, cols, rows);
   return { cwd };
 });
 ipcMain.handle("grok:terminalWrite", (_e, text: string) => terminal.write(text));
+ipcMain.handle("grok:terminalResize", (_e, cols: number, rows: number) =>
+  terminal.resize(cols, rows),
+);
 ipcMain.handle("grok:terminalKill", () => terminal.kill());
 
 ipcMain.handle("grok:window", (_e, action: "min" | "max" | "close") => {

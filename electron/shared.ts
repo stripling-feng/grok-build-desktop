@@ -155,17 +155,83 @@ export type PermissionMode = "ask" | "auto" | "always-approve";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export type SkillInfo = {
+  id: string;
   name: string;
+  displayName?: string;
   description: string;
   source: string;
+  scope?: string;
   path: string;
   disabled: boolean;
   userInvocable?: boolean;
   invocableAs?: string;
+  collidesWith?: string;
+  whenToUse?: string;
+  shortDescription?: string;
+  author?: string;
+  argumentHint?: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, string>;
+  allowedTools?: string[];
+  model?: string;
+  effort?: string;
+  disableModelInvocation?: boolean;
+  pluginName?: string;
+  pluginVersion?: string;
+  paths?: string[];
+};
+
+export type SkillCatalog = {
+  skills: SkillInfo[];
+  paths: string[];
+  ignore: string[];
+  message: string;
+};
+
+export type SkillCreateInput = {
+  name: string;
+  description: string;
+  scope: "user" | "project";
+  body: string;
+  whenToUse?: string;
+  argumentHint?: string;
+  allowedTools?: string[];
+  userInvocable?: boolean;
+  disableModelInvocation?: boolean;
+  author?: string;
+  shortDescription?: string;
+  license?: string;
+  compatibility?: string;
+  model?: string;
+  effort?: string;
+};
+
+export type McpToolInfo = {
+  name: string;
+  displayName?: string;
+  description?: string;
+  enabled: boolean;
+};
+
+export type McpSetupOption = { label: string; value: string };
+
+export type McpSetupField = {
+  id: string;
+  label: string;
+  type: string;
+  required: boolean;
+  default?: string;
+  options: McpSetupOption[];
+};
+
+export type McpSetupConfig = {
+  fields: McpSetupField[];
 };
 
 export type McpServerInfo = {
   name: string;
+  displayName?: string;
   transport: "stdio" | "http" | "sse" | string;
   target: string;
   source: string;
@@ -174,10 +240,40 @@ export type McpServerInfo = {
   enabled: boolean;
   status: string;
   native: boolean;
+  live?: boolean;
+  toolCount?: number;
+  tools?: McpToolInfo[];
+  authRequired?: boolean;
+  setupRequired?: boolean;
+  setup?: McpSetupConfig;
+  setupValues?: Record<string, string>;
+  args?: string[];
+  env?: { name: string; value: string }[];
+};
+
+export type McpAddInput = {
+  name: string;
+  transport: "stdio" | "http" | "sse";
+  scope: "user" | "project";
+  commandOrUrl: string;
+  args?: string[];
+  env?: string[];
+  headers?: string[];
+  serverCwd?: string;
+  bearerTokenEnvVar?: string;
+  oauthClientId?: string;
+  oauthClientSecretEnvVar?: string;
+  oauthScopes?: string[];
+  startupTimeoutSec?: number;
+  toolTimeoutSec?: number;
+  toolTimeouts?: Record<string, number>;
+  exposeImageBase64?: boolean;
 };
 
 export type PluginInfo = {
   name: string;
+  version?: string;
+  description?: string;
   scope: string;
   path: string;
   enabled: boolean;
@@ -185,6 +281,18 @@ export type PluginInfo = {
   agents: number;
   hooks: boolean;
   mcpServers: number;
+  commands: number;
+  lspServers: number;
+  dependencies?: PluginDependencyInfo[];
+};
+
+export type PluginDependencyInfo = {
+  command: string;
+  available: boolean;
+  requiredBy: string[];
+  packageName?: string;
+  installLabel?: string;
+  installable: boolean;
 };
 
 export type MarketplaceInfo = {
@@ -204,6 +312,15 @@ export type AvailablePluginInfo = {
   hasHooks: boolean;
   hasAgents: boolean;
   hasMcp: boolean;
+  commandCount: number;
+  hasLsp: boolean;
+};
+
+export type PluginTagInput = {
+  path?: string;
+  push: boolean;
+  force: boolean;
+  dryRun: boolean;
 };
 
 export type HookInfo = {

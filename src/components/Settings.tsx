@@ -3,12 +3,16 @@ import type {
   AppSettings,
   AppUpdateInfo,
   AvailablePluginInfo,
+  McpServerInfo,
   PermissionMode,
   ProxyMode,
   ProxySettings,
   ProxyTestResult,
   ReasoningEffort,
+  SkillCatalog,
+  SkillCreateInput,
 } from "../../electron/shared";
+import { parseMcpArguments, parseMcpLines, parseMcpToolTimeouts } from "../../electron/mcp-commands";
 import { Markdown } from "../lib/markdown";
 
 const MODES: { id: PermissionMode; label: string; hint: string }[] = [
@@ -112,17 +116,14 @@ export function Settings({
   return (
     <div className="settings-overlay" role="dialog" aria-label="设置">
       <header className="settings-top">
-        <div className="settings-top-title">
-          <span className="settings-top-icon" aria-hidden>
-            <SettingsPaneIcon pane="general" />
-          </span>
-          <strong>设置</strong>
-        </div>
         <button className="settings-close" type="button" aria-label="关闭设置" title="关闭" onClick={onClose}>
           <svg viewBox="0 0 16 16" aria-hidden>
             <path d="m4.1 4.1 7.8 7.8M11.9 4.1l-7.8 7.8" fill="none" stroke="currentColor" strokeWidth="1.45" strokeLinecap="round" />
           </svg>
         </button>
+        <div className="settings-top-title">
+          <strong>设置</strong>
+        </div>
       </header>
       <div className="settings-shell">
         <nav className="settings-nav" aria-label="设置分类">
@@ -570,22 +571,33 @@ function AboutPane() {
 
 export function SkillsTab({
   settings,
+  catalog,
   cwd,
-  onChange,
+  onCatalog,
+  onRefresh,
+  onCreate,
   run,
 }: {
   settings: AppSettings;
+  catalog: SkillCatalog | null;
   cwd?: string | null;
-  onChange: (next: AppSettings) => void;
+  onCatalog: (next: SkillCatalog) => void;
+  onRefresh: () => void;
+  onCreate: () => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
+  const skills = catalog?.skills ?? settings.skills;
+  const bridgeReady = typeof window === "undefined" || typeof window.grok.skillsCatalog === "function";
+  const projectDirReady = typeof window === "undefined" || typeof window.grok.openProjectSkillsDir === "function";
   return (
     <section className="settings-section">
       <h3>Skills</h3>
       <p className="settings-hint">
-        扫描本地 SKILL.md，并与 grok inspect 对齐。关闭后写入 [skills] disabled，不删文件。新会话生效。
+        来自 Grok 原生 Skills 目录，包括项目、用户、插件、内置、Claude、Cursor 与额外路径。同名技能保留限定调用名。
       </p>
       <div className="settings-actions">
+        <button className="btn primary" type="button" disabled={!bridgeReady} onClick={onCreate}>创建 Skill</button>
+        <button className="btn" type="button" onClick={onRefresh}>刷新</button>
         <button
           className="btn"
           type="button"
@@ -593,18 +605,87 @@ export function SkillsTab({
         >
           打开 ~/.grok/skills
         </button>
+        {cwd ? (
+          <button className="btn" type="button" disabled={!projectDirReady} onClick={() => void run("打开项目 Skills", () => window.grok.openProjectSkillsDir(cwd))}>
+            打开项目 Skills
+          </button>
+        ) : null}
+        <button
+          className="btn"
+          type="button"
+          disabled={!bridgeReady}
+          onClick={() => void run("添加 Skills 路径", async () => {
+            const paths = await window.grok.pickFolder();
+            if (!paths[0]) return catalog ?? { skills, paths: [], ignore: [], message: "" };
+            const next = await window.grok.skillsAddPath(paths[0], cwd);
+            onCatalog(next);
+            return next;
+          })}
+        >
+          添加目录
+        </button>
+        <button
+          className="btn ghost"
+          type="button"
+          disabled={!bridgeReady}
+          onClick={() => {
+            if (!window.confirm("重置自定义 Skills 路径、忽略项和禁用状态？磁盘中的 SKILL.md 不会被删除。")) return;
+            void run("重置 Skills", () => window.grok.skillsReset(cwd).then((next) => {
+              onCatalog(next);
+              return next;
+            }));
+          }}
+        >重置配置</button>
       </div>
-      {settings.skills.length === 0 ? (
+      {catalog?.paths.length ? (
+        <div className="extension-config-block">
+          <strong>额外搜索路径</strong>
+          {catalog.paths.map((skillPath) => (
+            <div className="extension-config-row" key={skillPath}>
+              <code>{skillPath}</code>
+              <button
+                className="btn small ghost"
+                type="button"
+                onClick={() => {
+                  if (!window.confirm(`移除 Skills 搜索路径？\n${skillPath}\n不会删除磁盘文件。`)) return;
+                  void run("移除 Skills 路径", () => window.grok.skillsRemovePath(skillPath, cwd).then((next) => {
+                    onCatalog(next);
+                    return next;
+                  }));
+                }}
+              >移除</button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {catalog?.ignore.length ? <p className="settings-hint">忽略路径：{catalog.ignore.join("、")}</p> : null}
+      {skills.length === 0 ? (
         <p className="settings-hint">还没有 Skills。把带 SKILL.md 的目录放到 ~/.grok/skills/ 或项目的 .grok/skills/。</p>
       ) : (
         <ul className="skill-list">
-          {settings.skills.map((skill) => (
-            <li key={`${skill.source}:${skill.path || skill.name}`}>
+          {skills.map((skill) => (
+            <li key={skill.id}>
               <div>
-                <strong>{skill.name}</strong>
+                <strong>{skill.displayName || skill.name}</strong>
                 <span className="skill-src">{skill.source}</span>
                 {skill.invocableAs ? <span className="skill-src">{skill.invocableAs}</span> : null}
-                {skill.description ? <p>{skill.description}</p> : null}
+                {skill.pluginVersion ? <span className="skill-src">v{skill.pluginVersion}</span> : null}
+                {skill.collidesWith ? <span className="skill-src warn">同名：/{skill.collidesWith}</span> : null}
+                {skill.userInvocable === false ? <span className="skill-src">仅模型</span> : null}
+                {skill.disableModelInvocation ? <span className="skill-src">仅手动</span> : null}
+                {skill.shortDescription || skill.description ? <p>{skill.shortDescription || skill.description}</p> : null}
+                {(skill.whenToUse || skill.argumentHint || skill.author || skill.allowedTools?.length || skill.compatibility) ? (
+                  <details className="extension-details">
+                    <summary>完整信息</summary>
+                    {skill.description && skill.shortDescription ? <p>{skill.description}</p> : null}
+                    {skill.whenToUse ? <p><b>触发：</b>{skill.whenToUse}</p> : null}
+                    {skill.argumentHint ? <p><b>参数：</b>{skill.argumentHint}</p> : null}
+                    {skill.author ? <p><b>作者：</b>{skill.author}</p> : null}
+                    {skill.allowedTools?.length ? <p><b>工具：</b>{skill.allowedTools.join("、")}</p> : null}
+                    {skill.compatibility ? <p><b>环境：</b>{skill.compatibility}</p> : null}
+                    {skill.license ? <p><b>许可：</b>{skill.license}</p> : null}
+                  </details>
+                ) : null}
               </div>
               <div className="row-actions">
                 {skill.path ? (
@@ -621,7 +702,23 @@ export function SkillsTab({
                     type="checkbox"
                     checked={!skill.disabled}
                     onChange={(e) => {
-                      void window.grok.setSkillDisabled(skill.name, !e.target.checked, cwd).then(onChange);
+                      const enabled = e.target.checked;
+                      void run("更新 Skill", async () => {
+                        if (typeof window.grok.skillsSetEnabled === "function") {
+                          const next = await window.grok.skillsSetEnabled(skill.name, enabled, cwd);
+                          onCatalog(next);
+                          return next;
+                        }
+                        const next = await window.grok.setSkillDisabled(skill.name, !enabled, cwd);
+                        const fallback = {
+                          skills: next.skills,
+                          paths: catalog?.paths ?? [],
+                          ignore: catalog?.ignore ?? [],
+                          message: "兼容模式",
+                        };
+                        onCatalog(fallback);
+                        return fallback;
+                      });
                     }}
                   />
                   {skill.disabled ? "已关闭" : "启用"}
@@ -637,28 +734,50 @@ export function SkillsTab({
 
 export function McpTab({
   settings,
+  servers,
   cwd,
+  sessionId,
   doctor,
   onDoctor,
   onOpenAdd,
+  onRefresh,
+  onSetup,
+  onServers,
   onChange,
   run,
 }: {
   settings: AppSettings;
+  servers: McpServerInfo[];
   cwd?: string | null;
+  sessionId?: string | null;
   doctor: string;
   onDoctor: (text: string) => void;
   onOpenAdd: () => void;
+  onRefresh: () => void;
+  onSetup: (server: McpServerInfo) => void;
+  onServers: (servers: McpServerInfo[]) => void;
   onChange: (next: AppSettings) => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
+  async function refreshAfterSettings(next: AppSettings) {
+    onChange(next);
+    if (typeof window.grok.mcpCatalog !== "function") {
+      onServers(next.mcpServers);
+      return next.mcpServers;
+    }
+    const rows = await window.grok.mcpCatalog(sessionId, cwd, true);
+    onServers(rows);
+    return rows;
+  }
+
   return (
     <section className="settings-section">
       <h3>MCP</h3>
       <p className="settings-hint">
-        列表来自 grok inspect（含 Claude / Cursor 兼容源）。添加、删除走 grok mcp，写入 config.toml。空的
-        ACP mcpServers 表示沿用这些磁盘配置。新会话生效。
+        同时读取磁盘配置和当前 Grok 会话。可管理服务器、OAuth、初始化字段、单个工具开关与超时配置；
+        Claude / Cursor 兼容源也会列出。
       </p>
+      {!sessionId ? <p className="settings-hint">打开一个对话后可判断实时认证状态并管理单个工具。</p> : null}
       {settings.inspectError ? <p className="settings-error">{settings.inspectError}</p> : null}
       {!settings.projectTrusted && cwd ? (
         <div className="settings-banner">
@@ -673,9 +792,10 @@ export function McpTab({
         </div>
       ) : null}
       <div className="settings-actions">
-        <button className="btn" type="button" onClick={onOpenAdd}>
+        <button className="btn primary" type="button" onClick={onOpenAdd}>
           添加服务器
         </button>
+        <button className="btn" type="button" onClick={onRefresh}>刷新</button>
         <button
           className="btn"
           type="button"
@@ -690,19 +810,83 @@ export function McpTab({
           诊断全部
         </button>
       </div>
-      {settings.mcpServers.length === 0 ? (
+      {servers.length === 0 ? (
         <p className="settings-hint">还没有发现 MCP 服务器。可用 stdio 命令或 HTTP 地址添加。</p>
       ) : (
         <ul className="skill-list">
-          {settings.mcpServers.map((server) => (
+          {servers.map((server) => (
             <li key={`${server.source}:${server.name}`}>
-              <div>
+              <div className="extension-main">
                 <strong>{server.name}</strong>
                 <span className="skill-src">{server.source}</span>
                 <span className="skill-src">{server.transport}</span>
+                <span className={`skill-src ${server.status && !/connected|ready|enabled|configured/i.test(server.status) ? "warn" : ""}`}>
+                  {server.status || (server.enabled ? "configured" : "disabled")}
+                </span>
+                {server.live ? <span className="skill-src live">实时</span> : null}
+                {server.toolCount !== undefined ? <span className="skill-src">{server.toolCount} 个工具</span> : null}
+                {server.authRequired ? <span className="skill-src warn">需要认证</span> : null}
+                {server.setupRequired ? <span className="skill-src warn">需要初始化</span> : null}
                 {server.target ? <p>{server.target}</p> : null}
+                {server.tools?.length ? (
+                  <details className="extension-details mcp-tools">
+                    <summary>工具 ({server.tools.length})</summary>
+                    <div className="extension-tool-list">
+                      {server.tools.map((tool) => (
+                        <div className="extension-tool-row" key={tool.name}>
+                          <div>
+                            <strong>{tool.displayName || tool.name}</strong>
+                            {tool.description ? <p>{tool.description}</p> : null}
+                          </div>
+                          <label className="toggle">
+                            <input
+                              type="checkbox"
+                              checked={tool.enabled}
+                              disabled={!sessionId}
+                              onChange={(event) => {
+                                if (!sessionId) return;
+                                void run("更新 MCP 工具", async () => {
+                                  const rows = await window.grok.mcpSetToolEnabled(
+                                    sessionId,
+                                    server.name,
+                                    tool.name,
+                                    event.target.checked,
+                                    cwd,
+                                  );
+                                  onServers(rows);
+                                  return rows;
+                                });
+                              }}
+                            />
+                            {tool.enabled ? "启用" : "关闭"}
+                          </label>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
               </div>
-              <div className="row-actions">
+              <div className="row-actions plugin-row-actions">
+                {server.authRequired ? (
+                  <button
+                    className="btn small"
+                    type="button"
+                    disabled={!sessionId || !server.enabled}
+                    title={!sessionId ? "请先打开一个对话，再进行 MCP 认证" : undefined}
+                    onClick={() => void run("MCP 认证", async () => {
+                      if (!sessionId) throw new Error("请先打开一个对话，再进行 MCP 认证");
+                      const result = await window.grok.mcpAuthenticate(sessionId, server.name, cwd);
+                      onServers(result.servers);
+                      return result;
+                    })}
+                  >认证</button>
+                ) : null}
+                {server.setupRequired && server.setup?.fields.length && sessionId ? (
+                  <button className="btn small" type="button" onClick={() => onSetup(server)}>初始化</button>
+                ) : null}
+                {server.path ? (
+                  <button className="btn small ghost" type="button" onClick={() => void window.grok.openPath(server.path)}>打开配置</button>
+                ) : null}
                 <button
                   className="btn small ghost"
                   type="button"
@@ -720,13 +904,19 @@ export function McpTab({
                   <button
                     className="btn small ghost"
                     type="button"
-                    onClick={() =>
-                      void run("删除", () =>
-                        window.grok
-                          .mcpRemove(server.name, server.source === "项目" ? "project" : "user", cwd)
-                          .then(onChange),
-                      )
-                    }
+                    onClick={() => {
+                      if (!window.confirm(`删除 MCP 服务器“${server.name}”？`)) return;
+                      const projectSource = /项目|project|仓库/i.test(server.source);
+                      void run("删除", async () => {
+                        const next = await window.grok.mcpRemove(
+                          server.name,
+                          projectSource ? "project" : "user",
+                          cwd,
+                          sessionId,
+                        );
+                        return refreshAfterSettings(next);
+                      });
+                    }}
                   >
                     删除
                   </button>
@@ -736,9 +926,10 @@ export function McpTab({
                     type="checkbox"
                     checked={server.enabled}
                     onChange={(e) => {
-                      void run("更新 MCP", () =>
-                        window.grok.mcpSetEnabled(server.name, e.target.checked, cwd).then(onChange),
-                      );
+                      void run("更新 MCP", async () => {
+                        const next = await window.grok.mcpSetEnabled(server.name, e.target.checked, cwd, sessionId);
+                        return refreshAfterSettings(next);
+                      });
                     }}
                   />
                   {server.enabled ? "启用" : "已关闭"}
@@ -753,149 +944,326 @@ export function McpTab({
   );
 }
 
+function PluginTileIcon() {
+  return (
+    <span className="plugin-tile-icon" aria-hidden>
+      <svg viewBox="0 0 24 24">
+        <path d="m12 3 8 4.5-8 4.5-8-4.5L12 3Z" />
+        <path d="M4 7.5v9L12 21l8-4.5v-9M12 12v9" />
+      </svg>
+    </span>
+  );
+}
+
 export function PluginsTab({
   settings,
   cwd,
+  sessionId,
   available,
   loading,
   onRefresh,
   onMarket,
+  onInstall,
+  onUninstall,
   onChange,
   run,
 }: {
   settings: AppSettings;
   cwd?: string | null;
+  sessionId?: string | null;
   available: AvailablePluginInfo[] | null;
   loading: boolean;
   onRefresh: () => void | Promise<void>;
   onMarket: () => void;
+  onInstall: () => void;
+  onUninstall: (name: string) => void;
   onChange: (next: AppSettings) => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
+  const [selectedMarketplace, setSelectedMarketplace] = useState("all");
+  const [installingPlugin, setInstallingPlugin] = useState("");
+  const [installingDependency, setInstallingDependency] = useState("");
+  const [installedDependencies, setInstalledDependencies] = useState<Set<string>>(() => new Set());
+  const marketplaceTabs = Array.from(new Set([
+    ...settings.marketplaces.map((item) => item.name),
+    ...(available || []).map((item) => item.marketplace),
+  ].filter(Boolean)));
+  const selectedSource = selectedMarketplace === "all"
+    ? null
+    : settings.marketplaces.find((item) => item.name === selectedMarketplace) || null;
+  const visiblePlugins = (available || []).filter((item) =>
+    selectedMarketplace === "all" || item.marketplace === selectedMarketplace,
+  );
+
+  useEffect(() => {
+    if (selectedMarketplace !== "all" && !marketplaceTabs.includes(selectedMarketplace)) {
+      setSelectedMarketplace("all");
+    }
+  }, [selectedMarketplace, marketplaceTabs.join("\u0000")]);
+
+  async function installMarketplacePlugin(item: AvailablePluginInfo) {
+    if (installingPlugin) return;
+    setInstallingPlugin(item.name);
+    try {
+      const next = await run(`安装并验证 ${item.name}`, () => window.grok.pluginInstall(item.name, true, cwd, sessionId));
+      if (next) onChange(next);
+    } finally {
+      setInstallingPlugin("");
+    }
+  }
+
+  async function installDependency(pluginName: string, command: string) {
+    const key = `${pluginName}:${command}`;
+    if (installingDependency) return;
+    setInstallingDependency(key);
+    try {
+      const result = await run(`安装 ${command} 运行环境`, () => window.grok.pluginInstallDependency(command));
+      if (result) setInstalledDependencies((current) => new Set(current).add(key));
+    } finally {
+      setInstallingDependency("");
+    }
+  }
+
   return (
     <>
       <section className="settings-section">
-        <h3>已安装</h3>
-        <p className="settings-hint">安装和开关走 grok plugin。项目插件需要信任文件夹后才会加载 MCP / Hooks。</p>
-        <div className="settings-actions">
-          <button className="btn" type="button" onClick={onMarket}>
-            添加市场源
-          </button>
+        <div className="plugin-section-head">
+          <div>
+            <h3>市场源</h3>
+            <p className="settings-hint">更新会重新同步远程仓库；Windows 兼容镜像也会重新生成。</p>
+          </div>
+          <div className="row-actions">
+            <button className="btn small" type="button" onClick={onMarket}>
+              添加市场源
+            </button>
+            <button
+              className="btn small ghost"
+              type="button"
+              disabled={settings.marketplaces.length === 0}
+              onClick={() =>
+                void run("更新全部市场源", () =>
+                  window.grok.marketplaceUpdate(undefined, cwd).then(async (next) => {
+                    onChange(next);
+                    await onRefresh();
+                    return next;
+                  }),
+                )
+              }
+            >
+              更新全部源
+            </button>
+          </div>
         </div>
-        {settings.plugins.length === 0 ? (
-          <p className="settings-hint">还没有已安装插件。</p>
-        ) : (
-          <ul className="skill-list">
-            {settings.plugins.map((plugin) => (
-              <li key={`${plugin.scope}:${plugin.name}`}>
-                <div>
-                  <strong>{plugin.name}</strong>
-                  <span className="skill-src">{plugin.scope}</span>
-                  <p>
-                    skills {plugin.skills} · agents {plugin.agents}
-                    {plugin.hooks ? " · hooks" : ""}
-                    {plugin.mcpServers ? ` · mcp ${plugin.mcpServers}` : ""}
-                  </p>
-                </div>
-                <div className="row-actions">
-                  <button
-                    className="btn small ghost"
-                    type="button"
-                    onClick={() =>
-                      void run("卸载", () => window.grok.pluginUninstall(plugin.name, cwd).then(onChange))
-                    }
-                  >
-                    卸载
-                  </button>
-                  <label className="toggle">
-                    <input
-                      type="checkbox"
-                      checked={plugin.enabled}
-                      onChange={(e) => {
-                        void run("更新插件", () =>
-                          window.grok.pluginSetEnabled(plugin.name, e.target.checked, cwd).then(onChange),
-                        );
-                      }}
-                    />
-                    {plugin.enabled ? "启用" : "已关闭"}
-                  </label>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-      <section className="settings-section">
-        <h3>市场源</h3>
         {settings.marketplaces.length === 0 ? (
           <p className="settings-hint">还没有市场源。可添加 GitHub 仓库、Git URL 或本地目录。</p>
         ) : (
-          <ul className="skill-list">
-            {settings.marketplaces.map((item) => (
-              <li key={item.url || item.name}>
+          <>
+            <div className="market-source-tabs" role="tablist" aria-label="市场源">
+              <button
+                className={selectedMarketplace === "all" ? "on" : ""}
+                type="button"
+                role="tab"
+                aria-selected={selectedMarketplace === "all"}
+                onClick={() => setSelectedMarketplace("all")}
+              >
+                <strong>全部</strong>
+                <span>{available?.length || 0}</span>
+              </button>
+              {marketplaceTabs.map((name) => (
+                <button
+                  className={selectedMarketplace === name ? "on" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={selectedMarketplace === name}
+                  title={name}
+                  key={name}
+                  onClick={() => setSelectedMarketplace(name)}
+                >
+                  <strong>{name}</strong>
+                  <span>{(available || []).filter((item) => item.marketplace === name).length}</span>
+                </button>
+              ))}
+            </div>
+            {selectedSource ? (
+              <div className="market-source-detail" role="tabpanel">
                 <div>
-                  <strong>{item.name}</strong>
-                  <span className="skill-src">{item.kind}</span>
-                  {item.url ? <p>{item.url}</p> : null}
+                  <strong>{selectedSource.name}</strong>
+                  <span>{selectedSource.kind}</span>
+                  {selectedSource.url ? <p>{selectedSource.url}</p> : null}
                 </div>
-                {item.url ? (
-                  <button
-                    className="btn small ghost"
-                    type="button"
-                    onClick={() =>
-                      void run("移除市场", () =>
-                        window.grok.marketplaceRemove(item.url, cwd).then(async (next) => {
-                          onChange(next);
-                          await onRefresh();
-                          return next;
-                        }),
-                      )
-                    }
-                  >
-                    移除
-                  </button>
+                {selectedSource.url ? (
+                  <div className="row-actions">
+                    <button
+                      className="btn small ghost"
+                      type="button"
+                      onClick={() =>
+                        void run("更新市场源", () =>
+                          window.grok.marketplaceUpdate(selectedSource.name, cwd).then(async (next) => {
+                            onChange(next);
+                            await onRefresh();
+                            return next;
+                          }),
+                        )
+                      }
+                    >
+                      更新当前源
+                    </button>
+                    <button
+                      className="btn small ghost danger"
+                      type="button"
+                      onClick={() => {
+                        if (!window.confirm(`移除市场源「${selectedSource.name}」？Grok CLI 会同时卸载从该来源安装的插件。`)) return;
+                        void run("移除市场", () =>
+                          window.grok.marketplaceRemove(selectedSource.url, cwd).then(async (next) => {
+                            onChange(next);
+                            setSelectedMarketplace("all");
+                            await onRefresh();
+                            return next;
+                          }),
+                        );
+                      }}
+                    >
+                      移除当前源
+                    </button>
+                  </div>
                 ) : null}
-              </li>
-            ))}
-          </ul>
+              </div>
+            ) : (
+              <p className="market-source-summary">当前显示全部市场，共 {available?.length || 0} 个插件。</p>
+            )}
+          </>
         )}
       </section>
       <section className="settings-section plugin-browser">
         <div className="plugin-section-head">
           <div>
-            <h3>可安装插件</h3>
-            <p className="settings-hint">从已添加的市场源中选择插件。</p>
+            <h3>可安装插件{selectedMarketplace === "all" ? "" : ` · ${selectedMarketplace}`}</h3>
+            <p className="settings-hint">使用上方市场 Tab 筛选插件；这里的刷新只重读目录，远程同步请使用“更新”。</p>
           </div>
-          <button className="btn small ghost" type="button" onClick={onRefresh}>
-            刷新
-          </button>
+          <div className="row-actions">
+            <button className="btn small" type="button" onClick={onInstall}>
+              从来源安装
+            </button>
+            <button
+              className="btn small ghost"
+              type="button"
+              disabled={settings.plugins.length === 0}
+              onClick={() =>
+                void run("更新全部插件", () =>
+                  window.grok.pluginUpdate(undefined, cwd).then(async (next) => {
+                    onChange(next);
+                    await onRefresh();
+                    return next;
+                  }),
+                )
+              }
+            >
+              更新全部插件
+            </button>
+            <button
+              className="btn small ghost"
+              type="button"
+              onClick={() =>
+                void run("重读插件目录", () =>
+                  window.grok.settings(cwd).then(async (next) => {
+                    onChange(next);
+                    await onRefresh();
+                    return next;
+                  }),
+                )
+              }
+            >
+              重读目录
+            </button>
+          </div>
         </div>
         {available === null && loading ? <p className="settings-hint">正在读取市场…</p> : null}
-        {available && available.length === 0 ? <p className="settings-hint">市场里暂时没有条目。</p> : null}
-        {available && available.length ? (
-          <ul className="plugin-card-grid">
-            {available.map((item) => {
-              const installed =
-                item.status === "installed" || settings.plugins.some((plugin) => plugin.name === item.name);
+        {available && visiblePlugins.length === 0 ? <p className="settings-hint">当前市场里暂时没有条目。</p> : null}
+        {available && visiblePlugins.length ? (
+          <ul className="plugin-card-grid plugin-available-grid">
+            {visiblePlugins.map((item) => {
+              const installedPlugin = settings.plugins.find((plugin) => plugin.name === item.name);
+              const installed = item.status === "installed" || Boolean(installedPlugin);
+              const description = item.description || installedPlugin?.description || "暂无插件说明。";
+              const installing = installingPlugin === item.name;
+              const missingDependencies = (installedPlugin?.dependencies || []).filter((dependency) => !dependency.available);
               return (
-                <li className="plugin-card" key={`${item.marketplace}:${item.name}`}>
-                  <div className="plugin-card-body">
-                    <div className="plugin-card-title">
-                      <strong>{item.name}</strong>
-                      {item.version ? <span>{item.version}</span> : null}
-                    </div>
-                    <span className="plugin-card-market">{item.marketplace}</span>
-                    <p>{item.description || "暂无插件说明。"}</p>
-                  </div>
+                <li
+                  className={`plugin-card plugin-available-card${installing ? " installing" : ""}${missingDependencies.length ? " has-runtime-warning" : ""}`}
+                  key={`${item.marketplace}:${item.name}`}
+                >
+                  <PluginTileIcon />
+                  <strong className="plugin-tile-name" title={item.name}>{item.name}</strong>
+                  <p className="plugin-tile-description" title={description}>
+                    {description}
+                  </p>
+                  {missingDependencies.map((dependency) => {
+                    const key = `${item.name}:${dependency.command}`;
+                    const installingRuntime = installingDependency === key;
+                    const installedRuntime = installedDependencies.has(key);
+                    return (
+                      <div className="plugin-runtime-warning" role="status" key={dependency.command}>
+                        <span>
+                          {installedRuntime
+                            ? `${dependency.packageName || dependency.command} 已安装，重启后生效`
+                            : `缺少运行环境 ${dependency.command}`}
+                        </span>
+                        {!installedRuntime && dependency.installable ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(installingDependency)}
+                            onClick={() => void installDependency(item.name, dependency.command)}
+                          >
+                            {installingRuntime ? "安装中…" : dependency.installLabel || "安装依赖"}
+                          </button>
+                        ) : !installedRuntime ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(installingDependency)}
+                            onClick={() => void run("重新检测运行环境", () => window.grok.settings(cwd).then(onChange))}
+                          >
+                            重新检测
+                          </button>
+                        ) : null}
+                      </div>
+                    );
+                  })}
                   <button
-                    className={`btn small plugin-card-install${installed ? "" : " primary"}`}
+                    className={`btn small plugin-card-install plugin-tile-action plugin-available-install${installed ? " is-installed" : ""}${installing ? " installing" : ""}`}
                     type="button"
-                    disabled={installed}
-                    onClick={() =>
-                      void run("安装", () => window.grok.pluginInstall(item.name, true, cwd).then(onChange))
-                    }
+                    disabled={Boolean(installingPlugin)}
+                    aria-busy={installing}
+                    onClick={() => installed ? onUninstall(item.name) : void installMarketplacePlugin(item)}
                   >
-                    {installed ? "已安装" : "安装并信任"}
+                    {installing ? (
+                      <>
+                        <svg className="spinner" width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                          <circle cx="8" cy="8" r="5.4" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.24" />
+                          <path
+                            d="M13.4 8a5.4 5.4 0 0 0-5.4-5.4"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.6"
+                            strokeLinecap="round"
+                          />
+                        </svg>
+                        安装配置中…
+                      </>
+                    ) : installed ? (
+                      <>
+                        <svg viewBox="0 0 16 16" aria-hidden>
+                          <path d="M3.5 4.5h9M6 4.5V3.2h4v1.3M5 6.2l.5 6.3h5l.5-6.3" />
+                        </svg>
+                        已安装 · 卸载
+                      </>
+                    ) : (
+                      <>
+                        <svg viewBox="0 0 16 16" aria-hidden>
+                          <path d="M8 2.5v7M5.5 7.2 8 9.7l2.5-2.5M3 12.5h10" />
+                        </svg>
+                        安装并完成配置
+                      </>
+                    )}
                   </button>
                 </li>
               );
@@ -1011,11 +1379,13 @@ function NestedModal({
 
 export function McpForm({
   cwd,
+  sessionId,
   onClose,
   onChange,
   run,
 }: {
   cwd?: string | null;
+  sessionId?: string | null;
   onClose: () => void;
   onChange: (next: AppSettings) => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
@@ -1025,7 +1395,27 @@ export function McpForm({
   const [scope, setScope] = useState<"user" | "project">("user");
   const [commandOrUrl, setCommandOrUrl] = useState("");
   const [args, setArgs] = useState("");
-  const [env, setEnv] = useState("");
+  const [connectionLines, setConnectionLines] = useState("");
+  const [serverCwd, setServerCwd] = useState("");
+  const [bearerTokenEnvVar, setBearerTokenEnvVar] = useState("");
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthClientSecretEnvVar, setOauthClientSecretEnvVar] = useState("");
+  const [oauthScopes, setOauthScopes] = useState("");
+  const [startupTimeout, setStartupTimeout] = useState("");
+  const [toolTimeout, setToolTimeout] = useState("");
+  const [toolTimeouts, setToolTimeouts] = useState("");
+  const [exposeImageBase64, setExposeImageBase64] = useState(false);
+
+  useEffect(() => {
+    if (!cwd && scope === "project") setScope("user");
+  }, [cwd, scope]);
+
+  function optionalSeconds(value: string): number | undefined {
+    if (!value.trim()) return undefined;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed <= 0) throw new Error("超时必须是正整数秒数");
+    return parsed;
+  }
 
   return (
     <NestedModal title="添加 MCP" onClose={onClose}>
@@ -1045,8 +1435,9 @@ export function McpForm({
         <span>范围</span>
         <select value={scope} onChange={(e) => setScope(e.target.value as "user" | "project")}>
           <option value="user">用户 ~/.grok/config.toml</option>
-          <option value="project">项目 .grok/config.toml</option>
+          <option value="project" disabled={!cwd}>项目 .grok/config.toml</option>
         </select>
+        {!cwd ? <small>选择项目后才能写入项目级配置。</small> : null}
       </label>
       <label className="field">
         <span>{transport === "stdio" ? "命令" : "URL"}</span>
@@ -1058,44 +1449,264 @@ export function McpForm({
       </label>
       {transport === "stdio" ? (
         <label className="field">
-          <span>参数（空格分隔）</span>
-          <input value={args} onChange={(e) => setArgs(e.target.value)} placeholder="-y @scope/server ." />
+          <span>参数（支持引号；也可每行一个参数）</span>
+          <textarea value={args} onChange={(e) => setArgs(e.target.value)} placeholder={'-y "@scope/server" .'} rows={2} />
         </label>
       ) : null}
       <label className="field">
         <span>{transport === "stdio" ? "环境变量 KEY=value，一行一个" : "请求头 Name: Value，一行一个"}</span>
-        <textarea value={env} onChange={(e) => setEnv(e.target.value)} rows={3} />
+        <textarea value={connectionLines} onChange={(e) => setConnectionLines(e.target.value)} rows={3} />
       </label>
+      <details className="extension-details form-details">
+        <summary>高级配置</summary>
+        {transport === "stdio" ? (
+          <label className="field">
+            <span>服务器工作目录</span>
+            <input value={serverCwd} onChange={(e) => setServerCwd(e.target.value)} placeholder="C:\\path\\to\\server" />
+          </label>
+        ) : (
+          <>
+            <label className="field">
+              <span>Bearer Token 环境变量名</span>
+              <input value={bearerTokenEnvVar} onChange={(e) => setBearerTokenEnvVar(e.target.value)} placeholder="MCP_TOKEN" />
+            </label>
+            <label className="field">
+              <span>OAuth Client ID</span>
+              <input value={oauthClientId} onChange={(e) => setOauthClientId(e.target.value)} />
+            </label>
+            <label className="field">
+              <span>OAuth Client Secret 环境变量名</span>
+              <input value={oauthClientSecretEnvVar} onChange={(e) => setOauthClientSecretEnvVar(e.target.value)} placeholder="MCP_CLIENT_SECRET" />
+            </label>
+            <label className="field">
+              <span>OAuth Scopes（空格或逗号分隔）</span>
+              <input value={oauthScopes} onChange={(e) => setOauthScopes(e.target.value)} placeholder="read write" />
+            </label>
+          </>
+        )}
+        <div className="extension-form-grid">
+          <label className="field">
+            <span>启动超时（秒）</span>
+            <input type="number" min={1} value={startupTimeout} onChange={(e) => setStartupTimeout(e.target.value)} />
+          </label>
+          <label className="field">
+            <span>默认工具超时（秒）</span>
+            <input type="number" min={1} value={toolTimeout} onChange={(e) => setToolTimeout(e.target.value)} />
+          </label>
+        </div>
+        <label className="field">
+          <span>单工具超时，一行一个 tool_name=秒数</span>
+          <textarea value={toolTimeouts} onChange={(e) => setToolTimeouts(e.target.value)} rows={3} />
+        </label>
+        <label className="check-row compact">
+          <input type="checkbox" checked={exposeImageBase64} onChange={(e) => setExposeImageBase64(e.target.checked)} />
+          <span><strong>向模型暴露图片 Base64</strong><small>仅在服务器和模型确实需要原始图片数据时开启。</small></span>
+        </label>
+      </details>
       <div className="permission-actions">
         <button
           className="btn primary"
           type="button"
           disabled={!name.trim() || !commandOrUrl.trim()}
           onClick={() => {
-            const extra = env
-              .split(/\r?\n/)
-              .map((s) => s.trim())
-              .filter(Boolean);
-            void run("添加 MCP", () =>
-              window.grok
-                .mcpAdd(
-                  {
-                    name: name.trim(),
-                    transport,
-                    scope,
-                    commandOrUrl: commandOrUrl.trim(),
-                    args: args.trim() ? args.trim().split(/\s+/) : [],
-                    env: transport === "stdio" ? extra : [],
-                    headers: transport === "stdio" ? [] : extra,
-                  },
-                  cwd,
-                )
-                .then(onChange),
-            );
+            void run("添加 MCP", async () => {
+              const connection = parseMcpLines(connectionLines);
+              const next = await window.grok.mcpAdd(
+                {
+                  name: name.trim(),
+                  transport,
+                  scope,
+                  commandOrUrl: commandOrUrl.trim(),
+                  args: transport === "stdio" ? parseMcpArguments(args) : [],
+                  env: transport === "stdio" ? connection : [],
+                  headers: transport === "stdio" ? [] : connection,
+                  serverCwd: serverCwd.trim() || undefined,
+                  bearerTokenEnvVar: bearerTokenEnvVar.trim() || undefined,
+                  oauthClientId: oauthClientId.trim() || undefined,
+                  oauthClientSecretEnvVar: oauthClientSecretEnvVar.trim() || undefined,
+                  oauthScopes: oauthScopes.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean),
+                  startupTimeoutSec: optionalSeconds(startupTimeout),
+                  toolTimeoutSec: optionalSeconds(toolTimeout),
+                  toolTimeouts: parseMcpToolTimeouts(toolTimeouts),
+                  exposeImageBase64,
+                },
+                cwd,
+                sessionId,
+              );
+              onChange(next);
+              return next;
+            });
           }}
         >
-          添加
+          添加或更新
         </button>
+      </div>
+    </NestedModal>
+  );
+}
+
+export function McpSetupForm({
+  server,
+  sessionId,
+  cwd,
+  onClose,
+  onServers,
+  run,
+}: {
+  server: McpServerInfo;
+  sessionId: string;
+  cwd?: string | null;
+  onClose: () => void;
+  onServers: (servers: McpServerInfo[]) => void;
+  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
+}) {
+  const fields = server.setup?.fields ?? [];
+  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(
+    fields.map((field) => [field.id, server.setupValues?.[field.id] ?? field.default ?? field.options[0]?.value ?? ""]),
+  ));
+  const complete = fields.every((field) => !field.required || Boolean(values[field.id]?.trim()));
+
+  return (
+    <NestedModal title={`初始化 MCP · ${server.displayName || server.name}`} onClose={onClose}>
+      <p className="settings-hint">这些值会提交给当前 Grok 会话的 MCP 初始化流程。</p>
+      {fields.map((field) => (
+        <label className="field" key={field.id}>
+          <span>{field.label}{field.required ? " *" : ""}</span>
+          {field.options.length ? (
+            <select
+              value={values[field.id] ?? ""}
+              onChange={(event) => setValues((current) => ({ ...current, [field.id]: event.target.value }))}
+            >
+              {!field.required ? <option value="">未设置</option> : null}
+              {field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          ) : (
+            <input
+              type={/secret|password|token/i.test(field.type) ? "password" : "text"}
+              value={values[field.id] ?? ""}
+              onChange={(event) => setValues((current) => ({ ...current, [field.id]: event.target.value }))}
+            />
+          )}
+        </label>
+      ))}
+      <div className="permission-actions">
+        <button
+          className="btn primary"
+          type="button"
+          disabled={!complete}
+          onClick={() => void run("初始化 MCP", async () => {
+            const rows = await window.grok.mcpSetup(sessionId, server.name, values, cwd);
+            onServers(rows);
+            return rows;
+          })}
+        >保存并连接</button>
+      </div>
+    </NestedModal>
+  );
+}
+
+export function SkillCreateForm({
+  cwd,
+  onClose,
+  onCreated,
+  run,
+}: {
+  cwd?: string | null;
+  onClose: () => void;
+  onCreated: (catalog: SkillCatalog) => void;
+  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [scope, setScope] = useState<SkillCreateInput["scope"]>(cwd ? "project" : "user");
+  const [body, setBody] = useState("");
+  const [whenToUse, setWhenToUse] = useState("");
+  const [argumentHint, setArgumentHint] = useState("");
+  const [allowedTools, setAllowedTools] = useState("");
+  const [userInvocable, setUserInvocable] = useState(true);
+  const [disableModelInvocation, setDisableModelInvocation] = useState(false);
+  const [author, setAuthor] = useState("");
+  const [shortDescription, setShortDescription] = useState("");
+  const [license, setLicense] = useState("");
+  const [compatibility, setCompatibility] = useState("");
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
+
+  useEffect(() => {
+    if (!cwd && scope === "project") setScope("user");
+  }, [cwd, scope]);
+
+  return (
+    <NestedModal title="创建 Skill" onClose={onClose}>
+      <label className="field">
+        <span>名称</span>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="release-check" autoFocus />
+        <small>保存时会标准化为小写连字符名称。</small>
+      </label>
+      <label className="field">
+        <span>描述</span>
+        <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="说明这个 Skill 做什么，以及什么时候应该使用。" />
+      </label>
+      <label className="field">
+        <span>范围</span>
+        <select value={scope} onChange={(e) => setScope(e.target.value as SkillCreateInput["scope"])}>
+          <option value="user">用户 ~/.grok/skills</option>
+          <option value="project" disabled={!cwd}>项目 .grok/skills</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>指令正文</span>
+        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={8} placeholder="# 工作流程&#10;&#10;1. 检查…&#10;2. 修改…&#10;3. 验证…" />
+      </label>
+      <details className="extension-details form-details">
+        <summary>调用与元数据</summary>
+        <label className="field"><span>何时使用</span><input value={whenToUse} onChange={(e) => setWhenToUse(e.target.value)} /></label>
+        <label className="field"><span>参数提示</span><input value={argumentHint} onChange={(e) => setArgumentHint(e.target.value)} placeholder="[target] [--fix]" /></label>
+        <label className="field"><span>允许的工具（空格、逗号或换行分隔）</span><textarea value={allowedTools} onChange={(e) => setAllowedTools(e.target.value)} rows={2} /></label>
+        <label className="check-row compact">
+          <input type="checkbox" checked={userInvocable} onChange={(e) => setUserInvocable(e.target.checked)} />
+          <span><strong>允许用户手动调用</strong><small>关闭后不显示为用户可调用的 /skill。</small></span>
+        </label>
+        <label className="check-row compact">
+          <input type="checkbox" checked={disableModelInvocation} onChange={(e) => setDisableModelInvocation(e.target.checked)} />
+          <span><strong>禁止模型自动调用</strong><small>只允许用户显式调用。</small></span>
+        </label>
+        <div className="extension-form-grid">
+          <label className="field"><span>作者</span><input value={author} onChange={(e) => setAuthor(e.target.value)} /></label>
+          <label className="field"><span>短描述</span><input value={shortDescription} onChange={(e) => setShortDescription(e.target.value)} /></label>
+          <label className="field"><span>许可证</span><input value={license} onChange={(e) => setLicense(e.target.value)} /></label>
+          <label className="field"><span>兼容性</span><input value={compatibility} onChange={(e) => setCompatibility(e.target.value)} /></label>
+          <label className="field"><span>模型</span><input value={model} onChange={(e) => setModel(e.target.value)} /></label>
+          <label className="field"><span>推理强度</span><input value={effort} onChange={(e) => setEffort(e.target.value)} placeholder="high" /></label>
+        </div>
+      </details>
+      <div className="permission-actions">
+        <button
+          className="btn primary"
+          type="button"
+          disabled={!name.trim() || !description.trim()}
+          onClick={() => void run("创建 Skill", async () => {
+            const result = await window.grok.skillsCreate({
+              name,
+              description,
+              scope,
+              body,
+              whenToUse,
+              argumentHint,
+              allowedTools: allowedTools.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean),
+              userInvocable,
+              disableModelInvocation,
+              author,
+              shortDescription,
+              license,
+              compatibility,
+              model,
+              effort,
+            }, cwd);
+            onCreated(result.catalog);
+            return result;
+          })}
+        >创建 SKILL.md</button>
       </div>
     </NestedModal>
   );
@@ -1163,6 +1774,198 @@ export function HookForm({
   );
 }
 
+export function PluginOutputModal({
+  title,
+  text,
+  onClose,
+}: {
+  title: string;
+  text: string;
+  onClose: () => void;
+}) {
+  return (
+    <NestedModal title={title} onClose={onClose}>
+      <pre className="settings-pre plugin-output">{text}</pre>
+    </NestedModal>
+  );
+}
+
+export function PluginInstallForm({
+  cwd,
+  sessionId,
+  onClose,
+  onChange,
+  run,
+}: {
+  cwd?: string | null;
+  sessionId?: string | null;
+  onClose: () => void;
+  onChange: (next: AppSettings) => void | Promise<void>;
+  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
+}) {
+  const [source, setSource] = useState("");
+  const [trusted, setTrusted] = useState(false);
+  return (
+    <NestedModal title="从来源安装插件" onClose={onClose}>
+      <p className="settings-hint">
+        支持市场插件名、Git URL、owner/repo、本地目录，以及 <code>@ref</code> 和 <code>#subdir</code>。
+      </p>
+      <p className="settings-hint">
+        安装会自动补齐运行环境、加载并验证 MCP；需要 OAuth 时会立即打开认证。任何一步失败都会回滚插件。
+      </p>
+      <label className="field">
+        <span>插件来源</span>
+        <input
+          value={source}
+          onChange={(e) => setSource(e.target.value)}
+          placeholder="plugin-name 或 owner/repo@v1.0#packages/plugin"
+          autoFocus
+        />
+      </label>
+      <label className="check-row">
+        <input type="checkbox" checked={trusted} onChange={(e) => setTrusted(e.target.checked)} />
+        <span>
+          <strong>信任并安装</strong>
+          <small>插件可能包含 Hooks、MCP 和可执行脚本；确认来源可信后再继续。</small>
+        </span>
+      </label>
+      <div className="permission-actions">
+        <button
+          className="btn primary"
+          type="button"
+          disabled={!source.trim() || !trusted}
+          onClick={() => {
+            void run("安装并验证插件", () => window.grok.pluginInstall(source.trim(), true, cwd, sessionId).then(onChange));
+          }}
+        >
+          安装并完成配置
+        </button>
+      </div>
+    </NestedModal>
+  );
+}
+
+export function PluginUninstallForm({
+  name,
+  cwd,
+  onClose,
+  onChange,
+  run,
+}: {
+  name: string;
+  cwd?: string | null;
+  onClose: () => void;
+  onChange: (next: AppSettings) => void | Promise<void>;
+  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
+}) {
+  const [keepData, setKeepData] = useState(true);
+  return (
+    <NestedModal title={`卸载 ${name}`} onClose={onClose}>
+      <div className="settings-banner danger">
+        <p>如果它来自包含多个插件的仓库，Grok CLI 可能同时卸载该仓库中的相关插件。</p>
+      </div>
+      <label className="check-row">
+        <input type="checkbox" checked={keepData} onChange={(e) => setKeepData(e.target.checked)} />
+        <span>
+          <strong>保留插件数据</strong>
+          <small>对应 grok plugin uninstall --keep-data；建议保留，方便以后重新安装。</small>
+        </span>
+      </label>
+      <div className="permission-actions">
+        <button
+          className="btn danger"
+          type="button"
+          onClick={() => {
+            void run("卸载插件", () => window.grok.pluginUninstall(name, keepData, cwd).then(onChange));
+          }}
+        >
+          确认卸载
+        </button>
+      </div>
+    </NestedModal>
+  );
+}
+
+export function PluginToolsForm({
+  cwd,
+  onClose,
+  run,
+}: {
+  cwd?: string | null;
+  onClose: () => void;
+  run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
+}) {
+  const [targetPath, setTargetPath] = useState(".");
+  const [dryRun, setDryRun] = useState(true);
+  const [force, setForce] = useState(false);
+  const [push, setPush] = useState(false);
+  const [output, setOutput] = useState("");
+
+  return (
+    <NestedModal title="插件开发工具" onClose={onClose}>
+      <p className="settings-hint">对插件目录执行清单校验，或按照 manifest 版本创建 Git 标签。</p>
+      <label className="field">
+        <span>插件目录</span>
+        <input value={targetPath} onChange={(e) => setTargetPath(e.target.value)} placeholder="." autoFocus />
+      </label>
+      <div className="settings-actions">
+        <button
+          className="btn"
+          type="button"
+          onClick={() => {
+            void run("校验插件", async () => {
+              const text = await window.grok.pluginValidate(targetPath.trim() || ".", cwd);
+              setOutput(text || "插件清单校验通过。");
+              return text;
+            });
+          }}
+        >
+          校验 manifest
+        </button>
+      </div>
+      <div className="plugin-tool-options">
+        <label className="check-row compact">
+          <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
+          <span><strong>仅预览标签</strong><small>对应 --dry-run，不创建 Git 标签。</small></span>
+        </label>
+        <label className="check-row compact">
+          <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+          <span><strong>强制创建</strong><small>允许工作区不干净或标签已存在。</small></span>
+        </label>
+        <label className="check-row compact">
+          <input
+            type="checkbox"
+            checked={push}
+            disabled={dryRun}
+            onChange={(e) => setPush(e.target.checked)}
+          />
+          <span><strong>推送到远程</strong><small>创建后执行推送；仅在关闭预览时可用。</small></span>
+        </label>
+      </div>
+      <div className="permission-actions">
+        <button
+          className={`btn${dryRun ? "" : " danger"}`}
+          type="button"
+          onClick={() => {
+            if (!dryRun && !window.confirm(`将根据插件 manifest 创建 Git 标签${push ? "并推送到远程" : ""}，继续吗？`)) return;
+            void run(dryRun ? "预览标签" : "创建标签", async () => {
+              const text = await window.grok.pluginTag(
+                { path: targetPath.trim() || ".", dryRun, force, push: dryRun ? false : push },
+                cwd,
+              );
+              setOutput(text || (dryRun ? "预览完成。" : "标签创建完成。"));
+              return text;
+            });
+          }}
+        >
+          {dryRun ? "预览标签" : push ? "创建并推送标签" : "创建标签"}
+        </button>
+      </div>
+      {output ? <pre className="settings-pre plugin-output">{output}</pre> : null}
+    </NestedModal>
+  );
+}
+
 export function MarketForm({
   cwd,
   onClose,
@@ -1170,15 +1973,17 @@ export function MarketForm({
   run,
 }: {
   cwd?: string | null;
+  marketplaces?: AppSettings["marketplaces"];
   onClose: () => void;
   onChange: (next: AppSettings) => void | Promise<void>;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
   const [url, setUrl] = useState("");
+  const [force, setForce] = useState(false);
   return (
     <NestedModal title="添加市场源" onClose={onClose}>
       <p className="settings-hint">
-        支持 GitHub 仓库页面、owner/repo、Git URL、marketplace.json 地址或本地目录。远程仓库会自动生成 Windows 兼容副本。
+        支持 GitHub 仓库页面、owner/repo、Git URL、marketplace.json 地址或本地目录。通过 Grok marketplace 注册；兼容源会自动生成 Windows 副本。
       </p>
       <label className="field">
         <span>市场源地址</span>
@@ -1189,13 +1994,20 @@ export function MarketForm({
           autoFocus
         />
       </label>
+      <label className="check-row">
+        <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+        <span>
+          <strong>跳过可达性探测</strong>
+          <small>对应 --force，适用于只能通过 VPN 或特殊网络访问的 Git 主机。</small>
+        </span>
+      </label>
       <div className="permission-actions">
         <button
           className="btn primary"
           type="button"
           disabled={!url.trim()}
           onClick={() => {
-            void run("添加市场", () => window.grok.marketplaceAdd(url.trim(), cwd).then(onChange));
+            void run("添加市场", () => window.grok.marketplaceAdd(url.trim(), force, cwd).then(onChange));
           }}
         >
           添加

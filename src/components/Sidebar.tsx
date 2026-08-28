@@ -30,7 +30,9 @@ type Props = {
   onOpenProjectFolder: (project: ProjectInfo) => void;
   onRenameThread: (thread: ThreadInfo, title: string) => void;
   onForkThread: (thread: ThreadInfo) => void;
+  onForkThreads: (threads: ThreadInfo[]) => void;
   onRemoveThread: (thread: ThreadInfo) => void;
+  onRemoveThreads: (threads: ThreadInfo[]) => void;
   page?: "chat" | "marketplace" | "automation";
   onOpenMarketplace?: () => void;
   onOpenAutomation?: () => void;
@@ -693,7 +695,9 @@ export function Sidebar({
   onOpenProjectFolder,
   onRenameThread,
   onForkThread,
+  onForkThreads,
   onRemoveThread,
+  onRemoveThreads,
   page = "chat",
   onOpenMarketplace,
   onOpenAutomation,
@@ -727,12 +731,14 @@ export function Sidebar({
   const [searchLoading, setSearchLoading] = useState(false);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [rename, setRename] = useState<RenameState | null>(null);
+  const [selectedThreadIds, setSelectedThreadIds] = useState<Set<string>>(() => new Set());
   const [, setTimeTick] = useState(0);
   const renameRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const updateRequestRef = useRef<Promise<AppUpdateInfo> | null>(null);
   const savedApiProviderRef = useRef(false);
+  const selectionAnchorRef = useRef<string | null>(null);
 
   const requestUpdateCheck = () => {
     if (updateRequestRef.current) return updateRequestRef.current;
@@ -833,6 +839,34 @@ export function Sidebar({
       ),
     [threads, projectThreadIds],
   );
+
+  const visibleThreadIds = useMemo(
+    () => [
+      ...grouped.flatMap((group) => group.threads.map((thread) => thread.id)),
+      ...chatThreads.map((thread) => thread.id),
+    ],
+    [grouped, chatThreads],
+  );
+
+  const selectedThreads = useMemo(() => {
+    if (selectedThreadIds.size === 0) return [];
+    const byId = new Map(threads.map((thread) => [thread.id, thread]));
+    return visibleThreadIds
+      .filter((id) => selectedThreadIds.has(id))
+      .map((id) => byId.get(id))
+      .filter((thread): thread is ThreadInfo => Boolean(thread));
+  }, [selectedThreadIds, threads, visibleThreadIds]);
+
+  useEffect(() => {
+    const visibleIds = new Set(visibleThreadIds);
+    setSelectedThreadIds((current) => {
+      if ([...current].every((id) => visibleIds.has(id))) return current;
+      return new Set([...current].filter((id) => visibleIds.has(id)));
+    });
+    if (selectionAnchorRef.current && !visibleIds.has(selectionAnchorRef.current)) {
+      selectionAnchorRef.current = null;
+    }
+  }, [visibleThreadIds]);
 
   useEffect(() => {
     if (rename) renameRef.current?.focus();
@@ -973,6 +1007,58 @@ export function Sidebar({
     setRename(null);
   };
 
+  const clearThreadSelection = () => {
+    setSelectedThreadIds(new Set());
+    selectionAnchorRef.current = null;
+  };
+
+  const handleThreadClick = (event: React.MouseEvent<HTMLButtonElement>, thread: ThreadInfo) => {
+    const additive = event.ctrlKey || event.metaKey;
+    if (event.shiftKey) {
+      const anchorIndex = selectionAnchorRef.current
+        ? visibleThreadIds.indexOf(selectionAnchorRef.current)
+        : -1;
+      const threadIndex = visibleThreadIds.indexOf(thread.id);
+      if (anchorIndex >= 0 && threadIndex >= 0) {
+        const start = Math.min(anchorIndex, threadIndex);
+        const end = Math.max(anchorIndex, threadIndex);
+        const range = visibleThreadIds.slice(start, end + 1);
+        setSelectedThreadIds((current) => new Set(additive ? [...current, ...range] : range));
+      } else {
+        setSelectedThreadIds(new Set([thread.id]));
+        selectionAnchorRef.current = thread.id;
+      }
+      return;
+    }
+    if (additive) {
+      setSelectedThreadIds((current) => {
+        const next = new Set(current);
+        if (next.has(thread.id)) next.delete(thread.id);
+        else next.add(thread.id);
+        return next;
+      });
+      selectionAnchorRef.current = thread.id;
+      return;
+    }
+    setSelectedThreadIds(new Set([thread.id]));
+    selectionAnchorRef.current = thread.id;
+    onSelectThread(thread);
+  };
+
+  const openThreadMenu = (event: React.MouseEvent<HTMLButtonElement>, thread: ThreadInfo) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const selectionCount = selectedThreadIds.has(thread.id) ? selectedThreadIds.size : 1;
+    if (!selectedThreadIds.has(thread.id)) {
+      setSelectedThreadIds(new Set([thread.id]));
+      selectionAnchorRef.current = thread.id;
+    }
+    openMenu(
+      { kind: "thread", thread, x: event.clientX, y: event.clientY },
+      selectionCount > 1 ? 96 : 128,
+    );
+  };
+
   const openMenu = (next: MenuState, height: number) => {
     const pos = clampMenu(next.x, next.y, 176, height);
     setMenu({ ...next, ...pos });
@@ -1059,14 +1145,24 @@ export function Sidebar({
           <SearchIcon />
           搜索会话
         </button>
-        <button type="button" className="btn primary block" onClick={onOpenNewTask}>
+        <button
+          type="button"
+          className="btn primary block"
+          onClick={() => {
+            clearThreadSelection();
+            onOpenNewTask?.();
+          }}
+        >
           <NewTaskIcon />
           新建任务
         </button>
         <button
           type="button"
           className={`sidebar-nav-item${page === "automation" ? " on" : ""}`}
-          onClick={onOpenAutomation}
+          onClick={() => {
+            clearThreadSelection();
+            onOpenAutomation?.();
+          }}
         >
           <AutoIcon />
           自动化
@@ -1074,7 +1170,10 @@ export function Sidebar({
         <button
           type="button"
           className={`sidebar-nav-item${page === "marketplace" ? " on" : ""}`}
-          onClick={onOpenMarketplace}
+          onClick={() => {
+            clearThreadSelection();
+            onOpenMarketplace?.();
+          }}
         >
           <MarketIcon />
           插件市场
@@ -1083,7 +1182,15 @@ export function Sidebar({
       <div className="sidebar-list">
         <div className="sidebar-title-row">
           <span className="sidebar-title">项目</span>
-          <button className="icon-btn" type="button" title="打开项目" onClick={onOpenProject}>
+          <button
+            className="icon-btn"
+            type="button"
+            title="打开项目"
+            onClick={() => {
+              clearThreadSelection();
+              onOpenProject();
+            }}
+          >
             <PlusIcon />
           </button>
         </div>
@@ -1116,10 +1223,14 @@ export function Sidebar({
                   className="project-head"
                   type="button"
                   title={project.cwd}
-                  onClick={() => onSelectProject(project)}
+                  onClick={() => {
+                    clearThreadSelection();
+                    onSelectProject(project);
+                  }}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    clearThreadSelection();
                     onSelectProject(project);
                     openMenu({ kind: "project", project, x: e.clientX, y: e.clientY }, 164);
                   }}
@@ -1140,6 +1251,7 @@ export function Sidebar({
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    clearThreadSelection();
                     onSelectProject(project);
                     const rect = e.currentTarget.getBoundingClientRect();
                     openMenu({ kind: "project", project, x: rect.right - 176, y: rect.bottom + 4 }, 164);
@@ -1172,16 +1284,12 @@ export function Sidebar({
                   <button
                     key={t.id}
                     type="button"
-                    className={`thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
+                    className={`thread${activeId === t.id ? " active" : ""}${selectedThreadIds.has(t.id) ? " selected" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
                     title={t.title}
                     aria-label={`${t.title}${unreadIds.has(t.id) ? "，未读" : ""}`}
-                    onClick={() => onSelectThread(t)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onSelectThread(t);
-                      openMenu({ kind: "thread", thread: t, x: e.clientX, y: e.clientY }, 128);
-                    }}
+                    aria-pressed={selectedThreadIds.has(t.id)}
+                    onClick={(event) => handleThreadClick(event, t)}
+                    onContextMenu={(event) => openThreadMenu(event, t)}
                   >
                     <span className="thread-name">{t.title}</span>
                     {unreadIds.has(t.id) ? <span className="thread-unread" title="未读" aria-label="未读" /> : null}
@@ -1200,7 +1308,15 @@ export function Sidebar({
         {grouped.length === 0 ? <div className="sidebar-list-empty">暂无项目</div> : null}
         <div className="sidebar-title-row chats-label">
           <span className="sidebar-title">对话</span>
-          <button className="icon-btn" type="button" title="新对话" onClick={onNewChat}>
+          <button
+            className="icon-btn"
+            type="button"
+            title="新对话"
+            onClick={() => {
+              clearThreadSelection();
+              onNewChat?.();
+            }}
+          >
             <PlusIcon />
           </button>
         </div>
@@ -1229,16 +1345,12 @@ export function Sidebar({
               <button
                 key={t.id}
                 type="button"
-                className={`thread chat-thread${activeId === t.id ? " active" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
+                className={`thread chat-thread${activeId === t.id ? " active" : ""}${selectedThreadIds.has(t.id) ? " selected" : ""}${runningIds.has(t.id) ? " running" : ""}${unreadIds.has(t.id) ? " unread" : ""}`}
                 title={t.title}
                 aria-label={`${t.title}${unreadIds.has(t.id) ? "，未读" : ""}`}
-                onClick={() => onSelectThread(t)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onSelectThread(t);
-                  openMenu({ kind: "thread", thread: t, x: e.clientX, y: e.clientY }, 88);
-                }}
+                aria-pressed={selectedThreadIds.has(t.id)}
+                onClick={(event) => handleThreadClick(event, t)}
+                onContextMenu={(event) => openThreadMenu(event, t)}
               >
                 <span className="thread-name">{t.title}</span>
                 {unreadIds.has(t.id) ? <span className="thread-unread" title="未读" aria-label="未读" /> : null}
@@ -1695,6 +1807,38 @@ export function Sidebar({
                   <TrashIcon />
                 </span>
                 移除项目
+              </button>
+            </>
+          ) : selectedThreads.length > 1 && selectedThreadIds.has(menu.thread.id) ? (
+            <>
+              <div className="ctx-menu-label">已选择 {selectedThreads.length} 个会话</div>
+              <button
+                type="button"
+                onClick={() => {
+                  onForkThreads(selectedThreads);
+                  clearThreadSelection();
+                  setMenu(null);
+                }}
+              >
+                <span className="ctx-icon">
+                  <ForkIcon />
+                </span>
+                分叉所选会话
+              </button>
+              <div className="ctx-sep" />
+              <button
+                type="button"
+                className="danger"
+                onClick={() => {
+                  onRemoveThreads(selectedThreads);
+                  clearThreadSelection();
+                  setMenu(null);
+                }}
+              >
+                <span className="ctx-icon">
+                  <TrashIcon />
+                </span>
+                移除所选会话
               </button>
             </>
           ) : (

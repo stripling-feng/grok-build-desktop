@@ -6,16 +6,23 @@ import type {
   AutomationInput,
   AvailablePluginInfo,
   IntervalUnit,
+  McpServerInfo,
   ProjectInfo,
+  SkillCatalog,
 } from "../../electron/shared";
 import {
   MarketForm,
   McpForm,
   McpTab,
+  PluginInstallForm,
+  PluginUninstallForm,
   PluginsTab,
+  SkillCreateForm,
   SkillsTab,
+  McpSetupForm,
   type SettingsRun,
 } from "./Settings";
+import { TabRefreshGate } from "../lib/tab-refresh-gate";
 
 export type WorkspacePage = "chat" | "marketplace" | "automation";
 export type MarketplaceTab = "market" | "mcp" | "skills";
@@ -49,18 +56,39 @@ function useWorkspaceActions() {
 export function MarketplacePage({
   settings,
   cwd,
+  sessionId,
   onChange,
 }: {
   settings: AppSettings | null;
   cwd?: string | null;
+  sessionId?: string | null;
   onChange: (next: AppSettings) => void;
 }) {
   const [tab, setTab] = useState<MarketplaceTab>("market");
   const [mcpOpen, setMcpOpen] = useState(false);
   const [marketOpen, setMarketOpen] = useState(false);
+  const [pluginInstallOpen, setPluginInstallOpen] = useState(false);
+  const [pluginUninstall, setPluginUninstall] = useState("");
   const [doctor, setDoctor] = useState("");
+  const [mcpServers, setMcpServers] = useState<McpServerInfo[] | null>(null);
+  const [mcpSetup, setMcpSetup] = useState<McpServerInfo | null>(null);
+  const [skillCatalog, setSkillCatalog] = useState<SkillCatalog | null>(null);
+  const [skillCreateOpen, setSkillCreateOpen] = useState(false);
   const [available, setAvailable] = useState<AvailablePluginInfo[] | null>(null);
   const marketLoadStarted = useRef(false);
+  const mountedRef = useRef(true);
+  const mcpRefreshGate = useRef(new TabRefreshGate());
+  const skillsRefreshGate = useRef(new TabRefreshGate());
+  const settingsRef = useRef(settings);
+  const mcpContextKey = `${sessionId ?? ""}\u0000${cwd ?? ""}`;
+  const skillsContextKey = cwd ?? "";
+  const mcpContextRef = useRef(mcpContextKey);
+  const skillsContextRef = useRef(skillsContextKey);
+  settingsRef.current = settings;
+  mcpContextRef.current = mcpContextKey;
+  skillsContextRef.current = skillsContextKey;
+  const mcpBridgeReady = typeof window !== "undefined" && typeof window.grok.mcpCatalog === "function";
+  const skillsBridgeReady = typeof window !== "undefined" && typeof window.grok.skillsCatalog === "function";
   const { busy, error, run } = useWorkspaceActions();
 
   async function refreshAvailable() {
@@ -68,11 +96,100 @@ export function MarketplacePage({
     if (rows) setAvailable(rows);
   }
 
+  async function refreshMcp(force = false) {
+    const key = mcpContextKey;
+    return mcpRefreshGate.current.run(key, force, async () => {
+      if (typeof window.grok.mcpCatalog !== "function") {
+        if (!mountedRef.current || mcpContextRef.current !== key) return false;
+        setMcpServers(settingsRef.current?.mcpServers ?? []);
+        return true;
+      }
+      const rows = await run(force ? "刷新 MCP" : "读取 MCP", () => window.grok.mcpCatalog(sessionId, cwd, force));
+      if (!rows || !mountedRef.current || mcpContextRef.current !== key) return false;
+      setMcpServers(rows);
+      if (settingsRef.current) onChange({ ...settingsRef.current, mcpServers: rows });
+      return true;
+    });
+  }
+
+  function applySkillCatalog(catalog: SkillCatalog) {
+    setSkillCatalog(catalog);
+    if (settingsRef.current) onChange({ ...settingsRef.current, skills: catalog.skills });
+  }
+
+  async function refreshSkills(showBusy = true, force = showBusy) {
+    const key = skillsContextKey;
+    return skillsRefreshGate.current.run(key, force, async () => {
+      if (typeof window.grok.skillsCatalog !== "function") {
+        if (!mountedRef.current || skillsContextRef.current !== key || !settingsRef.current) return false;
+        setSkillCatalog({
+          skills: settingsRef.current.skills,
+          paths: [],
+          ignore: [],
+          message: "请重启应用以加载新版 Skills 接口",
+        });
+        return true;
+      }
+      const work = () => window.grok.skillsCatalog(cwd);
+      const catalog = showBusy ? await run("刷新 Skills", work) : await work().catch(() => undefined);
+      if (!catalog || !mountedRef.current || skillsContextRef.current !== key) return false;
+      applySkillCatalog(catalog);
+      return true;
+    });
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (!settings || marketLoadStarted.current) return;
     marketLoadStarted.current = true;
     void refreshAvailable();
   }, [settings]);
+
+  useEffect(() => {
+    if (!settings || tab !== "mcp") return;
+    void refreshMcp(false);
+  }, [tab, sessionId, cwd]);
+
+  useEffect(() => {
+    if (!settings || tab !== "skills") return;
+    void refreshSkills(false);
+    const timer = window.setInterval(() => void refreshSkills(false, true), 5_000);
+    return () => window.clearInterval(timer);
+  }, [tab, cwd]);
+
+  useEffect(() => {
+    if (typeof window.grok.onExtensionUpdate !== "function") return;
+    let mcpTimer: number | undefined;
+    let skillsTimer: number | undefined;
+    const unsubscribe = window.grok.onExtensionUpdate((payload) => {
+      const method = payload && typeof payload === "object" ? String((payload as { method?: unknown }).method || "") : "";
+      if (method.startsWith("x.ai/mcp/")) {
+        mcpRefreshGate.current.invalidate(mcpContextKey);
+      }
+      if (tab === "mcp" && method.startsWith("x.ai/mcp/")) {
+        if (mcpTimer !== undefined) window.clearTimeout(mcpTimer);
+        mcpTimer = window.setTimeout(() => void refreshMcp(true), 150);
+      }
+      if (method.startsWith("x.ai/skills/")) {
+        skillsRefreshGate.current.invalidate(skillsContextKey);
+      }
+      if (tab === "skills" && method.startsWith("x.ai/skills/")) {
+        if (skillsTimer !== undefined) window.clearTimeout(skillsTimer);
+        skillsTimer = window.setTimeout(() => void refreshSkills(false, true), 150);
+      }
+    });
+    return () => {
+      unsubscribe();
+      if (mcpTimer !== undefined) window.clearTimeout(mcpTimer);
+      if (skillsTimer !== undefined) window.clearTimeout(skillsTimer);
+    };
+  }, [tab, sessionId, cwd]);
 
   if (!settings) {
     return (
@@ -105,14 +222,27 @@ export function MarketplacePage({
       <div className="workspace-body">
         {error ? <p className="settings-error">{error}</p> : null}
         {busy ? <p className="settings-hint">{busy}…</p> : null}
+        {tab === "mcp" && !mcpBridgeReady ? (
+          <div className="settings-banner">
+            <p>页面已经更新，但 Electron preload 仍是旧版本。请完全退出 Grok Build Desktop 后重新启动。</p>
+          </div>
+        ) : null}
+        {tab === "skills" && !skillsBridgeReady ? (
+          <div className="settings-banner">
+            <p>页面已经更新，但 Electron preload 仍是旧版本。请完全退出 Grok Build Desktop 后重新启动。</p>
+          </div>
+        ) : null}
         {tab === "market" ? (
           <PluginsTab
             settings={settings}
             cwd={cwd}
+            sessionId={sessionId}
             available={available}
             loading={busy === "读取市场"}
             onRefresh={refreshAvailable}
             onMarket={() => setMarketOpen(true)}
+            onInstall={() => setPluginInstallOpen(true)}
+            onUninstall={setPluginUninstall}
             onChange={onChange}
             run={run}
           />
@@ -120,25 +250,40 @@ export function MarketplacePage({
         {tab === "mcp" ? (
           <McpTab
             settings={settings}
+            servers={mcpServers ?? settings.mcpServers}
             cwd={cwd}
+            sessionId={sessionId}
             doctor={doctor}
             onDoctor={setDoctor}
             onOpenAdd={() => setMcpOpen(true)}
+            onRefresh={() => void refreshMcp(true)}
+            onSetup={setMcpSetup}
+            onServers={setMcpServers}
             onChange={onChange}
             run={run}
           />
         ) : null}
         {tab === "skills" ? (
-          <SkillsTab settings={settings} cwd={cwd} onChange={onChange} run={run} />
+          <SkillsTab
+            settings={settings}
+            catalog={skillCatalog}
+            cwd={cwd}
+            onCatalog={applySkillCatalog}
+            onRefresh={() => void refreshSkills(true)}
+            onCreate={() => setSkillCreateOpen(true)}
+            run={run}
+          />
         ) : null}
       </div>
       {mcpOpen ? (
         <McpForm
           cwd={cwd}
+          sessionId={sessionId}
           onClose={() => setMcpOpen(false)}
           onChange={(next) => {
             onChange(next);
             setMcpOpen(false);
+            void refreshMcp(true);
           }}
           run={run}
         />
@@ -146,10 +291,62 @@ export function MarketplacePage({
       {marketOpen ? (
         <MarketForm
           cwd={cwd}
+          marketplaces={settings.marketplaces}
           onClose={() => setMarketOpen(false)}
           onChange={async (next) => {
             onChange(next);
             setMarketOpen(false);
+            await refreshAvailable();
+          }}
+          run={run}
+        />
+      ) : null}
+      {mcpSetup && sessionId ? (
+        <McpSetupForm
+          server={mcpSetup}
+          sessionId={sessionId}
+          cwd={cwd}
+          onClose={() => setMcpSetup(null)}
+          onServers={(rows) => {
+            setMcpServers(rows);
+            setMcpSetup(null);
+            if (settingsRef.current) onChange({ ...settingsRef.current, mcpServers: rows });
+          }}
+          run={run}
+        />
+      ) : null}
+      {skillCreateOpen ? (
+        <SkillCreateForm
+          cwd={cwd}
+          onClose={() => setSkillCreateOpen(false)}
+          onCreated={(catalog) => {
+            applySkillCatalog(catalog);
+            setSkillCreateOpen(false);
+          }}
+          run={run}
+        />
+      ) : null}
+      {pluginInstallOpen ? (
+        <PluginInstallForm
+          cwd={cwd}
+          sessionId={sessionId}
+          onClose={() => setPluginInstallOpen(false)}
+          onChange={async (next) => {
+            onChange(next);
+            setPluginInstallOpen(false);
+            await refreshAvailable();
+          }}
+          run={run}
+        />
+      ) : null}
+      {pluginUninstall ? (
+        <PluginUninstallForm
+          name={pluginUninstall}
+          cwd={cwd}
+          onClose={() => setPluginUninstall("")}
+          onChange={async (next) => {
+            onChange(next);
+            setPluginUninstall("");
             await refreshAvailable();
           }}
           run={run}
