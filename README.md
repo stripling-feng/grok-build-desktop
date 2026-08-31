@@ -26,7 +26,22 @@
 
 </div>
 
-![Grok Build Desktop 界面](docs/screenshot.jpg)
+## 界面预览
+
+![Grok Build Desktop v0.1.8 界面预览](docs/screenshot.jpg)
+
+当前截图展示了桌面端的项目侧栏、多会话工作区和任务输入界面。完整功能请下载最新版本体验。
+
+## 最新版本
+
+### v0.1.8
+
+- 全面更新桌面端视觉样式、弹窗和设置页面交互
+- 新增统一的确认提示、会话搜索和窗口状态反馈
+- 优化 Skills、MCP、插件市场与自动化任务管理
+- 修复 API Provider 多行配置和会话思考内容保存问题
+
+[下载 v0.1.8 Windows 安装包](https://github.com/stripling-feng/grok-build-desktop/releases/tag/v0.1.8)
 
 ## 这是什么？
 
