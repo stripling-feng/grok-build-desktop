@@ -48,8 +48,58 @@ function tableBlock(text: string, table: string): { start: number; end: number; 
   return { start, end, body: text.slice(start, end) };
 }
 
-function keyLineRe(key: string) {
-  return new RegExp(`^"?${escapeRegExp(key)}"?\\s*=\\s*.*$`, "m");
+function keyAssignmentRe(key: string) {
+  return new RegExp(`^[ \t]*"?${escapeRegExp(key)}"?\\s*=\\s*(.*)$`, "m");
+}
+
+function keyAssignmentRange(body: string, key: string): { start: number; end: number } | null {
+  const match = keyAssignmentRe(key).exec(body);
+  if (!match) return null;
+  let end = match.index + match[0].length;
+  const firstValue = match[1].trim();
+  let depth = (firstValue.match(/\[/g)?.length ?? 0) - (firstValue.match(/\]/g)?.length ?? 0);
+  if (depth <= 0) {
+    // Older builds replaced only the opening line of a multi-line array,
+    // leaving orphaned "item", lines and a closing bracket behind.
+    if (firstValue.includes("[") && firstValue.includes("]")) {
+      let cursor = end;
+      let sawItem = false;
+      while (cursor < body.length) {
+        const lineStart = body.indexOf("\n", cursor);
+        if (lineStart < 0) break;
+        const nextStart = lineStart + 1;
+        const nextEnd = body.indexOf("\n", nextStart);
+        const lineEnd = nextEnd < 0 ? body.length : nextEnd;
+        const continuation = body.slice(nextStart, lineEnd).trim();
+        if (/^"[^"]*"\s*,?\s*(?:#.*)?$/.test(continuation)) {
+          sawItem = true;
+          end = lineEnd;
+          cursor = lineEnd;
+          continue;
+        }
+        if (sawItem && continuation === "]") end = lineEnd;
+        break;
+      }
+    }
+    return { start: match.index, end };
+  }
+
+  let cursor = end;
+  while (cursor < body.length && depth > 0) {
+    const lineStart = body.indexOf("\n", cursor);
+    if (lineStart < 0) {
+      end = body.length;
+      break;
+    }
+    const nextStart = lineStart + 1;
+    const nextEnd = body.indexOf("\n", nextStart);
+    const lineEnd = nextEnd < 0 ? body.length : nextEnd;
+    const continuation = body.slice(nextStart, lineEnd);
+    depth += (continuation.match(/\[/g)?.length ?? 0) - (continuation.match(/\]/g)?.length ?? 0);
+    end = lineEnd;
+    cursor = lineEnd;
+  }
+  return { start: match.index, end };
 }
 
 export function setTableKey(text: string, table: string, key: string, rawValue: string): string {
@@ -59,9 +109,9 @@ export function setTableKey(text: string, table: string, key: string, rawValue: 
     const prefix = text.trimEnd();
     return `${prefix}${prefix ? "\n\n" : ""}[${table}]\n${line}\n`;
   }
-  const keyRe = keyLineRe(key);
-  const nextBody = keyRe.test(block.body)
-    ? block.body.replace(keyRe, line)
+  const range = keyAssignmentRange(block.body, key);
+  const nextBody = range
+    ? `${block.body.slice(0, range.start)}${line}${block.body.slice(range.end)}`
     : `${block.body.trimEnd()}\n${line}\n`;
   return text.slice(0, block.start) + nextBody + text.slice(block.end);
 }
@@ -69,7 +119,9 @@ export function setTableKey(text: string, table: string, key: string, rawValue: 
 function deleteTableKey(text: string, table: string, key: string): string {
   const block = tableBlock(text, table);
   if (!block) return text;
-  const nextBody = block.body.replace(keyLineRe(key), "").replace(/\n{3,}/g, "\n\n");
+  const range = keyAssignmentRange(block.body, key);
+  if (!range) return text;
+  const nextBody = `${block.body.slice(0, range.start)}${block.body.slice(range.end)}`.replace(/\n{3,}/g, "\n\n");
   return text.slice(0, block.start) + nextBody + text.slice(block.end);
 }
 

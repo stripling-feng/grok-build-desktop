@@ -23,6 +23,7 @@ import {
   type SettingsRun,
 } from "./Settings";
 import { TabRefreshGate } from "../lib/tab-refresh-gate";
+import { ConfirmDialog, ModalPortal } from "./ModalPortal";
 
 export type WorkspacePage = "chat" | "marketplace" | "automation";
 export type MarketplaceTab = "market" | "mcp" | "skills";
@@ -32,6 +33,66 @@ const MARKET_TABS: { id: MarketplaceTab; label: string }[] = [
   { id: "mcp", label: "MCP" },
   { id: "skills", label: "Skills" },
 ];
+
+const MARKET_TAB_META: Record<MarketplaceTab, {
+  eyebrow: string;
+  title: string;
+  description: string;
+}> = {
+  market: {
+    eyebrow: "EXTENSION CATALOG",
+    title: "把常用能力装进工作流",
+    description: "从可信市场源发现插件，按需安装到当前工作台。",
+  },
+  mcp: {
+    eyebrow: "MODEL CONTEXT PROTOCOL",
+    title: "连接外部工具与数据",
+    description: "管理服务器、认证状态和可调用工具。",
+  },
+  skills: {
+    eyebrow: "SKILL LIBRARY",
+    title: "整理可调用的工作流",
+    description: "统一查看来源、启停状态与项目级技能。",
+  },
+};
+
+function MarketplaceTabIcon({ tab }: { tab: MarketplaceTab }) {
+  if (tab === "mcp") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden>
+        <circle cx="5" cy="10" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <circle cx="15" cy="5" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <circle cx="15" cy="15" r="2.1" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <path d="m6.8 9 6.2-3M6.8 11l6.2 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  if (tab === "skills") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden>
+        <path d="M4 5.2A2.2 2.2 0 0 1 6.2 3h8.6A1.2 1.2 0 0 1 16 4.2v10.6a1.2 1.2 0 0 1-1.2 1.2H6.2A2.2 2.2 0 0 1 4 13.8V5.2Z" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M4.2 5.5h8.1M7 8.5h6M7 11.5h4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden>
+      <path d="m10 2.8 6.6 3.7L10 10.2 3.4 6.5 10 2.8Z" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <path d="m3.4 10 6.6 3.7 6.6-3.7M3.4 13.5l6.6 3.7 6.6-3.7" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function MarketplaceOverviewIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden>
+      <rect x="3.5" y="3.5" width="7" height="7" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <rect x="13.5" y="3.5" width="7" height="7" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <rect x="3.5" y="13.5" width="7" height="7" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M17 13.5v7M13.5 17h7" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 function useWorkspaceActions() {
   const [busy, setBusy] = useState("");
@@ -199,29 +260,115 @@ export function MarketplacePage({
     );
   }
 
+  const tabMeta = MARKET_TAB_META[tab];
+  const mcpRows = mcpServers ?? settings.mcpServers;
+  const skillRows = skillCatalog?.skills ?? settings.skills;
+  const overviewStats = tab === "market"
+    ? [
+        { value: settings.plugins.length, label: "已安装" },
+        { value: available?.length ?? 0, label: "目录插件" },
+        { value: settings.marketplaces.length, label: "市场源" },
+      ]
+    : tab === "mcp"
+      ? [
+          { value: mcpRows.length, label: "服务器" },
+          { value: mcpRows.filter((server) => server.enabled).length, label: "已启用" },
+          { value: mcpRows.reduce((sum, server) => sum + (server.toolCount ?? server.tools?.length ?? 0), 0), label: "可用工具" },
+        ]
+      : [
+          { value: skillRows.length, label: "可调用" },
+          { value: skillRows.filter((skill) => !skill.disabled).length, label: "已启用" },
+          { value: new Set(skillRows.map((skill) => skill.source)).size, label: "来源" },
+        ];
+  const syncLabel = tab === "market"
+    ? available === null
+      ? "首次同步中"
+      : "目录已就绪"
+    : tab === "mcp"
+      ? (mcpBridgeReady ? "实时目录" : "需要重启")
+      : (skillsBridgeReady ? "实时目录" : "需要重启");
+  const contextLabel = tab === "market"
+    ? available === null
+      ? "目录同步中"
+      : settings.marketplaces.length > 0
+        ? `${settings.marketplaces.length} 个来源已接入`
+        : "等待添加来源"
+    : tab === "mcp"
+      ? (sessionId ? "当前会话已连接" : "打开会话后查看实时状态")
+      : (cwd ? "当前项目范围" : "用户级技能目录");
+  const contextTone = tab === "market"
+    ? (available === null ? "pending" : "ready")
+    : tab === "mcp"
+      ? (sessionId ? "ready" : "muted")
+      : (cwd ? "ready" : "muted");
+
   return (
-    <section className="workspace-page">
-      <div className="workspace-head">
-        <h1>插件市场</h1>
+    <section className="workspace-page marketplace-page">
+      <div className="workspace-head marketplace-head">
+        <div className="marketplace-head-copy">
+          <span className="marketplace-head-icon" aria-hidden>
+            <MarketplaceOverviewIcon />
+          </span>
+          <div>
+            <span className="marketplace-head-eyebrow">WORKBENCH EXTENSIONS</span>
+            <h1>插件市场</h1>
+          </div>
+        </div>
+        <div className="marketplace-head-stats" aria-label="扩展概览">
+          {overviewStats.map((stat) => (
+            <span className="marketplace-head-stat" key={stat.label}>
+              <strong>{stat.value}</strong>
+              <small>{stat.label}</small>
+            </span>
+          ))}
+          <span className={`marketplace-sync-state${available === null && tab === "market" ? " pending" : ""}`}>
+            <i aria-hidden />
+            {syncLabel}
+          </span>
+        </div>
       </div>
-      <div className="workspace-tabs">
+      <div className="workspace-tabs marketplace-tabs" role="tablist" aria-label="扩展管理">
         {MARKET_TABS.map((item) => (
           <button
             key={item.id}
             type="button"
             className={tab === item.id ? "on" : ""}
+            role="tab"
+            id={`marketplace-tab-${item.id}`}
+            aria-selected={tab === item.id}
+            aria-controls={`marketplace-panel-${item.id}`}
             onClick={() => {
               setTab(item.id);
               setDoctor("");
             }}
           >
-            {item.label}
+            <MarketplaceTabIcon tab={item.id} />
+            <span>{item.label}</span>
           </button>
         ))}
       </div>
-      <div className="workspace-body">
-        {error ? <p className="settings-error">{error}</p> : null}
-        {busy ? <p className="settings-hint">{busy}…</p> : null}
+      <div
+        className={`workspace-body marketplace-workspace-body marketplace-tab-${tab}`}
+        id={`marketplace-panel-${tab}`}
+        role="tabpanel"
+        aria-labelledby={`marketplace-tab-${tab}`}
+      >
+        <div className="marketplace-context">
+          <span className="marketplace-context-icon" aria-hidden>
+            <MarketplaceTabIcon tab={tab} />
+          </span>
+          <div className="marketplace-context-copy">
+            <span className="marketplace-context-eyebrow">{tabMeta.eyebrow}</span>
+            <h2>{tabMeta.title}</h2>
+            <p>{tabMeta.description}</p>
+          </div>
+          <span className={`marketplace-context-state ${contextTone}`}>
+            <i aria-hidden />
+            {contextLabel}
+          </span>
+        </div>
+        {error && !(tab === "market" && available === null) ? <p className="settings-error" role="alert">{error}</p> : null}
+        {busy ? <p className="settings-hint" role="status" aria-live="polite">{busy}…</p> : null}
         {tab === "mcp" && !mcpBridgeReady ? (
           <div className="settings-banner">
             <p>页面已经更新，但 Electron preload 仍是旧版本。请完全退出 Grok Build Desktop 后重新启动。</p>
@@ -239,6 +386,7 @@ export function MarketplacePage({
             sessionId={sessionId}
             available={available}
             loading={busy === "读取市场"}
+            error={error}
             onRefresh={refreshAvailable}
             onMarket={() => setMarketOpen(true)}
             onInstall={() => setPluginInstallOpen(true)}
@@ -617,6 +765,7 @@ export function AutomationPage({
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; row?: Automation; seed?: Partial<ScheduleDraft>; history?: boolean } | null>(null);
   const [menuId, setMenuId] = useState<string | null>(null);
   const [pending, setPending] = useState<{ id: string; action: "run" | "toggle" | "delete" } | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<Automation | null>(null);
   const { busy, error, run } = useWorkspaceActions();
 
   useEffect(() => {
@@ -870,11 +1019,7 @@ export function AutomationPage({
                               disabled={row.lastStatus === "running"}
                               onClick={() => {
                                 setMenuId(null);
-                                if (!window.confirm(`确定删除“${row.title}”？此操作无法撤销。`)) return;
-                                void perform(row, "delete", "正在删除任务", async () => {
-                                  await window.grok.deleteAutomation(row.id);
-                                  return window.grok.listAutomations();
-                                });
+                                setDeleteCandidate(row);
                               }}
                             >
                               删除
@@ -931,6 +1076,23 @@ export function AutomationPage({
             setEditor(null);
           }}
           onOpenSession={onOpenSession}
+        />
+      ) : null}
+      {deleteCandidate ? (
+        <ConfirmDialog
+          title={`删除“${deleteCandidate.title || "未命名定时任务"}”`}
+          message="此操作无法撤销，任务的历史运行记录也会从列表中移除。"
+          confirmLabel="删除任务"
+          danger
+          onClose={() => setDeleteCandidate(null)}
+          onConfirm={() => {
+            const row = deleteCandidate;
+            setDeleteCandidate(null);
+            void perform(row, "delete", "正在删除任务", async () => {
+              await window.grok.deleteAutomation(row.id);
+              return window.grok.listAutomations();
+            });
+          }}
         />
       ) : null}
     </section>
@@ -1019,8 +1181,9 @@ function AutomationForm({
   }
 
   return (
-    <div className="modal-backdrop nested" onClick={() => { if (!saving) onClose(); }}>
-      <div className="modal settings-modal auto-form" role="dialog" aria-modal="true" aria-labelledby="automation-form-title" onClick={(e) => e.stopPropagation()}>
+    <ModalPortal>
+      <div className="modal-backdrop nested" onClick={() => { if (!saving) onClose(); }}>
+        <div className="modal settings-modal auto-form" role="dialog" aria-modal="true" aria-labelledby="automation-form-title" onClick={(e) => e.stopPropagation()}>
         <div className="auto-form-head">
           <div>
             <h2 id="automation-form-title">{editing ? "编辑定时任务" : "新建定时任务"}</h2>
@@ -1096,7 +1259,7 @@ function AutomationForm({
                 </div>
                 <label className="field auto-prompt-field">
                   <span>执行指令 <em>必填</em></span>
-                  <textarea value={draft.prompt} onChange={(e) => patch({ prompt: e.target.value })} rows={5} placeholder="清楚描述每次运行时要检查、整理或生成什么。" />
+                  <textarea className="resize-none" value={draft.prompt} onChange={(e) => patch({ prompt: e.target.value })} rows={5} placeholder="清楚描述每次运行时要检查、整理或生成什么。" />
                 </label>
               </section>
 
@@ -1223,7 +1386,8 @@ function AutomationForm({
             </div>
           </>
         )}
+        </div>
       </div>
-    </div>
+    </ModalPortal>
   );
 }

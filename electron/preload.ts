@@ -113,6 +113,12 @@ contextBridge.exposeInMainWorld("grok", {
     ipcRenderer.invoke("grok:resolveImage", input),
   windowControl: (action: "min" | "max" | "close") =>
     ipcRenderer.invoke("grok:window", action),
+  windowState: () => ipcRenderer.invoke("grok:window-state"),
+  onWindowState: (cb: (state: { maximized: boolean; fullscreen: boolean }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: { maximized: boolean; fullscreen: boolean }) => cb(state);
+    ipcRenderer.on("grok:window-state", listener);
+    return () => ipcRenderer.removeListener("grok:window-state", listener);
+  },
   settings: (cwd?: string | null) => ipcRenderer.invoke("grok:settings", cwd),
   proxySettings: () => ipcRenderer.invoke("grok:proxySettings"),
   setProxySettings: (input: unknown) => ipcRenderer.invoke("grok:setProxySettings", input),

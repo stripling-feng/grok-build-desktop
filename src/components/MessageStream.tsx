@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { FileLineStats, GitStatus, StreamItem } from "../../electron/shared";
-import grokLogo from "../assets/grok-logo.jpg";
+import grokLogo from "../assets/grok-logo-transparent.png";
 import { Markdown } from "../lib/markdown";
 import { toolStatusLabel } from "../lib/i18n";
 import { planFlowLabel, type PlanActivity, type PlanFlowPhase } from "../lib/plan-flow";
@@ -300,6 +300,48 @@ function TurnChangesCard({
   );
 }
 
+function ThoughtBlock({
+  text,
+  sessionId,
+  cwd,
+  live = false,
+}: {
+  text: string;
+  sessionId?: string;
+  cwd?: string;
+  live?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(live);
+
+  useEffect(() => {
+    // Live reasoning is useful while a turn is running; once it completes,
+    // leave a compact title so the transcript stays scannable.
+    setExpanded(live);
+  }, [live]);
+
+  return (
+    <section className={`msg thought${expanded ? " expanded" : ""}${live ? " live" : ""}`}>
+      <button
+        className="thought-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="msg-role">思考过程</span>
+        <span className="thought-state">{live ? "生成中" : "已完成"}</span>
+        <svg className="thought-chevron" viewBox="0 0 12 12" aria-hidden>
+          <path d="m4.25 3.5 3.5 2.5-3.5 2.5" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      <div className={`thought-body${expanded ? " open" : ""}`} aria-hidden={!expanded}>
+        <div className="body">
+          <Markdown text={text} sessionId={sessionId} cwd={cwd} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function RestItem({
   item,
   onOpenFile,
@@ -365,12 +407,7 @@ function RestItem({
     );
   }
   if (item.kind === "thought") {
-    return (
-      <div className="msg thought">
-        <div className="msg-role">思考</div>
-        <div className="body">{item.text}</div>
-      </div>
-    );
+    return <ThoughtBlock text={item.text} sessionId={sessionId} cwd={cwd} />;
   }
   return <div className="msg thought">{item.kind === "status" ? item.text : ""}</div>;
 }
@@ -564,12 +601,9 @@ export function MessageStream({
                   />
                 ) : null}
                 {turn.thought || turn.tool ? (
-                  <div className="turn-live">
+                  <div className={`turn-live${live ? " live" : ""}`}>
                     {turn.thought ? (
-                      <div className="msg thought">
-                        <div className="msg-role">思考</div>
-                        <div className="body">{turn.thought.text}</div>
-                      </div>
+                      <ThoughtBlock text={turn.thought.text} sessionId={sessionId} cwd={cwd} live={live} />
                     ) : null}
                     {turn.tool ? <ToolCard item={turn.tool} onOpenFile={onOpenFile} /> : null}
                   </div>

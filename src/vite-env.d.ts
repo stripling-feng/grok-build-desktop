@@ -144,13 +144,15 @@ declare global {
         cwd?: string;
       }) => Promise<{ path: string; dataUrl: string } | null>;
       windowControl: (action: "min" | "max" | "close") => Promise<void>;
+      windowState: () => Promise<{ maximized: boolean; fullscreen: boolean }>;
+      onWindowState: (cb: (state: { maximized: boolean; fullscreen: boolean }) => void) => () => void;
       settings: (cwd?: string | null) => Promise<AppSettings>;
       proxySettings: () => Promise<ProxySettings>;
       setProxySettings: (input: ProxySettings) => Promise<ProxyApplyResult>;
       testProxy: (input: ProxySettings, target: "oauth" | "api") => Promise<ProxyTestResult>;
       setModel: (id: string) => Promise<AppSettings>;
       setReasoningEffort: (effort: ReasoningEffort, sessionId?: string) => Promise<AppSettings>;
-      setPermission: (mode: PermissionMode) => Promise<AppSettings>;
+      setPermission: (mode: PermissionMode) => Promise<void>;
       setBrowserControl: (enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
       setComputerControl: (enabled: boolean, cwd?: string | null) => Promise<AppSettings>;
       setSubagentsEnabled: (enabled: boolean, cwd?: string | null) => Promise<AppSettings>;

@@ -38,6 +38,7 @@ import {
   latestPlan,
   mergeTranscriptWithLiveItems,
   planRevisions,
+  stripEphemeral,
 } from "../src/lib/stream";
 import { threadTitleForDisplay, threadTitleFromPrompt } from "../src/lib/thread-title";
 import { settingsForAccountMethod } from "../src/lib/model-options";
@@ -159,6 +160,37 @@ test("API login selects the custom model without corrupting OAuth credentials", 
   });
   assert.equal(repaired.changed, true);
   assert.deepEqual(repaired.auth, { "https://auth.x.ai::user": oauth });
+});
+
+test("API provider updates replace legacy multi-line reasoning arrays", () => {
+  const original = [
+    "[model.desktop-api]",
+    'reasoning_efforts = [',
+    '    "low",',
+    '    "medium",',
+    '    "high",',
+    '    "xhigh",',
+    "]",
+    "",
+  ].join("\n");
+  const updated = buildApiProviderConfig(original, {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+  });
+  assert.match(updated, /reasoning_efforts = \["low","medium","high","xhigh"\]/);
+  assert.doesNotMatch(updated, /^\s+"(?:low|medium|high|xhigh)",?\s*$/m);
+  assert.doesNotMatch(updated, /^\s*]\s*$/m);
+
+  const malformed = original.replace(
+    /reasoning_efforts = \[[\s\S]*?\]/,
+    'reasoning_efforts = ["low","medium","high","xhigh"]\n    "low",\n    "medium",\n    "high",\n    "xhigh",\n]',
+  );
+  const repaired = buildApiProviderConfig(malformed, {
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "secret-test-key",
+  });
+  assert.doesNotMatch(repaired, /^\s+"(?:low|medium|high|xhigh)",?\s*$/m);
+  assert.doesNotMatch(repaired, /^\s*]\s*$/m);
 });
 
 test("saved API provider configuration can be loaded back into the login form", () => {
@@ -302,6 +334,17 @@ test("a transcript containing the live user turn is merged without duplication",
     transcript[1],
     ...live,
   ]);
+});
+
+test("completed turns keep thought text while removing ephemeral tool cards", () => {
+  const items: StreamItem[] = [
+    { kind: "user", text: "检查项目" },
+    { kind: "thought", text: "**先看结构**" },
+    { kind: "tool", id: "tool-1", title: "读取文件", status: "completed" },
+    { kind: "agent", text: "已完成" },
+  ];
+
+  assert.deepEqual(stripEphemeral(items), [items[0], items[1], items[3]]);
 });
 
 test("live and fallback turn completion publish exactly once", () => {

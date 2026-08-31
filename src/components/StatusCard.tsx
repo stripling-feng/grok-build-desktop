@@ -198,6 +198,7 @@ export function StatusCard({
               {commitOpen ? (
                 <form
                   className="status-commit"
+                  noValidate
                   onSubmit={(e) => {
                     e.preventDefault();
                     if (!cwd) return;
@@ -209,6 +210,7 @@ export function StatusCard({
                   }}
                 >
                   <textarea
+                    className="resize-none"
                     value={message}
                     onChange={(e) => setMessage(e.target.value)}
                     placeholder="提交说明"

@@ -644,6 +644,8 @@ function createWindow() {
     height: 860,
     minWidth: 980,
     minHeight: 640,
+    resizable: true,
+    maximizable: true,
     title: "Grok 桌面端",
     backgroundColor: "#ffffff",
     icon: appIconPath(),
@@ -659,6 +661,15 @@ function createWindow() {
   });
   mainWindow = win;
   log("window created");
+
+  const publishWindowState = () => {
+    send("grok:window-state", { maximized: win.isMaximized(), fullscreen: win.isFullScreen() });
+  };
+  win.on("maximize", publishWindowState);
+  win.on("unmaximize", publishWindowState);
+  win.on("enter-full-screen", publishWindowState);
+  win.on("leave-full-screen", publishWindowState);
+  win.webContents.once("did-finish-load", publishWindowState);
 
   win.once("ready-to-show", () => {
     log("window ready-to-show");
@@ -1530,8 +1541,9 @@ ipcMain.handle("grok:setComputerControl", async (_e, enabled: boolean, cwd?: str
   return loadSettings(cwd);
 });
 ipcMain.handle("grok:setPermission", (_e, mode: PermissionMode) => {
+  // This is a global, file-backed preference. Returning only after the write
+  // keeps a simple mode change from waiting on the full CLI/settings scan.
   setPermissionMode(mode);
-  return loadSettings();
 });
 ipcMain.handle("grok:setSkillDisabled", async (_e, name: string, disabled: boolean, cwd?: string | null) => {
   try {
@@ -1860,4 +1872,9 @@ ipcMain.handle("grok:window", (_e, action: "min" | "max" | "close") => {
     if (win.isMaximized()) win.unmaximize();
     else win.maximize();
   } else win.close();
+});
+
+ipcMain.handle("grok:window-state", () => {
+  const win = mainWindow;
+  return { maximized: Boolean(win && win.isMaximized()), fullscreen: Boolean(win && win.isFullScreen()) };
 });

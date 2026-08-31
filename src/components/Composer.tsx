@@ -10,6 +10,7 @@ import type {
 } from "../../electron/shared";
 import type { QueuedFollowUp } from "../../electron/follow-ups";
 import { AttachmentCard } from "./AttachmentCard";
+import { ModalPortal } from "./ModalPortal";
 import { permissionOptionLabel } from "../lib/i18n";
 
 type Props = {
@@ -215,6 +216,14 @@ function IconSend() {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+function IconStop() {
+  return (
+    <svg className="stop-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden>
+      <rect x="4" y="4" width="8" height="8" rx="1.35" fill="currentColor" />
     </svg>
   );
 }
@@ -435,6 +444,14 @@ export function Composer({
   const [previews, setPreviews] = useState<Record<string, string>>({});
 
   useEffect(() => setGoalDraft(goal), [goal]);
+  useEffect(() => {
+    if (!goalOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setGoalOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [goalOpen]);
   useEffect(() => setSlashIndex(0), [value]);
   useEffect(() => {
     setPreviews((cur) => {
@@ -757,7 +774,7 @@ export function Composer({
             <div className="composer-chips">
               <span className="chip" title={goal}>
                 目标：{goal}
-                <button type="button" onClick={() => onGoal("")}>
+                <button type="button" aria-label="移除目标" onClick={() => onGoal("")}>
                   ×
                 </button>
               </span>
@@ -772,8 +789,8 @@ export function Composer({
                   className={`slash-item${i === slashIndex ? " on" : ""}`}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    applySlash(item);
                   }}
+                  onClick={() => applySlash(item)}
                 >
                   <strong>{item.label}</strong>
                   <em>{item.hint}</em>
@@ -788,6 +805,7 @@ export function Composer({
             </div>
           ) : null}
           <textarea
+            className="resize-none"
             ref={ref}
             value={value}
             disabled={disabled}
@@ -876,6 +894,7 @@ export function Composer({
                         key={p.id}
                         type="button"
                         className={`perm-option ${p.tone}${perm === p.id ? " on" : ""}`}
+                        aria-pressed={perm === p.id}
                         onClick={() => {
                           onPermissionMode(p.id);
                           setPermOpen(false);
@@ -954,6 +973,7 @@ export function Composer({
                               key={m.id}
                               type="button"
                               className={`model-option${m.id === settings.model ? " on" : ""}`}
+                              aria-pressed={m.id === settings.model}
                               onClick={() => onModel(m.id)}
                             >
                               <span className={`model-radio${m.id === settings.model ? " on" : ""}`} />
@@ -995,7 +1015,7 @@ export function Composer({
               {busy ? (
                 <>
                   <button className="send-round stop" type="button" onClick={onStop} aria-label="停止">
-                    ■
+                    <IconStop />
                   </button>
                   <button
                     className="send-round follow-up-send"
@@ -1025,35 +1045,37 @@ export function Composer({
       </div>
 
       {goalOpen ? (
-        <div className="modal-backdrop" onClick={() => setGoalOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h2>目标</h2>
-              <button className="btn small ghost" type="button" onClick={() => setGoalOpen(false)}>
-                关闭
-              </button>
-            </div>
-            <p className="settings-hint">这个目标会一直带进当前项目的新会话。</p>
-            <textarea
-              className="goal-input"
-              value={goalDraft}
-              placeholder="例如：把登录流程做到能上线"
-              onChange={(e) => setGoalDraft(e.target.value)}
-            />
-            <div className="permission-actions">
-              <button
-                className="btn primary"
-                type="button"
-                onClick={() => {
-                  onGoal(goalDraft.trim());
-                  setGoalOpen(false);
-                }}
-              >
-                保存
-              </button>
+        <ModalPortal>
+          <div className="modal-backdrop" onClick={() => setGoalOpen(false)}>
+            <div className="modal" role="dialog" aria-modal="true" aria-labelledby="goal-dialog-title" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-head">
+                <h2 id="goal-dialog-title">目标</h2>
+                <button className="btn small ghost" type="button" onClick={() => setGoalOpen(false)}>
+                  关闭
+                </button>
+              </div>
+              <p className="settings-hint">这个目标会一直带进当前项目的新会话。</p>
+              <textarea
+                className="goal-input resize-none"
+                value={goalDraft}
+                placeholder="例如：把登录流程做到能上线"
+                onChange={(e) => setGoalDraft(e.target.value)}
+              />
+              <div className="permission-actions">
+                <button
+                  className="btn primary"
+                  type="button"
+                  onClick={() => {
+                    onGoal(goalDraft.trim());
+                    setGoalOpen(false);
+                  }}
+                >
+                  保存
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ModalPortal>
       ) : null}
     </div>
   );

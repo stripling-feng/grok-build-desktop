@@ -217,7 +217,8 @@ export function applyLiveUpdate(
 
 export function stripEphemeral(items: StreamItem[]): StreamItem[] {
   return items.filter((item) => {
-    if (item.kind === "thought") return false;
+    // Thought text is part of the conversation record. Tool cards remain
+    // ephemeral because they are reconstructed from the live ACP stream.
     if (item.kind === "tool") return false;
     return true;
   });

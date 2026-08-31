@@ -14,6 +14,7 @@ import type {
 } from "../../electron/shared";
 import { parseMcpArguments, parseMcpLines, parseMcpToolTimeouts } from "../../electron/mcp-commands";
 import { Markdown } from "../lib/markdown";
+import { ConfirmDialog, ModalPortal } from "./ModalPortal";
 
 const MODES: { id: PermissionMode; label: string; hint: string }[] = [
   { id: "ask", label: "询问", hint: "改文件、跑命令前先问你" },
@@ -98,6 +99,7 @@ export function Settings({
   modelSelectionLocked = false,
   onClose,
   onChange,
+  onPermissionMode,
 }: {
   open: boolean;
   settings: AppSettings | null;
@@ -106,15 +108,25 @@ export function Settings({
   modelSelectionLocked?: boolean;
   onClose: () => void;
   onChange: (next: AppSettings) => void;
+  onPermissionMode?: (mode: PermissionMode) => void;
 }) {
   const [pane, setPane] = useState<SettingsPane>("general");
   useEffect(() => {
     if (open) setPane("general");
   }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !document.querySelector(".modal-backdrop.nested")) onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
   if (!open) return null;
 
   return (
-    <div className="settings-overlay" role="dialog" aria-label="设置">
+    <ModalPortal>
+      <div className="settings-overlay" role="dialog" aria-modal="true" aria-label="设置">
       <header className="settings-top">
         <button className="settings-close" type="button" aria-label="关闭设置" title="关闭" onClick={onClose}>
           <svg viewBox="0 0 16 16" aria-hidden>
@@ -150,7 +162,7 @@ export function Settings({
         </nav>
         <div className={`settings-body ${pane}`}>
           {pane === "general" ? (
-            settings ? <GeneralPane settings={settings} sessionId={sessionId} modelSelectionLocked={modelSelectionLocked} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
+            settings ? <GeneralPane settings={settings} sessionId={sessionId} modelSelectionLocked={modelSelectionLocked} onChange={onChange} onPermissionMode={onPermissionMode} /> : <p className="settings-hint">正在读取配置…</p>
           ) : pane === "features" ? (
             settings ? <FeaturesPane settings={settings} cwd={cwd} onChange={onChange} /> : <p className="settings-hint">正在读取配置…</p>
           ) : pane === "network" ? (
@@ -162,7 +174,8 @@ export function Settings({
           )}
         </div>
       </div>
-    </div>
+      </div>
+    </ModalPortal>
   );
 }
 
@@ -171,11 +184,13 @@ function GeneralPane({
   sessionId,
   modelSelectionLocked,
   onChange,
+  onPermissionMode,
 }: {
   settings: AppSettings;
   sessionId?: string | null;
   modelSelectionLocked: boolean;
   onChange: (next: AppSettings) => void;
+  onPermissionMode?: (mode: PermissionMode) => void;
 }) {
   return (
     <>
@@ -214,6 +229,7 @@ function GeneralPane({
               key={item.id}
               type="button"
               className={`mode-item${settings.reasoningEffort === item.id ? " on" : ""}`}
+              aria-pressed={settings.reasoningEffort === item.id}
               onClick={() => {
                 onChange({ ...settings, reasoningEffort: item.id });
                 void window.grok.setReasoningEffort(item.id, sessionId || undefined).then(onChange);
@@ -234,8 +250,15 @@ function GeneralPane({
               key={mode.id}
               type="button"
               className={`mode-item${settings.permissionMode === mode.id ? " on" : ""}`}
+              aria-pressed={settings.permissionMode === mode.id}
               onClick={() => {
-                void window.grok.setPermission(mode.id).then(onChange);
+                if (onPermissionMode) {
+                  onPermissionMode(mode.id);
+                  return;
+                }
+                const previous = settings;
+                onChange({ ...settings, permissionMode: mode.id });
+                void window.grok.setPermission(mode.id).catch(() => onChange(previous));
               }}
             >
               <strong>{mode.label}</strong>
@@ -385,6 +408,7 @@ function NetworkPane() {
               key={mode.id}
               type="button"
               className={`mode-item${draft.mode === mode.id ? " on" : ""}`}
+              aria-pressed={draft.mode === mode.id}
               disabled={loading || Boolean(busy)}
               onClick={() => {
                 setDraft((current) => ({ ...current, mode: mode.id }));
@@ -589,8 +613,10 @@ export function SkillsTab({
   const skills = catalog?.skills ?? settings.skills;
   const bridgeReady = typeof window === "undefined" || typeof window.grok.skillsCatalog === "function";
   const projectDirReady = typeof window === "undefined" || typeof window.grok.openProjectSkillsDir === "function";
+  const [confirmAction, setConfirmAction] = useState<"reset" | { type: "path"; path: string } | null>(null);
   return (
-    <section className="settings-section">
+    <>
+      <section className="settings-section">
       <h3>Skills</h3>
       <p className="settings-hint">
         来自 Grok 原生 Skills 目录，包括项目、用户、插件、内置、Claude、Cursor 与额外路径。同名技能保留限定调用名。
@@ -628,13 +654,7 @@ export function SkillsTab({
           className="btn ghost"
           type="button"
           disabled={!bridgeReady}
-          onClick={() => {
-            if (!window.confirm("重置自定义 Skills 路径、忽略项和禁用状态？磁盘中的 SKILL.md 不会被删除。")) return;
-            void run("重置 Skills", () => window.grok.skillsReset(cwd).then((next) => {
-              onCatalog(next);
-              return next;
-            }));
-          }}
+          onClick={() => setConfirmAction("reset")}
         >重置配置</button>
       </div>
       {catalog?.paths.length ? (
@@ -646,13 +666,7 @@ export function SkillsTab({
               <button
                 className="btn small ghost"
                 type="button"
-                onClick={() => {
-                  if (!window.confirm(`移除 Skills 搜索路径？\n${skillPath}\n不会删除磁盘文件。`)) return;
-                  void run("移除 Skills 路径", () => window.grok.skillsRemovePath(skillPath, cwd).then((next) => {
-                    onCatalog(next);
-                    return next;
-                  }));
-                }}
+                onClick={() => setConfirmAction({ type: "path", path: skillPath })}
               >移除</button>
             </div>
           ))}
@@ -728,7 +742,34 @@ export function SkillsTab({
           ))}
         </ul>
       )}
-    </section>
+      </section>
+      {confirmAction ? (
+        <ConfirmDialog
+          title={confirmAction === "reset" ? "重置 Skills 配置" : "移除 Skills 搜索路径"}
+          message={confirmAction === "reset"
+            ? "将重置自定义路径、忽略项和禁用状态；磁盘中的 SKILL.md 不会被删除。"
+            : `将从搜索范围移除：\n${confirmAction.path}\n不会删除磁盘文件。`}
+          confirmLabel={confirmAction === "reset" ? "重置配置" : "移除路径"}
+          danger
+          onClose={() => setConfirmAction(null)}
+          onConfirm={() => {
+            const action = confirmAction;
+            setConfirmAction(null);
+            if (action === "reset") {
+              void run("重置 Skills", () => window.grok.skillsReset(cwd).then((next) => {
+                onCatalog(next);
+                return next;
+              }));
+              return;
+            }
+            void run("移除 Skills 路径", () => window.grok.skillsRemovePath(action.path, cwd).then((next) => {
+              onCatalog(next);
+              return next;
+            }));
+          }}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -759,6 +800,8 @@ export function McpTab({
   onChange: (next: AppSettings) => void;
   run: <T>(label: string, work: () => Promise<T>) => Promise<T | undefined>;
 }) {
+  const [removeServer, setRemoveServer] = useState<McpServerInfo | null>(null);
+
   async function refreshAfterSettings(next: AppSettings) {
     onChange(next);
     if (typeof window.grok.mcpCatalog !== "function") {
@@ -771,7 +814,8 @@ export function McpTab({
   }
 
   return (
-    <section className="settings-section">
+    <>
+      <section className="settings-section">
       <h3>MCP</h3>
       <p className="settings-hint">
         同时读取磁盘配置和当前 Grok 会话。可管理服务器、OAuth、初始化字段、单个工具开关与超时配置；
@@ -904,19 +948,7 @@ export function McpTab({
                   <button
                     className="btn small ghost"
                     type="button"
-                    onClick={() => {
-                      if (!window.confirm(`删除 MCP 服务器“${server.name}”？`)) return;
-                      const projectSource = /项目|project|仓库/i.test(server.source);
-                      void run("删除", async () => {
-                        const next = await window.grok.mcpRemove(
-                          server.name,
-                          projectSource ? "project" : "user",
-                          cwd,
-                          sessionId,
-                        );
-                        return refreshAfterSettings(next);
-                      });
-                    }}
+                    onClick={() => setRemoveServer(server)}
                   >
                     删除
                   </button>
@@ -940,7 +972,31 @@ export function McpTab({
         </ul>
       )}
       {doctor ? <pre className="settings-pre">{doctor}</pre> : null}
-    </section>
+      </section>
+      {removeServer ? (
+        <ConfirmDialog
+          title={`删除 MCP 服务器“${removeServer.name}”`}
+          message="此操作会从当前配置中移除服务器及其工具入口。"
+          confirmLabel="删除服务器"
+          danger
+          onClose={() => setRemoveServer(null)}
+          onConfirm={() => {
+            const server = removeServer;
+            setRemoveServer(null);
+            const projectSource = /项目|project|仓库/i.test(server.source);
+            void run("删除", async () => {
+              const next = await window.grok.mcpRemove(
+                server.name,
+                projectSource ? "project" : "user",
+                cwd,
+                sessionId,
+              );
+              return refreshAfterSettings(next);
+            });
+          }}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -955,12 +1011,53 @@ function PluginTileIcon() {
   );
 }
 
+function MarketplaceSectionIcon({ kind }: { kind: "source" | "catalog" }) {
+  if (kind === "source") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden>
+        <circle cx="6" cy="12" r="2.3" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <circle cx="18" cy="6" r="2.3" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <circle cx="18" cy="18" r="2.3" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="m8.1 11 7.8-4M8.1 13l7.8 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden>
+      <path d="m12 3 8 4.5-8 4.5-8-4.5L12 3Z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M4 7.5v9L12 21l8-4.5v-9M12 12v9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function MarketplaceStateIcon({ kind }: { kind: "empty" | "loading" }) {
+  if (kind === "loading") {
+    return (
+      <span className="marketplace-state-icon is-loading" aria-hidden>
+        <svg viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" strokeWidth="1.6" opacity=".24" />
+          <path d="M20 12a8 8 0 0 0-8-8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      </span>
+    );
+  }
+  return (
+    <span className="marketplace-state-icon" aria-hidden>
+      <svg viewBox="0 0 24 24">
+        <path d="M5 7.5h14M5 12h9M5 16.5h6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        <path d="m17 14.5 3 3-3 3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </span>
+  );
+}
+
 export function PluginsTab({
   settings,
   cwd,
   sessionId,
   available,
   loading,
+  error,
   onRefresh,
   onMarket,
   onInstall,
@@ -973,6 +1070,7 @@ export function PluginsTab({
   sessionId?: string | null;
   available: AvailablePluginInfo[] | null;
   loading: boolean;
+  error?: string;
   onRefresh: () => void | Promise<void>;
   onMarket: () => void;
   onInstall: () => void;
@@ -984,6 +1082,7 @@ export function PluginsTab({
   const [installingPlugin, setInstallingPlugin] = useState("");
   const [installingDependency, setInstallingDependency] = useState("");
   const [installedDependencies, setInstalledDependencies] = useState<Set<string>>(() => new Set());
+  const [removeMarketplaceName, setRemoveMarketplaceName] = useState("");
   const marketplaceTabs = Array.from(new Set([
     ...settings.marketplaces.map((item) => item.name),
     ...(available || []).map((item) => item.marketplace),
@@ -994,6 +1093,9 @@ export function PluginsTab({
   const visiblePlugins = (available || []).filter((item) =>
     selectedMarketplace === "all" || item.marketplace === selectedMarketplace,
   );
+  const marketplaceToRemove = removeMarketplaceName
+    ? settings.marketplaces.find((item) => item.name === removeMarketplaceName) || null
+    : null;
 
   useEffect(() => {
     if (selectedMarketplace !== "all" && !marketplaceTabs.includes(selectedMarketplace)) {
@@ -1026,13 +1128,19 @@ export function PluginsTab({
 
   return (
     <>
-      <section className="settings-section">
-        <div className="plugin-section-head">
-          <div>
-            <h3>市场源</h3>
-            <p className="settings-hint">更新会重新同步远程仓库；Windows 兼容镜像也会重新生成。</p>
+      <section className="settings-section marketplace-panel market-source-section">
+        <div className="plugin-section-head marketplace-section-head">
+          <div className="marketplace-section-title">
+            <span className="marketplace-section-icon" aria-hidden>
+              <MarketplaceSectionIcon kind="source" />
+            </span>
+            <div>
+              <span className="marketplace-section-eyebrow">CATALOG SOURCES</span>
+              <h3>市场源 <span className="marketplace-section-count">{settings.marketplaces.length}</span></h3>
+              <p className="settings-hint">更新会重新同步远程仓库；Windows 兼容镜像也会重新生成。</p>
+            </div>
           </div>
-          <div className="row-actions">
+          <div className="row-actions marketplace-section-actions">
             <button className="btn small" type="button" onClick={onMarket}>
               添加市场源
             </button>
@@ -1055,7 +1163,16 @@ export function PluginsTab({
           </div>
         </div>
         {settings.marketplaces.length === 0 ? (
-          <p className="settings-hint">还没有市场源。可添加 GitHub 仓库、Git URL 或本地目录。</p>
+          <div className="marketplace-empty-state marketplace-empty-source" role="status">
+            <MarketplaceStateIcon kind="empty" />
+            <div>
+              <strong>还没有市场源</strong>
+              <p>可添加 GitHub 仓库、Git URL 或本地目录，插件目录会在同步后出现在下方。</p>
+            </div>
+            <button className="btn small primary" type="button" onClick={onMarket}>
+              添加第一个市场源
+            </button>
+          </div>
         ) : (
           <>
             <div className="market-source-tabs" role="tablist" aria-label="市场源">
@@ -1064,8 +1181,13 @@ export function PluginsTab({
                 type="button"
                 role="tab"
                 aria-selected={selectedMarketplace === "all"}
+                id="market-source-tab-all"
+                aria-controls="market-source-panel"
                 onClick={() => setSelectedMarketplace("all")}
               >
+                <span className="market-source-tab-mark" aria-hidden>
+                  <MarketplaceSectionIcon kind="catalog" />
+                </span>
                 <strong>全部</strong>
                 <span>{available?.length || 0}</span>
               </button>
@@ -1075,24 +1197,35 @@ export function PluginsTab({
                   type="button"
                   role="tab"
                   aria-selected={selectedMarketplace === name}
+                  id={`market-source-tab-${name}`}
+                  aria-controls="market-source-panel"
                   title={name}
                   key={name}
                   onClick={() => setSelectedMarketplace(name)}
                 >
+                  <span className="market-source-tab-mark" aria-hidden>
+                    <MarketplaceSectionIcon kind="source" />
+                  </span>
                   <strong>{name}</strong>
                   <span>{(available || []).filter((item) => item.marketplace === name).length}</span>
                 </button>
               ))}
             </div>
             {selectedSource ? (
-              <div className="market-source-detail" role="tabpanel">
-                <div>
-                  <strong>{selectedSource.name}</strong>
-                  <span>{selectedSource.kind}</span>
+              <div className="market-source-detail" id="market-source-panel" role="tabpanel" aria-label={`${selectedSource.name} 市场源`}>
+                <div className="market-source-detail-copy">
+                  <div className="market-source-detail-title">
+                    <span className="market-source-detail-mark" aria-hidden>
+                      <MarketplaceSectionIcon kind="source" />
+                    </span>
+                    <strong>{selectedSource.name}</strong>
+                    <span>{selectedSource.kind}</span>
+                  </div>
                   {selectedSource.url ? <p>{selectedSource.url}</p> : null}
                 </div>
+                <span className="market-source-detail-status"><i aria-hidden />已连接目录</span>
                 {selectedSource.url ? (
-                  <div className="row-actions">
+                  <div className="row-actions market-source-detail-actions">
                     <button
                       className="btn small ghost"
                       type="button"
@@ -1111,17 +1244,7 @@ export function PluginsTab({
                     <button
                       className="btn small ghost danger"
                       type="button"
-                      onClick={() => {
-                        if (!window.confirm(`移除市场源「${selectedSource.name}」？Grok CLI 会同时卸载从该来源安装的插件。`)) return;
-                        void run("移除市场", () =>
-                          window.grok.marketplaceRemove(selectedSource.url, cwd).then(async (next) => {
-                            onChange(next);
-                            setSelectedMarketplace("all");
-                            await onRefresh();
-                            return next;
-                          }),
-                        );
-                      }}
+                      onClick={() => setRemoveMarketplaceName(selectedSource.name)}
                     >
                       移除当前源
                     </button>
@@ -1129,18 +1252,24 @@ export function PluginsTab({
                 ) : null}
               </div>
             ) : (
-              <p className="market-source-summary">当前显示全部市场，共 {available?.length || 0} 个插件。</p>
+              <p className="market-source-summary"><i aria-hidden />当前显示全部市场，共 <strong>{available?.length || 0}</strong> 个插件。</p>
             )}
           </>
         )}
       </section>
-      <section className="settings-section plugin-browser">
-        <div className="plugin-section-head">
-          <div>
-            <h3>可安装插件{selectedMarketplace === "all" ? "" : ` · ${selectedMarketplace}`}</h3>
-            <p className="settings-hint">使用上方市场 Tab 筛选插件；这里的刷新只重读目录，远程同步请使用“更新”。</p>
+      <section className="settings-section marketplace-panel plugin-browser plugin-browser-section">
+        <div className="plugin-section-head marketplace-section-head">
+          <div className="marketplace-section-title">
+            <span className="marketplace-section-icon" aria-hidden>
+              <MarketplaceSectionIcon kind="catalog" />
+            </span>
+            <div>
+              <span className="marketplace-section-eyebrow">DISCOVER &amp; INSTALL</span>
+              <h3>可安装插件{selectedMarketplace === "all" ? "" : ` · ${selectedMarketplace}`} <span className="marketplace-section-count">{available ? visiblePlugins.length : "—"}</span></h3>
+              <p className="settings-hint">使用上方市场 Tab 筛选插件；这里的刷新只重读目录，远程同步请使用“更新”。</p>
+            </div>
           </div>
-          <div className="row-actions">
+          <div className="row-actions marketplace-section-actions">
             <button className="btn small" type="button" onClick={onInstall}>
               从来源安装
             </button>
@@ -1177,8 +1306,51 @@ export function PluginsTab({
             </button>
           </div>
         </div>
-        {available === null && loading ? <p className="settings-hint">正在读取市场…</p> : null}
-        {available && visiblePlugins.length === 0 ? <p className="settings-hint">当前市场里暂时没有条目。</p> : null}
+        {available === null && error ? (
+          <div className="marketplace-state-card marketplace-error-state" role="alert">
+            <MarketplaceStateIcon kind="empty" />
+            <div>
+              <strong>市场目录读取失败</strong>
+              <span>{error}</span>
+            </div>
+            <button className="btn small" type="button" onClick={onRefresh}>重试</button>
+          </div>
+        ) : null}
+        {available === null && !error && loading ? (
+          <div className="marketplace-state-card marketplace-loading-state" role="status" aria-live="polite">
+            <MarketplaceStateIcon kind="loading" />
+            <div>
+              <strong>正在读取市场…</strong>
+              <span>整理来源和插件信息，马上就好。</span>
+            </div>
+            <div className="marketplace-loading-lines" aria-hidden><i /><i /><i /></div>
+          </div>
+        ) : null}
+        {available === null && !error && loading ? (
+          <div className="marketplace-skeleton-grid" aria-hidden>
+            {[0, 1, 2].map((item) => (
+              <div className="marketplace-skeleton-card" key={item}>
+                <i className="skeleton-icon" />
+                <i className="skeleton-title" />
+                <i className="skeleton-line" />
+                <i className="skeleton-line short" />
+                <i className="skeleton-action" />
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {available && visiblePlugins.length === 0 ? (
+          <div className="marketplace-state-card marketplace-empty-filter" role="status">
+            <MarketplaceStateIcon kind="empty" />
+            <div>
+              <strong>当前市场里暂时没有条目</strong>
+              <span>{selectedMarketplace === "all" ? "更新市场源或从来源安装一个插件。" : `“${selectedMarketplace}”暂时没有可展示的插件。`}</span>
+            </div>
+            {selectedMarketplace !== "all" ? (
+              <button className="btn small ghost" type="button" onClick={() => setSelectedMarketplace("all")}>查看全部市场</button>
+            ) : null}
+          </div>
+        ) : null}
         {available && visiblePlugins.length ? (
           <ul className="plugin-card-grid plugin-available-grid">
             {visiblePlugins.map((item) => {
@@ -1187,16 +1359,38 @@ export function PluginsTab({
               const description = item.description || installedPlugin?.description || "暂无插件说明。";
               const installing = installingPlugin === item.name;
               const missingDependencies = (installedPlugin?.dependencies || []).filter((dependency) => !dependency.available);
+              const capabilities = [
+                item.skillCount > 0 ? `${item.skillCount} 个 Skill` : "基础扩展",
+                item.hasMcp ? "MCP" : null,
+                item.hasAgents ? "Agent" : null,
+                item.hasHooks ? "Hooks" : null,
+                item.commandCount > 0 ? `${item.commandCount} 个命令` : null,
+                item.hasLsp ? "LSP" : null,
+              ].filter((value): value is string => Boolean(value)).slice(0, 4);
               return (
                 <li
                   className={`plugin-card plugin-available-card${installing ? " installing" : ""}${missingDependencies.length ? " has-runtime-warning" : ""}`}
+                  data-plugin-name={item.name}
+                  data-marketplace={item.marketplace}
                   key={`${item.marketplace}:${item.name}`}
                 >
-                  <PluginTileIcon />
-                  <strong className="plugin-tile-name" title={item.name}>{item.name}</strong>
+                  <div className="plugin-card-topline">
+                    <PluginTileIcon />
+                    <span className={`plugin-card-state${installed ? " installed" : ""}`}>
+                      <i aria-hidden />
+                      {installed ? "已安装" : "可安装"}
+                    </span>
+                  </div>
+                  <div className="plugin-card-heading">
+                    <strong className="plugin-tile-name" title={item.name}>{item.name}</strong>
+                    <span className="plugin-card-source" title={item.marketplace}>{item.marketplace}</span>
+                  </div>
                   <p className="plugin-tile-description" title={description}>
                     {description}
                   </p>
+                  <div className="plugin-card-capabilities" aria-label="插件能力">
+                    {capabilities.map((capability) => <span key={capability}>{capability}</span>)}
+                  </div>
                   {missingDependencies.map((dependency) => {
                     const key = `${item.name}:${dependency.command}`;
                     const installingRuntime = installingDependency === key;
@@ -1228,49 +1422,74 @@ export function PluginsTab({
                       </div>
                     );
                   })}
-                  <button
-                    className={`btn small plugin-card-install plugin-tile-action plugin-available-install${installed ? " is-installed" : ""}${installing ? " installing" : ""}`}
-                    type="button"
-                    disabled={Boolean(installingPlugin)}
-                    aria-busy={installing}
-                    onClick={() => installed ? onUninstall(item.name) : void installMarketplacePlugin(item)}
-                  >
-                    {installing ? (
-                      <>
-                        <svg className="spinner" width="13" height="13" viewBox="0 0 16 16" aria-hidden>
-                          <circle cx="8" cy="8" r="5.4" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.24" />
-                          <path
-                            d="M13.4 8a5.4 5.4 0 0 0-5.4-5.4"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.6"
-                            strokeLinecap="round"
-                          />
-                        </svg>
-                        安装配置中…
-                      </>
-                    ) : installed ? (
-                      <>
-                        <svg viewBox="0 0 16 16" aria-hidden>
-                          <path d="M3.5 4.5h9M6 4.5V3.2h4v1.3M5 6.2l.5 6.3h5l.5-6.3" />
-                        </svg>
-                        已安装 · 卸载
-                      </>
-                    ) : (
-                      <>
-                        <svg viewBox="0 0 16 16" aria-hidden>
-                          <path d="M8 2.5v7M5.5 7.2 8 9.7l2.5-2.5M3 12.5h10" />
-                        </svg>
-                        安装并完成配置
-                      </>
-                    )}
-                  </button>
+                  <div className="plugin-card-footer">
+                    <span className="plugin-card-footnote">{installed ? "已加入工作台" : "安装后可在会话中调用"}</span>
+                    <button
+                      className={`btn small plugin-card-install plugin-tile-action plugin-available-install${installed ? " is-installed" : ""}${installing ? " installing" : ""}`}
+                      type="button"
+                      disabled={Boolean(installingPlugin)}
+                      aria-busy={installing}
+                      aria-label={installing ? `正在配置 ${item.name}` : installed ? `卸载 ${item.name}` : `安装 ${item.name}`}
+                      onClick={() => installed ? onUninstall(item.name) : void installMarketplacePlugin(item)}
+                    >
+                      {installing ? (
+                        <>
+                          <svg className="spinner" width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                            <circle cx="8" cy="8" r="5.4" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.24" />
+                            <path
+                              d="M13.4 8a5.4 5.4 0 0 0-5.4-5.4"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.6"
+                              strokeLinecap="round"
+                            />
+                          </svg>
+                          安装配置中…
+                        </>
+                      ) : installed ? (
+                        <>
+                          <svg viewBox="0 0 16 16" aria-hidden>
+                            <path d="M3.5 4.5h9M6 4.5V3.2h4v1.3M5 6.2l.5 6.3h5l.5-6.3" />
+                          </svg>
+                          已安装 · 卸载
+                        </>
+                      ) : (
+                        <>
+                          <svg viewBox="0 0 16 16" aria-hidden>
+                            <path d="M8 2.5v7M5.5 7.2 8 9.7l2.5-2.5M3 12.5h10" />
+                          </svg>
+                          安装并完成配置
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </li>
               );
             })}
           </ul>
         ) : null}
       </section>
+      {marketplaceToRemove ? (
+        <ConfirmDialog
+          title={`移除市场源「${marketplaceToRemove.name}」`}
+          message={`Grok CLI 会同时卸载从该来源安装的插件。此操作不会删除本地项目文件。`}
+          confirmLabel="移除市场源"
+          danger
+          onClose={() => setRemoveMarketplaceName("")}
+          onConfirm={() => {
+            const source = marketplaceToRemove;
+            setRemoveMarketplaceName("");
+            void run("移除市场", () =>
+              window.grok.marketplaceRemove(source.url, cwd).then(async (next) => {
+                onChange(next);
+                setSelectedMarketplace("all");
+                await onRefresh();
+                return next;
+              }),
+            );
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -1356,24 +1575,34 @@ function NestedModal({
   onClose: () => void;
   children: ReactNode;
 }) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
   return (
-    <div
-      className="modal-backdrop nested"
-      onClick={(e) => {
-        e.stopPropagation();
-        onClose();
-      }}
-    >
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">
-          <h2>{title}</h2>
-          <button className="btn small ghost" type="button" onClick={onClose}>
-            关闭
-          </button>
+    <ModalPortal>
+      <div
+        className="modal-backdrop nested"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      >
+        <div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
+          <div className="modal-head">
+            <h2>{title}</h2>
+            <button className="btn small ghost" type="button" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+          {children}
         </div>
-        {children}
       </div>
-    </div>
+    </ModalPortal>
   );
 }
 
@@ -1450,12 +1679,12 @@ export function McpForm({
       {transport === "stdio" ? (
         <label className="field">
           <span>参数（支持引号；也可每行一个参数）</span>
-          <textarea value={args} onChange={(e) => setArgs(e.target.value)} placeholder={'-y "@scope/server" .'} rows={2} />
+          <textarea className="resize-none" value={args} onChange={(e) => setArgs(e.target.value)} placeholder={'-y "@scope/server" .'} rows={2} />
         </label>
       ) : null}
       <label className="field">
         <span>{transport === "stdio" ? "环境变量 KEY=value，一行一个" : "请求头 Name: Value，一行一个"}</span>
-        <textarea value={connectionLines} onChange={(e) => setConnectionLines(e.target.value)} rows={3} />
+        <textarea className="resize-none" value={connectionLines} onChange={(e) => setConnectionLines(e.target.value)} rows={3} />
       </label>
       <details className="extension-details form-details">
         <summary>高级配置</summary>
@@ -1496,7 +1725,7 @@ export function McpForm({
         </div>
         <label className="field">
           <span>单工具超时，一行一个 tool_name=秒数</span>
-          <textarea value={toolTimeouts} onChange={(e) => setToolTimeouts(e.target.value)} rows={3} />
+          <textarea className="resize-none" value={toolTimeouts} onChange={(e) => setToolTimeouts(e.target.value)} rows={3} />
         </label>
         <label className="check-row compact">
           <input type="checkbox" checked={exposeImageBase64} onChange={(e) => setExposeImageBase64(e.target.checked)} />
@@ -1645,7 +1874,7 @@ export function SkillCreateForm({
       </label>
       <label className="field">
         <span>描述</span>
-        <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="说明这个 Skill 做什么，以及什么时候应该使用。" />
+        <textarea className="resize-none" value={description} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="说明这个 Skill 做什么，以及什么时候应该使用。" />
       </label>
       <label className="field">
         <span>范围</span>
@@ -1656,13 +1885,13 @@ export function SkillCreateForm({
       </label>
       <label className="field">
         <span>指令正文</span>
-        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={8} placeholder="# 工作流程&#10;&#10;1. 检查…&#10;2. 修改…&#10;3. 验证…" />
+        <textarea className="resize-none" value={body} onChange={(e) => setBody(e.target.value)} rows={8} placeholder="# 工作流程&#10;&#10;1. 检查…&#10;2. 修改…&#10;3. 验证…" />
       </label>
       <details className="extension-details form-details">
         <summary>调用与元数据</summary>
         <label className="field"><span>何时使用</span><input value={whenToUse} onChange={(e) => setWhenToUse(e.target.value)} /></label>
         <label className="field"><span>参数提示</span><input value={argumentHint} onChange={(e) => setArgumentHint(e.target.value)} placeholder="[target] [--fix]" /></label>
-        <label className="field"><span>允许的工具（空格、逗号或换行分隔）</span><textarea value={allowedTools} onChange={(e) => setAllowedTools(e.target.value)} rows={2} /></label>
+        <label className="field"><span>允许的工具（空格、逗号或换行分隔）</span><textarea className="resize-none" value={allowedTools} onChange={(e) => setAllowedTools(e.target.value)} rows={2} /></label>
         <label className="check-row compact">
           <input type="checkbox" checked={userInvocable} onChange={(e) => setUserInvocable(e.target.checked)} />
           <span><strong>允许用户手动调用</strong><small>关闭后不显示为用户可调用的 /skill。</small></span>
@@ -1900,9 +2129,11 @@ export function PluginToolsForm({
   const [force, setForce] = useState(false);
   const [push, setPush] = useState(false);
   const [output, setOutput] = useState("");
+  const [confirmTag, setConfirmTag] = useState(false);
 
   return (
-    <NestedModal title="插件开发工具" onClose={onClose}>
+    <>
+      <NestedModal title="插件开发工具" onClose={onClose}>
       <p className="settings-hint">对插件目录执行清单校验，或按照 manifest 版本创建 Git 标签。</p>
       <label className="field">
         <span>插件目录</span>
@@ -1947,7 +2178,10 @@ export function PluginToolsForm({
           className={`btn${dryRun ? "" : " danger"}`}
           type="button"
           onClick={() => {
-            if (!dryRun && !window.confirm(`将根据插件 manifest 创建 Git 标签${push ? "并推送到远程" : ""}，继续吗？`)) return;
+            if (!dryRun) {
+              setConfirmTag(true);
+              return;
+            }
             void run(dryRun ? "预览标签" : "创建标签", async () => {
               const text = await window.grok.pluginTag(
                 { path: targetPath.trim() || ".", dryRun, force, push: dryRun ? false : push },
@@ -1962,7 +2196,28 @@ export function PluginToolsForm({
         </button>
       </div>
       {output ? <pre className="settings-pre plugin-output">{output}</pre> : null}
-    </NestedModal>
+      </NestedModal>
+      {confirmTag ? (
+        <ConfirmDialog
+          title="创建 Git 标签"
+          message={`将根据插件 manifest 创建 Git 标签${push ? "并推送到远程" : ""}。请确认工作区和版本信息无误。`}
+          confirmLabel={push ? "创建并推送" : "创建标签"}
+          danger={push}
+          onClose={() => setConfirmTag(false)}
+          onConfirm={() => {
+            setConfirmTag(false);
+            void run("创建标签", async () => {
+              const text = await window.grok.pluginTag(
+                { path: targetPath.trim() || ".", dryRun: false, force, push },
+                cwd,
+              );
+              setOutput(text || "标签创建完成。");
+              return text;
+            });
+          }}
+        />
+      ) : null}
+    </>
   );
 }
 

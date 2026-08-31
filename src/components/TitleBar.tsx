@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import grokMark from "../assets/grok-mark.jpg";
 
 function TerminalIcon() {
@@ -38,6 +39,15 @@ function MaximizeIcon() {
   );
 }
 
+function RestoreIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+      <rect x="3.1" y="2.1" width="6.8" height="6.8" rx="0.7" fill="none" stroke="currentColor" strokeWidth="1.05" />
+      <path d="M2.1 4.2v5.1c0 .4.3.7.7.7h5.1" fill="none" stroke="currentColor" strokeWidth="1.05" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function CloseIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
@@ -53,8 +63,41 @@ export function TitleBar({
   onTerminal?: () => void;
   terminalActive?: boolean;
 }) {
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const windowApi = window.grok as typeof window.grok & {
+      windowState?: () => Promise<{ maximized: boolean; fullscreen: boolean }>;
+      onWindowState?: (cb: (state: { maximized: boolean; fullscreen: boolean }) => void) => () => void;
+    };
+    if (typeof windowApi.windowState === "function") {
+      void windowApi.windowState().then((state) => {
+        if (mounted) setIsMaximized(state.maximized);
+      }).catch(() => undefined);
+    }
+    const off = typeof windowApi.onWindowState === "function"
+      ? windowApi.onWindowState((state) => {
+          if (mounted) setIsMaximized(state.maximized);
+        })
+      : () => undefined;
+    return () => {
+      mounted = false;
+      off();
+    };
+  }, []);
+
+  const toggleMaximize = () => {
+    void window.grok.windowControl("max");
+  };
+
   return (
-    <header className="titlebar">
+    <header
+      className="titlebar"
+      onDoubleClick={(event) => {
+        if (!(event.target as HTMLElement).closest("button")) toggleMaximize();
+      }}
+    >
       <div className="titlebar-left">
         <img className="titlebar-mark" src={grokMark} alt="" />
         <span>Grok 桌面端</span>
@@ -78,8 +121,13 @@ export function TitleBar({
         <button type="button" onClick={() => void window.grok.windowControl("min")} aria-label="最小化">
           <MinimizeIcon />
         </button>
-        <button type="button" onClick={() => void window.grok.windowControl("max")} aria-label="最大化">
-          <MaximizeIcon />
+        <button
+          type="button"
+          onClick={toggleMaximize}
+          aria-label={isMaximized ? "还原" : "最大化"}
+          title={isMaximized ? "还原窗口" : "最大化窗口"}
+        >
+          {isMaximized ? <RestoreIcon /> : <MaximizeIcon />}
         </button>
         <button
           type="button"

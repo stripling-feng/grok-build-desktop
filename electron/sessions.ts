@@ -1006,7 +1006,7 @@ export function loadTranscript(
     readTurnFiles(sessionId, cwd),
   );
   return {
-    items: restoredItems.filter((item) => item.kind !== "thought" && item.kind !== "tool"),
+    items: restoredItems.filter((item) => item.kind !== "tool"),
     contextUsed: contextUsage?.used ?? null,
     contextUsage,
     planAwaiting,

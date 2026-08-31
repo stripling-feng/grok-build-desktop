@@ -10,7 +10,8 @@ import { Sidebar } from "./components/Sidebar";
 import { AutomationPage, MarketplacePage, type WorkspacePage } from "./components/WorkspacePages";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { TitleBar } from "./components/TitleBar";
-import grokLogo from "./assets/grok-logo.jpg";
+import { AlertDialog, ConfirmDialog } from "./components/ModalPortal";
+import grokLogo from "./assets/grok-logo-transparent.png";
 import {
   appendTurnChanges,
   applyLiveUpdate,
@@ -72,6 +73,13 @@ type ConversationComposerState = {
   attachments: string[];
   planMode: boolean;
 };
+
+type AppConfirmAction =
+  | { kind: "threads"; threads: ThreadInfo[] }
+  | { kind: "project"; project: ProjectInfo }
+  | { kind: "project-threads"; project: ProjectInfo; threads: ThreadInfo[] }
+  | { kind: "thread"; thread: ThreadInfo }
+  | { kind: "alert"; title: string; message: string };
 
 const EMPTY_COMPOSER_STATE: ConversationComposerState = {
   draft: "",
@@ -336,6 +344,7 @@ export function App() {
   const installLogRef = useRef<HTMLDivElement | null>(null);
   const [goal, setGoal] = useState("");
   const [account, setAccount] = useState<AccountInfo | null>(null);
+  const [confirmAction, setConfirmAction] = useState<AppConfirmAction | null>(null);
   const modelSettings = settingsForAccountMethod(settings, account?.method);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     readWidth("grok.sidebarWidth", 252, SIDEBAR_MIN),
@@ -352,6 +361,7 @@ export function App() {
   const sendingRef = useRef<Set<string>>(new Set());
   const followUpSendingRef = useRef<Set<string>>(new Set());
   const renderedFollowUpIdsRef = useRef<Set<string>>(new Set());
+  const permissionRequestRef = useRef(0);
   // Vite Fast Refresh can retain the old boolean ref from earlier builds.
   // Normalize it during render so a hot-updated window can send immediately.
   if (!(sendingRef.current instanceof Set)) sendingRef.current = new Set<string>();
@@ -398,6 +408,21 @@ export function App() {
       [composerKey]: { ...(cur[composerKey] ?? EMPTY_COMPOSER_STATE), planMode: value },
     }));
   }, [composerKey]);
+
+  const changePermissionMode = useCallback((mode: PermissionMode) => {
+    const requestId = ++permissionRequestRef.current;
+    const previousMode = settings?.permissionMode;
+    setError(null);
+    setSettings((current) => (current ? { ...current, permissionMode: mode } : current));
+    void window.grok.setPermission(mode).catch((err) => {
+      if (requestId !== permissionRequestRef.current) return;
+      setSettings((current) => {
+        if (!current || current.permissionMode !== mode || previousMode === undefined) return current;
+        return { ...current, permissionMode: previousMode };
+      });
+      setError(`切换权限模式失败：${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, [settings?.permissionMode]);
   const syncRunningSession = useCallback((sessionId: string) => {
     void window.grok.runningSessions().then((ids) => {
       setRunningIds((current) =>
@@ -1720,10 +1745,7 @@ export function App() {
     });
   };
 
-  const removeSelectedThreads = (selectedThreads: ThreadInfo[]) => {
-    if (!window.confirm(`移除选中的 ${selectedThreads.length} 个会话？此操作无法撤销。`)) {
-      return;
-    }
+  const removeSelectedThreadsNow = (selectedThreads: ThreadInfo[]) => {
     void (async () => {
       const results = await Promise.all(
         selectedThreads.map(async (thread) => {
@@ -1767,6 +1789,91 @@ export function App() {
       }
     })().catch((err) => {
       setError(`无法移除所选会话：${err instanceof Error ? err.message : String(err)}`);
+      void refresh();
+    });
+  };
+
+  const removeSelectedThreads = (selectedThreads: ThreadInfo[]) => {
+    if (selectedThreads.length === 0) return;
+    setConfirmAction({ kind: "threads", threads: selectedThreads });
+  };
+
+  const removeProjectNow = (project: ProjectInfo) => {
+    void window.grok.removeProject(project.cwd).then(async (nextProjects) => {
+      if (selectedProjectCwd && samePath(selectedProjectCwd, project.cwd)) {
+        const next = nextProjects[0]?.cwd ?? null;
+        setSelectedProjectCwd(next);
+        if (active && samePath(active.projectCwd, project.cwd)) {
+          setActive(null);
+          setItems([]);
+          setContextUsed(null);
+          setContextUsage(null);
+          setPlanDocument(null);
+          setPlanPanel(null);
+        }
+        if (next) void window.grok.gitStatus(next).then(setGit);
+        else setGit(null);
+      }
+      await refresh();
+    }).catch((err) => {
+      setError(`无法移除项目：${err instanceof Error ? err.message : String(err)}`);
+      void refresh();
+    });
+  };
+
+  const removeProjectThreadsNow = (projectThreads: ThreadInfo[]) => {
+    void (async () => {
+      const removedIds = new Set(projectThreads.map((thread) => thread.id));
+      await Promise.all(
+        projectThreads.map(async (thread) => {
+          if (runningIds.has(thread.id)) {
+            await window.grok.cancel(thread.id).catch(() => undefined);
+          }
+          await window.grok.removeThread(thread.id, thread.cwd);
+          clearStoredPlanFlow(thread.id);
+        }),
+      );
+      setUnreadIds((current) => {
+        const next = new Set(current);
+        removedIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      setRunningIds((current) => {
+        const next = new Set(current);
+        removedIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      if (active && removedIds.has(active.sessionId)) {
+        setActive(null);
+        setItems([]);
+        setContextUsed(null);
+        setContextUsage(null);
+        setPlanDocument(null);
+        setPlanPanel(null);
+      }
+      await refresh();
+    })().catch((err) => {
+      setError(`无法移除全部聊天：${err instanceof Error ? err.message : String(err)}`);
+      void refresh();
+    });
+  };
+
+  const removeThreadNow = (thread: ThreadInfo) => {
+    void window.grok.removeThread(thread.id, thread.cwd).then(async () => {
+      setUnreadIds((current) =>
+        updateUnreadSessionIds(current, { sessionId: thread.id, unread: false }),
+      );
+      clearStoredPlanFlow(thread.id);
+      if (active?.sessionId === thread.id) {
+        setActive(null);
+        setItems([]);
+        setContextUsed(null);
+        setContextUsage(null);
+        setPlanPanel(null);
+      }
+      await refresh();
+    }).catch((err) => {
+      setError(`无法移除会话：${err instanceof Error ? err.message : String(err)}`);
       void refresh();
     });
   };
@@ -1847,24 +1954,7 @@ export function App() {
             void window.grok.renameProject(project.cwd, name).then(() => refresh());
           }}
           onRemoveProject={(project) => {
-            if (!window.confirm(`从列表中移除项目「${project.name}」？不会删除磁盘上的文件。`)) return;
-            void window.grok.removeProject(project.cwd).then(async (nextProjects) => {
-              if (selectedProjectCwd && samePath(selectedProjectCwd, project.cwd)) {
-                const next = nextProjects[0]?.cwd ?? null;
-                setSelectedProjectCwd(next);
-                if (active && samePath(active.projectCwd, project.cwd)) {
-                  setActive(null);
-                  setItems([]);
-                  setContextUsed(null);
-                  setContextUsage(null);
-                  setPlanDocument(null);
-                  setPlanPanel(null);
-                }
-                if (next) void window.grok.gitStatus(next).then(setGit);
-                else setGit(null);
-              }
-              await refresh();
-            });
+            setConfirmAction({ kind: "project", project });
           }}
           onRemoveProjectThreads={(project) => {
             const projectThreads = threads.filter(
@@ -1874,51 +1964,14 @@ export function App() {
                 samePath(thread.projectCwd, project.cwd),
             );
             if (projectThreads.length === 0) {
-              window.alert(`项目「${project.name}」中没有聊天。`);
+              setConfirmAction({
+                kind: "alert",
+                title: "没有可移除的聊天",
+                message: `项目「${project.name}」中没有聊天。`,
+              });
               return;
             }
-            if (
-              !window.confirm(
-                `移除项目「${project.name}」中的全部 ${projectThreads.length} 个聊天？此操作无法撤销，项目文件不会被删除。`,
-              )
-            ) {
-              return;
-            }
-
-            void (async () => {
-              const removedIds = new Set(projectThreads.map((thread) => thread.id));
-              await Promise.all(
-                projectThreads.map(async (thread) => {
-                  if (runningIds.has(thread.id)) {
-                    await window.grok.cancel(thread.id).catch(() => undefined);
-                  }
-                  await window.grok.removeThread(thread.id, thread.cwd);
-                  clearStoredPlanFlow(thread.id);
-                }),
-              );
-              setUnreadIds((current) => {
-                const next = new Set(current);
-                removedIds.forEach((id) => next.delete(id));
-                return next;
-              });
-              setRunningIds((current) => {
-                const next = new Set(current);
-                removedIds.forEach((id) => next.delete(id));
-                return next;
-              });
-              if (active && removedIds.has(active.sessionId)) {
-                setActive(null);
-                setItems([]);
-                setContextUsed(null);
-                setContextUsage(null);
-                setPlanDocument(null);
-                setPlanPanel(null);
-              }
-              await refresh();
-            })().catch((err) => {
-              setError(`无法移除全部聊天：${err instanceof Error ? err.message : String(err)}`);
-              void refresh();
-            });
+            setConfirmAction({ kind: "project-threads", project, threads: projectThreads });
           }}
           onOpenProjectFolder={(project) => {
             void window.grok.openPath(project.cwd);
@@ -1931,21 +1984,7 @@ export function App() {
           onForkThread={(thread) => void forkThread(thread)}
           onForkThreads={forkSelectedThreads}
           onRemoveThread={(thread) => {
-            if (!window.confirm(`移除会话「${thread.title}」？`)) return;
-            void window.grok.removeThread(thread.id, thread.cwd).then(async () => {
-              setUnreadIds((current) =>
-                updateUnreadSessionIds(current, { sessionId: thread.id, unread: false }),
-              );
-              clearStoredPlanFlow(thread.id);
-              if (active?.sessionId === thread.id) {
-                setActive(null);
-                setItems([]);
-                setContextUsed(null);
-                setContextUsage(null);
-                setPlanPanel(null);
-              }
-              await refresh();
-            });
+            setConfirmAction({ kind: "thread", thread });
           }}
           onRemoveThreads={removeSelectedThreads}
         />
@@ -2111,7 +2150,7 @@ export function App() {
               void window.grok.removeFollowUp(active.sessionId, entryId);
             }}
             onPermissionMode={(mode: PermissionMode) => {
-              void window.grok.setPermission(mode).then(setSettings);
+              changePermissionMode(mode);
             }}
             onModel={(id) => {
               void window.grok.setModel(id).then(setSettings);
@@ -2284,7 +2323,54 @@ export function App() {
         modelSelectionLocked={account?.method === "api-key"}
         onClose={() => setSettingsOpen(false)}
         onChange={setSettings}
+        onPermissionMode={changePermissionMode}
       />
+      {confirmAction?.kind === "alert" ? (
+        <AlertDialog
+          title={confirmAction.title}
+          message={confirmAction.message}
+          onClose={() => setConfirmAction(null)}
+        />
+      ) : confirmAction ? (
+        <ConfirmDialog
+          title={confirmAction.kind === "project"
+            ? `移除项目「${confirmAction.project.name}」`
+            : confirmAction.kind === "project-threads"
+              ? `移除项目「${confirmAction.project.name}」中的聊天`
+              : confirmAction.kind === "threads"
+                ? `移除选中的 ${confirmAction.threads.length} 个会话`
+                : `移除会话「${confirmAction.thread.title}」`}
+          message={confirmAction.kind === "project"
+            ? "只会从列表中移除项目，不会删除磁盘上的文件。"
+            : confirmAction.kind === "project-threads"
+              ? `将移除 ${confirmAction.threads.length} 个聊天。此操作无法撤销，项目文件不会被删除。`
+              : confirmAction.kind === "threads"
+                ? "此操作无法撤销；正在运行的会话会先停止。"
+                : "此操作无法撤销，会话记录和关联计划也会被移除。"}
+          confirmLabel={confirmAction.kind === "project"
+            ? "移除项目"
+            : confirmAction.kind === "project-threads"
+              ? "移除全部聊天"
+              : confirmAction.kind === "threads"
+                ? "移除会话"
+                : "移除会话"}
+          danger
+          onClose={() => setConfirmAction(null)}
+          onConfirm={() => {
+            const action = confirmAction;
+            setConfirmAction(null);
+            if (action.kind === "project") {
+              removeProjectNow(action.project);
+            } else if (action.kind === "project-threads") {
+              removeProjectThreadsNow(action.threads);
+            } else if (action.kind === "threads") {
+              removeSelectedThreadsNow(action.threads);
+            } else {
+              removeThreadNow(action.thread);
+            }
+          }}
+        />
+      ) : null}
     </div>
   );
 }

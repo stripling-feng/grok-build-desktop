@@ -9,6 +9,7 @@ import type {
 } from "../../electron/shared";
 import { relativeTime } from "../lib/i18n";
 import { Markdown } from "../lib/markdown";
+import { ModalPortal } from "./ModalPortal";
 
 type Props = {
   projects: ProjectInfo[];
@@ -817,6 +818,15 @@ export function Sidebar({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [loginOpen, loginBusy]);
 
+  useEffect(() => {
+    if (!updateOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUpdateOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [updateOpen]);
+
   const grouped = useMemo(() => {
     return projects.map((project) => ({
       project,
@@ -1458,62 +1468,65 @@ export function Sidebar({
         </div>
       </div>
       {searchOpen ? (
-        <div className="modal-backdrop" onClick={() => setSearchOpen(false)}>
-          <div className="modal thread-search-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-head">
-              <h2>搜索所有会话</h2>
-              <button className="btn small ghost" type="button" onClick={() => setSearchOpen(false)}>
-                关闭
-              </button>
-            </div>
-            <label className="thread-search-box">
-              <SearchIcon />
-              <input
-                ref={searchInputRef}
-                value={searchQuery}
-                placeholder="输入会话内容关键词"
-                onChange={(event) => setSearchQuery(event.target.value)}
-              />
-              {searchLoading ? <SpinnerIcon /> : null}
-            </label>
-            <div className="thread-search-results">
-              {!searchQuery.trim() ? <div className="thread-search-empty">输入关键词搜索全部会话内容</div> : null}
-              {searchQuery.trim() && !searchLoading && searchResults.length === 0 ? (
-                <div className="thread-search-empty">没有找到匹配的会话</div>
-              ) : null}
-              {searchResults.map((result) => (
-                <button
-                  key={result.thread.id}
-                  type="button"
-                  className="thread-search-result"
-                  onClick={() => {
-                    setSearchOpen(false);
-                    onSelectThread(result.thread);
-                  }}
-                >
-                  <span className="thread-search-result-head">
-                    <strong>{result.thread.title}</strong>
-                    <em>{result.matchCount} 处匹配</em>
-                  </span>
-                  <span className="thread-search-snippet">{result.snippet}</span>
+        <ModalPortal>
+          <div className="modal-backdrop" onClick={() => setSearchOpen(false)}>
+            <div className="modal thread-search-modal" role="dialog" aria-modal="true" aria-labelledby="thread-search-dialog-title" onClick={(event) => event.stopPropagation()}>
+              <div className="modal-head">
+                <h2 id="thread-search-dialog-title">搜索所有会话</h2>
+                <button className="btn small ghost" type="button" onClick={() => setSearchOpen(false)}>
+                  关闭
                 </button>
-              ))}
+              </div>
+              <label className="thread-search-box">
+                <SearchIcon />
+                <input
+                  ref={searchInputRef}
+                  value={searchQuery}
+                  placeholder="输入会话内容关键词"
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                />
+                {searchLoading ? <SpinnerIcon /> : null}
+              </label>
+              <div className="thread-search-results">
+                {!searchQuery.trim() ? <div className="thread-search-empty">输入关键词搜索全部会话内容</div> : null}
+                {searchQuery.trim() && !searchLoading && searchResults.length === 0 ? (
+                  <div className="thread-search-empty">没有找到匹配的会话</div>
+                ) : null}
+                {searchResults.map((result) => (
+                  <button
+                    key={result.thread.id}
+                    type="button"
+                    className="thread-search-result"
+                    onClick={() => {
+                      setSearchOpen(false);
+                      onSelectThread(result.thread);
+                    }}
+                  >
+                    <span className="thread-search-result-head">
+                      <strong>{result.thread.title}</strong>
+                      <em>{result.matchCount} 处匹配</em>
+                    </span>
+                    <span className="thread-search-snippet">{result.snippet}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        </ModalPortal>
       ) : null}
       {loginOpen ? (
-        <div
-          className="modal-backdrop login-backdrop"
-          onClick={closeLogin}
-        >
+        <ModalPortal>
           <div
-            className={`modal login-modal login-modal-${loginView}`}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="login-dialog-title"
-            onClick={(e) => e.stopPropagation()}
+            className="modal-backdrop login-backdrop"
+            onClick={closeLogin}
           >
+            <div
+              className={`modal login-modal login-modal-${loginView}`}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="login-dialog-title"
+              onClick={(e) => e.stopPropagation()}
+            >
             <div className="login-window-bar">
               <span className="login-window-title">Grok Build</span>
               <button
@@ -1670,14 +1683,16 @@ export function Sidebar({
                 />
               )}
             </div>
+            </div>
           </div>
-        </div>
+        </ModalPortal>
       ) : null}
       {updateOpen && update ? (
-        <div className="modal-backdrop" onClick={() => setUpdateOpen(false)}>
-          <div className="modal update-modal" onClick={(e) => e.stopPropagation()}>
+        <ModalPortal>
+          <div className="modal-backdrop" onClick={() => setUpdateOpen(false)}>
+            <div className="modal update-modal" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <h2>检查更新</h2>
+              <h2 id="update-dialog-title">检查更新</h2>
               <button className="btn small ghost" type="button" onClick={() => setUpdateOpen(false)}>
                 关闭
               </button>
@@ -1745,17 +1760,22 @@ export function Sidebar({
             {!update.error && !update.hasUpdate ? (
               <p>已是最新版本{update.current ? ` ${update.current}` : ""}。</p>
             ) : null}
+            </div>
           </div>
-        </div>
+        </ModalPortal>
       ) : null}
       {menu ? (
-        <div
-          ref={menuRef}
-          className="ctx-menu"
-          style={{ left: menu.x, top: menu.y }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          {menu.kind === "project" ? (
+        <ModalPortal>
+          <div
+            ref={menuRef}
+            className="ctx-menu"
+            role="menu"
+            aria-label={menu.kind === "project" ? "项目操作" : "会话操作"}
+            style={{ left: menu.x, top: menu.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            {menu.kind === "project" ? (
             <>
               <button
                 type="button"
@@ -1882,8 +1902,9 @@ export function Sidebar({
                 移除
               </button>
             </>
-          )}
-        </div>
+            )}
+          </div>
+        </ModalPortal>
       ) : null}
     </aside>
   );
