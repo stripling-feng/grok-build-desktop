@@ -1,6 +1,6 @@
 {
   "name": "grok-build-desktop",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "description": "Grok Build 桌面端：通过 ACP 调用本机 grok CLI 的 Electron 界面",
   "author": "Grok Build Desktop",
@@ -12,6 +12,7 @@
     "build": "vite build && npm run build:main",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "esbuild tests/plan-flow.test.ts tests/plugin-commands.test.ts tests/plugin-ui.test.tsx tests/mcp-commands.test.ts tests/skills.test.ts tests/extensions-ui.test.tsx tests/tab-refresh-gate.test.ts --bundle --platform=node --format=cjs --alias:electron=./tests/electron-shim.ts --outdir=.test-dist --out-extension:.js=.cjs && node --test .test-dist/plan-flow.test.cjs .test-dist/plugin-commands.test.cjs .test-dist/plugin-ui.test.cjs .test-dist/mcp-commands.test.cjs .test-dist/skills.test.cjs .test-dist/extensions-ui.test.cjs .test-dist/tab-refresh-gate.test.cjs",
+    "verify:release": "node scripts/verify-release.cjs",
     "start": "electron .",
     "pack:win": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win nsis --publish never",
     "release:win": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win nsis --publish always"
@@ -52,7 +53,7 @@
           ]
         }
       ],
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "Grok-Build-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

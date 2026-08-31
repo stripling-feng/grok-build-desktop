@@ -35,7 +35,22 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Build and publish installer
-        run: npm run release:win
+      - name: Build installer
+        run: npm run pack:win
+
+      - name: Verify updater artifacts
+        run: npm run verify:release
+
+      - name: Publish release
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $installer = "release/Grok-Build-Setup-$version.exe"
+          $assets = @($installer, "$installer.blockmap", "release/latest.yml")
+          if (gh release view "${{ github.ref_name }}" 2>$null) {
+            gh release upload "${{ github.ref_name }}" @assets --clobber
+          } else {
+            gh release create "${{ github.ref_name }}" @assets --verify-tag --generate-notes --title "${{ github.ref_name }}"
+          }
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
